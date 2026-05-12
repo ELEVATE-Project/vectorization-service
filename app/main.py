@@ -1,0 +1,70 @@
+import uvicorn
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+from app.api.v1.api import api_router
+from app.core.clients.qdrant import ensure_collections_exist
+from app.utils.json_handler import CustomJSONResponse
+from app.config import settings
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events"""
+    try:
+        await ensure_collections_exist()
+        logger.info("Application startup completed")
+    except Exception as e:
+        logger.error(f"Startup failed: {str(e)}")
+        raise
+
+    yield
+
+    try:
+        logger.info("Application shutdown completed")
+    except Exception as e:
+        logger.error(f"Cleanup failed: {str(e)}")
+
+
+# Conditionally set root_path based on environment
+root_path_config = "" if settings.ENVIRONMENT == "local" else "/vector"
+
+app = FastAPI(
+    title="Vector Search API",
+    description="API for document ingestion, search, and management with vector database",
+    version="1.0.0",
+    lifespan=lifespan,
+    root_path=root_path_config,
+    default_response_class=CustomJSONResponse
+)
+
+app.include_router(api_router, prefix="/api")
+
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    from app.core.clients.qdrant import qdrant_client
+    from app.core.clients.redis_cache import redis_cache
+    import redis
+    from fastapi import HTTPException
+
+    try:
+        qdrant_client.get_collections()
+        redis_cache.redis_client.ping()
+        return {
+            "status": "healthy",
+            "services": {"qdrant": "connected", "redis": "connected"},
+        }
+    except redis.ConnectionError as e:
+        logger.error(f"Redis connection failed: {str(e)}")
+        raise HTTPException(status_code=503, detail="Redis connection failed")
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        raise HTTPException(status_code=503, detail="Service unhealthy")
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

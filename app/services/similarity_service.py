@@ -1,0 +1,96 @@
+import logging
+from typing import List, Dict, Any
+from fastapi import HTTPException
+from qdrant_client.http import models
+from app.core.clients.qdrant import qdrant_client
+from app.core.clients.embedding import generate_single_embedding
+from app.config import settings
+from app.models.api_models import SimilarityCheckRequest, SimilarityCheckResponse
+
+logger = logging.getLogger(__name__)
+
+
+class SimilarityService:
+    """Service for checking document similarity"""
+
+    def __init__(self):
+        self.threshold_default = 0.85
+
+    def check_similarity(self, request: SimilarityCheckRequest) -> SimilarityCheckResponse:
+        """Check if similar content already exists in the vector database"""
+        try:
+            logger.info(f"Checking similarity for text: {request.text[:100]}...")
+
+            # Generate embedding for the text (limit to 1000 chars for performance)
+            text_embedding = generate_single_embedding(request.text[:1000])
+
+            # Build search filter
+            filter_conditions = [
+                models.FieldCondition(
+                    key="metadata.company",
+                    match=models.MatchValue(value=request.company_id)
+                )
+            ]
+
+            # Exclude specific source_id if provided
+            if request.exclude_source_id:
+                filter_conditions.append(
+                    models.FieldCondition(
+                        key="source_id",
+                        match=models.MatchValue(value=request.exclude_source_id),
+                        invert=True  # Exclude this source_id
+                    )
+                )
+
+            search_filter = models.Filter(must=filter_conditions)
+
+            # Search for similar documents
+            logger.debug(f"Searching with threshold: {request.threshold}")
+            search_results = qdrant_client.search(
+                collection_name=settings.COLLECTION_NAME,
+                query_vector=text_embedding.tolist(),
+                limit=5,  # Get top 5 similar documents
+                query_filter=search_filter,
+                score_threshold=request.threshold
+            )
+
+            # Process results
+            similar_docs = []
+            for hit in search_results:
+                similar_doc = {
+                    "source_id": hit.payload.get("source_id"),
+                    "similarity_score": float(hit.score),
+                    "metadata": hit.payload.get("metadata", {}),
+                    "text_preview": hit.payload.get("text", "")[:200] + "...",
+                    "chunk_id": str(hit.id)
+                }
+                similar_docs.append(similar_doc)
+
+                logger.debug(
+                    f"Found similar document: {similar_doc['source_id']} with score: {similar_doc['similarity_score']}")
+
+            has_similar = len(similar_docs) > 0
+
+            logger.info(f"Similarity check completed. Found {len(similar_docs)} similar documents")
+
+            return SimilarityCheckResponse(
+                has_similar=has_similar,
+                similar_documents=similar_docs
+            )
+
+        except Exception as e:
+            logger.error(f"Similarity check failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Similarity check failed: {str(e)}")
+
+    def find_duplicates_in_collection(self, company_id: str) -> List[Dict[str, Any]]:
+        """Find potential duplicate documents within a company's collection"""
+        try:
+            # This could be used for cleanup operations
+            # Implementation would involve comparing all documents against each other
+            # For now, return empty list as this is an advanced feature
+            logger.info(f"Finding duplicates for company: {company_id}")
+            return []
+
+        except Exception as e:
+            logger.error(f"Duplicate detection failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Duplicate detection failed: {str(e)}")

@@ -1,2 +1,1 @@
-# vectorization-service
-vectorization-service
+# ai-vector-service
