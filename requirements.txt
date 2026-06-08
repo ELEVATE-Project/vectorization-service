@@ -1,0 +1,47 @@
+# Core Framework
+fastapi
+uvicorn
+# Database and Caching
+sqlalchemy
+psycopg2-binary
+redis
+qdrant-client
+
+# File Processing
+pandas
+tabulate
+PyPDF2
+PyMuPDF
+python-docx
+pytesseract
+pdf2image
+Pillow
+
+# NLP and ML
+sentence-transformers
+langchain
+langchain-text-splitters
+langchain-core
+spacy>=3.7.0
+
+# Data Types and Validation
+pydantic
+pydantic-settings
+
+# File Handling
+python-multipart
+
+# Utilities
+typing
+uuid
+datetime
+requests
+beautifulsoup4
+lxml
+
+openpyxl
+
+# Testing and Coverage
+pytest
+pytest-cov
+pytest-asyncio
