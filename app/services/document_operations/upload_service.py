@@ -282,14 +282,22 @@ class UploadService(BaseDocumentOperation):
         
         return chunk_metadata
 
-    def _create_point_vectors(self, text_embedding, field_embeddings: dict):
-        """Create vectors dictionary with text and field embeddings"""
+    def _create_point_vectors(self, text_embedding, field_embeddings: dict, sparse_vector=None):
+        """Create vectors dictionary with text and field embeddings.
+
+        When sparse_vector is provided (Phase 2 only) it is stored under the
+        configured sparse vector name so Qdrant can use it for BM25 hybrid search.
+        """
         vectors_dict = {"text": text_embedding.tolist()}
-        
+
         for field_name in ['title', 'summary', 'tags', 'metadata']:
             if field_name in field_embeddings:
                 vectors_dict[field_name] = field_embeddings[field_name].tolist()
-        
+
+        if sparse_vector is not None:
+            # sparse_vector is a qdrant_client SparseVector model instance
+            vectors_dict[settings.SPARSE_VECTOR_NAME] = sparse_vector
+
         return vectors_dict
 
     async def _upload_chunks(self, processed_chunks: List[dict], additional_metadata: dict,
@@ -298,19 +306,38 @@ class UploadService(BaseDocumentOperation):
         """Generate embeddings and upload chunks to Qdrant with separate embeddings for title, summary, and text"""
         logger.info(f"Generating embeddings for {len(processed_chunks)} chunks")
         text_embeddings = generate_embeddings([chunk["text"] for chunk in processed_chunks])
-        
+
         field_embeddings = self._generate_field_embeddings(title, summary, tags, additional_metadata)
 
+        # Phase 2: generate BM25 sparse vectors when enabled.
+        sparse_vectors: List[object] = []
+        if settings.SPARSE_SEARCH_ENABLED:
+            try:
+                from app.core.clients.sparse_encoder import generate_sparse_vector
+                from qdrant_client.http.models import SparseVector  # type: ignore[import]
+                for chunk in processed_chunks:
+                    indices, values = generate_sparse_vector(chunk.get("text", ""))
+                    sparse_vectors.append(
+                        SparseVector(indices=indices, values=values) if indices else None
+                    )
+                logger.info(f"Sparse BM25 vectors generated for {len(sparse_vectors)} chunks")
+            except Exception as exc:
+                logger.warning(
+                    f"Sparse vector generation skipped (non-fatal): {exc}. "
+                    "Only dense vectors will be stored."
+                )
+                sparse_vectors = []
+
         points = []
-        for chunk, text_embedding in zip(processed_chunks, text_embeddings):
+        for idx, (chunk, text_embedding) in enumerate(zip(processed_chunks, text_embeddings)):
             if not isinstance(chunk, dict):
                 logger.error(f"Invalid chunk type: {type(chunk)}")
                 continue
-            
+
             if "id" not in chunk or "text" not in chunk or "metadata" not in chunk:
                 logger.error(f"Chunk missing required fields: {chunk.keys()}")
                 continue
-            
+
             chunk_id = str(chunk["id"])
             chunk_metadata = self._prepare_chunk_metadata(
                 chunk, additional_metadata, source_id, company_id, title, summary, tags
@@ -324,8 +351,9 @@ class UploadService(BaseDocumentOperation):
                 "summary": summary if summary else None,
                 "tags": tags if tags else None
             }
-            
-            vectors_dict = self._create_point_vectors(text_embedding, field_embeddings)
+
+            sparse_vec = sparse_vectors[idx] if idx < len(sparse_vectors) else None
+            vectors_dict = self._create_point_vectors(text_embedding, field_embeddings, sparse_vec)
 
             point = models.PointStruct(
                 id=chunk_id,

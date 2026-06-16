@@ -59,7 +59,20 @@ class Settings(BaseSettings):
     MAX_SEARCH_TOP_K: int = 100
     MIN_SEARCH_FILTER_SCORE: int = 0
     MIN_WEIGHTED_SCORE_THRESHOLD: float = 0.0  # Minimum weighted score (15%) to include in results
-    
+
+    # Hybrid Search Configuration (Phase 1 — works with qdrant-client<=1.6.9)
+    HYBRID_SEARCH_ENABLED: bool = os.getenv("HYBRID_SEARCH_ENABLED", "true").lower() == "true"
+    EXACT_TITLE_BOOST: float = float(os.getenv("EXACT_TITLE_BOOST", "2.5"))
+    PARTIAL_TITLE_BOOST: float = float(os.getenv("PARTIAL_TITLE_BOOST", "1.5"))
+    METADATA_MATCH_BOOST: float = float(os.getenv("METADATA_MATCH_BOOST", "1.2"))
+    # Queries shorter than this word count skip spaCy stop-word removal
+    SHORT_QUERY_THRESHOLD: int = int(os.getenv("SHORT_QUERY_THRESHOLD", "3"))
+    RRF_K: int = int(os.getenv("RRF_K", "60"))  # standard Reciprocal Rank Fusion constant
+
+    # Sparse Vector Configuration (Phase 2 — requires qdrant-client>=1.9.0)
+    SPARSE_VECTOR_NAME: str = os.getenv("SPARSE_VECTOR_NAME", "bm25")
+    SPARSE_SEARCH_ENABLED: bool = os.getenv("SPARSE_SEARCH_ENABLED", "false").lower() == "true"
+
     # Environment configuration
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "local")  # local, production, staging, etc.
 

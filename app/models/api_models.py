@@ -68,7 +68,7 @@ class PrioritizedSearchRequest(BaseModel):
                     "A document passes if ANY field meets its threshold (OR logic)."
     )
     categories: Optional[List[str]] = Field(
-        default=None, 
+        default=None,
         description="Optional list of tag values to filter (searches in 'tags' field, OR condition)"
     )
     organizations: Optional[List[str]] = Field(
@@ -83,6 +83,11 @@ class PrioritizedSearchRequest(BaseModel):
         default=None,
         description="Optional list of document types to filter (searches in 'metadata.type' field, OR condition)"
     )
+    search_mode: str = Field(
+        default="hybrid",
+        description="Search mode: 'hybrid' (semantic + title boost), 'semantic' (vector only), "
+                    "or 'keyword' (title/keyword match only). Defaults to 'hybrid'."
+    )
 
 class SearchResultItem(BaseModel):
     id: str
@@ -96,6 +101,14 @@ class SearchResultItem(BaseModel):
     field_scores: Dict[str, float] = Field(
         default_factory=dict,
         description="Individual scores from each search field"
+    )
+    keyword_score: Optional[float] = Field(
+        default=None,
+        description="BM25 sparse vector score (Phase 2 only; None when sparse search is disabled)"
+    )
+    title_match: Optional[str] = Field(
+        default=None,
+        description="Title match type: 'exact', 'partial', or None if no title match"
     )
 
 class PrioritizedSearchResponse(BaseModel):
