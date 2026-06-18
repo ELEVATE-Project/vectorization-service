@@ -1,10 +1,14 @@
 """BM25 sparse vector encoder for Phase 2 hybrid search.
 
-Requires: qdrant-client[fastembed]>=1.9.0  (see requirements.txt)
+Requires: qdrant-client[fastembed]>=1.18.0 (the ``[fastembed]`` extra pulls in the
+``fastembed`` package used here directly).
 
 This module is intentionally guarded behind SPARSE_SEARCH_ENABLED so that the
-service continues to start and operate normally when the qdrant-client upgrade
-has not yet been applied (Phase 1 deployments).
+service continues to start and operate normally when sparse search is disabled.
+
+Note: earlier versions used an in-memory ``QdrantClient`` + ``embed_sparse``;
+that helper was removed in qdrant-client 1.14+, so we use the underlying
+``fastembed.SparseTextEmbedding`` model directly.
 """
 import logging
 from typing import Optional
@@ -12,35 +16,28 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # Lazy singleton — loaded only when sparse search is first requested.
-_sparse_client: Optional[object] = None
+_sparse_encoder: Optional[object] = None
 _SPARSE_MODEL = "Qdrant/bm25"
 
 
-def _get_sparse_client():
-    """Return a qdrant-client TextEmbeddings instance backed by BM25 via FastEmbed.
-
-    The 'in-memory' QdrantClient is used purely as a container for the FastEmbed
-    sparse encoder — no vectors are stored in it. This approach avoids spinning up
-    a second real Qdrant connection.
-    """
-    global _sparse_client
-    if _sparse_client is not None:
-        return _sparse_client
+def _get_sparse_encoder():
+    """Return a cached ``fastembed.SparseTextEmbedding`` BM25 encoder."""
+    global _sparse_encoder
+    if _sparse_encoder is not None:
+        return _sparse_encoder
 
     try:
-        from qdrant_client import QdrantClient  # type: ignore[import]
-        client = QdrantClient(":memory:")
-        client.set_sparse_model(_SPARSE_MODEL)
-        _sparse_client = client
+        from fastembed import SparseTextEmbedding  # type: ignore[import]
+        _sparse_encoder = SparseTextEmbedding(model_name=_SPARSE_MODEL)
         logger.info(f"Sparse BM25 encoder initialised (model: {_SPARSE_MODEL})")
     except Exception as exc:
         logger.error(
             f"Failed to initialise sparse BM25 encoder: {exc}. "
-            "Ensure qdrant-client[fastembed]>=1.9.0 is installed."
+            "Ensure qdrant-client[fastembed]>=1.18.0 (or fastembed) is installed."
         )
         raise
 
-    return _sparse_client
+    return _sparse_encoder
 
 
 def generate_sparse_vector(text: str) -> tuple[list[int], list[float]]:
@@ -57,9 +54,9 @@ def generate_sparse_vector(text: str) -> tuple[list[int], list[float]]:
         return [], []
 
     try:
-        client = _get_sparse_client()
-        # embed_documents returns a list of SparseEmbedding objects
-        results = list(client.embed_sparse(documents=[text], model_name=_SPARSE_MODEL))
+        encoder = _get_sparse_encoder()
+        # embed() returns an iterator of SparseEmbedding objects
+        results = list(encoder.embed([text]))
         if not results:
             return [], []
 
@@ -76,7 +73,7 @@ def generate_sparse_vector(text: str) -> tuple[list[int], list[float]]:
 def is_sparse_available() -> bool:
     """Return True if the BM25 sparse encoder can be loaded."""
     try:
-        _get_sparse_client()
+        _get_sparse_encoder()
         return True
     except Exception:
         return False

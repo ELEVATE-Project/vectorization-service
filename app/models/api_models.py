@@ -110,6 +110,10 @@ class SearchResultItem(BaseModel):
         default=None,
         description="Title match type: 'exact', 'partial', or None if no title match"
     )
+    summary_match: Optional[str] = Field(
+        default=None,
+        description="Summary match type: 'exact', 'partial', or None if no summary match"
+    )
 
 class PrioritizedSearchResponse(BaseModel):
     query: Optional[str] = None

@@ -86,12 +86,15 @@ def main() -> None:
                 del pending_upserts[:]
             return
         try:
-            client.upsert(collection_name=collection, points=pending_upserts)
+            # PointVectors carries only the new (sparse) vector — use update_vectors,
+            # which leaves existing dense vectors and payload untouched. upsert() expects
+            # full PointStruct objects and would reject PointVectors.
+            client.update_vectors(collection_name=collection, points=pending_upserts)
             total_migrated += len(pending_upserts)
-            logger.info(f"Upserted {len(pending_upserts)} points (total migrated: {total_migrated})")
+            logger.info(f"Updated {len(pending_upserts)} points (total migrated: {total_migrated})")
         except Exception as exc:
             total_errors += len(pending_upserts)
-            logger.error(f"Upsert batch failed: {exc}")
+            logger.error(f"Update batch failed: {exc}")
         del pending_upserts[:]
 
     logger.info("Starting scroll...")

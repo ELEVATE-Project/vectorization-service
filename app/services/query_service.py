@@ -121,14 +121,14 @@ class QueryService:
             )
 
             logger.debug(f"Executing priority-filtered search with limit: {search_limit}")
-            search_results = qdrant_client.search(
+            search_results = qdrant_client.query_points(
                 collection_name=settings.COLLECTION_NAME,
-                query_vector=query_embedding.tolist(),
+                query=query_embedding.tolist(),
                 using="text",
                 limit=search_limit,
                 query_filter=search_filter,
                 score_threshold=self.similarity_threshold,
-            )
+            ).points
             logger.debug(f"Found {len(search_results)} results for priority {priority_level}")
             all_search_results.extend(search_results)
 
@@ -153,14 +153,14 @@ class QueryService:
                 )
 
                 logger.debug(f"Searching priority {priority} with limit {remaining_limit}")
-                priority_results = qdrant_client.search(
+                priority_results = qdrant_client.query_points(
                     collection_name=settings.COLLECTION_NAME,
-                    query_vector=query_embedding.tolist(),
+                    query=query_embedding.tolist(),
                     using="text",
                     limit=remaining_limit,
                     query_filter=search_filter,
                     score_threshold=self.similarity_threshold,
-                )
+                ).points
 
                 logger.debug(f"Found {len(priority_results)} results for priority {priority}")
                 all_search_results.extend(priority_results)

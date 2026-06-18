@@ -1,7 +1,7 @@
 import logging
 from typing import List, Set
 from fastapi import HTTPException
-from qdrant_client.http import models
+from qdrant_client import models
 from app.core.clients.qdrant import qdrant_client
 from app.models.api_models import SourceVerificationRequest, SourceVerificationResponse
 from app.config import settings

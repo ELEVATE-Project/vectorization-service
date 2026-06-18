@@ -1,6 +1,7 @@
+from typing import Any
 from qdrant_client import QdrantClient
-from qdrant_client.http import models
-from qdrant_client.http.models import PayloadSchemaType
+from qdrant_client import models
+from qdrant_client.models import PayloadSchemaType
 from app.config import settings
 from app.core.clients.embedding import embedding_model
 import logging
@@ -10,15 +11,28 @@ logger = logging.getLogger(__name__)
 # Initialize client
 qdrant_client = QdrantClient(settings.QDRANT_HOST, port=settings.QDRANT_PORT)
 
-# Payload fields to index and their schema types.
+# Prefix-tokenized text index for title/summary. The PREFIX tokenizer indexes every
+# prefix of each token (e.g. "insurance" → "in", "ins", "insu", ...), so partial and
+# typed-mid queries retrieve candidates at the Qdrant level via MatchText. lowercase
+# makes matching case-insensitive; min/max bound the prefix lengths that get indexed.
+_PREFIX_TEXT_INDEX = models.TextIndexParams(
+    type="text",
+    tokenizer=models.TokenizerType.PREFIX,
+    min_token_len=2,
+    max_token_len=20,
+    lowercase=True,
+)
+
+# Payload fields to index and their schema/params.
 # Keyword indexes support exact MatchAny/MatchValue filters (used for source_id, company, tags).
-# Text indexes support MatchText substring/full-text filters (used for title, DOCUMENT_TYPE).
+# Text indexes support MatchText substring/full-text filters (title, summary, DOCUMENT_TYPE).
 _PAYLOAD_INDEXES = [
     ("source_id",              PayloadSchemaType.KEYWORD),
     ("metadata.company",       PayloadSchemaType.KEYWORD),
     ("tags",                   PayloadSchemaType.KEYWORD),
     ("metadata.DOCUMENT_TYPE", PayloadSchemaType.TEXT),
-    ("title",                  PayloadSchemaType.TEXT),
+    ("title",                  _PREFIX_TEXT_INDEX),
+    ("summary",                _PREFIX_TEXT_INDEX),
 ]
 
 
@@ -67,7 +81,7 @@ async def ensure_collections_exist():
             if settings.SPARSE_SEARCH_ENABLED:
                 # SparseVectorParams and Modifier require qdrant-client>=1.9.0
                 try:
-                    from qdrant_client.http.models import SparseVectorParams, Modifier  # type: ignore[import]
+                    from qdrant_client.models import SparseVectorParams, Modifier  # type: ignore[import]
                     create_kwargs["sparse_vectors_config"] = {
                         settings.SPARSE_VECTOR_NAME: SparseVectorParams(
                             modifier=Modifier.IDF
@@ -112,7 +126,7 @@ def _ensure_sparse_vector_field(collection_name: str) -> None:
     Qdrant server that supports sparse vectors (>=1.7.0).
     """
     try:
-        from qdrant_client.http.models import SparseVectorParams, Modifier  # type: ignore[import]
+        from qdrant_client.models import SparseVectorParams, Modifier  # type: ignore[import]
         from app.config import settings as _s
         qdrant_client.update_collection(
             collection_name=collection_name,
@@ -135,24 +149,59 @@ def _ensure_sparse_vector_field(collection_name: str) -> None:
         logger.warning(f"Could not update collection with sparse vectors: {exc}")
 
 
+def _index_params_match(existing_schema: Any, desired_schema: Any) -> bool:
+    """Return True if an existing payload index already matches the desired schema.
+
+    For simple schema types (KEYWORD/TEXT) presence alone is treated as a match —
+    re-creating them is a cheap no-op. For TextIndexParams we compare the tokenizer
+    so that switching to the PREFIX tokenizer triggers a rebuild exactly once.
+    """
+    if isinstance(desired_schema, models.TextIndexParams):
+        existing_params = getattr(existing_schema, "params", None)
+        existing_tokenizer = getattr(existing_params, "tokenizer", None)
+        return existing_tokenizer == desired_schema.tokenizer
+    # Simple schema type: an existing index of any kind is good enough.
+    return True
+
+
 def _ensure_payload_indexes(collection_name: str) -> None:
     """Create payload indexes for fast filtering and MatchText search.
 
-    Indexes are created idempotently — if one already exists Qdrant returns a
-    success response, so calling this on every startup is safe.
+    Simple-schema indexes are created idempotently. For text indexes whose params
+    changed (e.g. switching ``title`` to the PREFIX tokenizer), the stale index is
+    deleted and rebuilt once — subsequent startups detect a match and skip the
+    rebuild, so there is no per-restart index churn.
     """
+    try:
+        existing_schema = qdrant_client.get_collection(collection_name).payload_schema or {}
+    except Exception as exc:
+        logger.warning(f"Could not read payload schema for '{collection_name}': {exc}")
+        existing_schema = {}
+
     for field_name, schema_type in _PAYLOAD_INDEXES:
         try:
-            qdrant_client.create_payload_index(
-                collection_name=collection_name,
-                field_name=field_name,
-                field_schema=schema_type,
-            )
-            logger.info(f"Payload index ensured: {field_name} ({schema_type})")
+            current = existing_schema.get(field_name)
+            if current is not None and not _index_params_match(current, schema_type):
+                logger.info(f"Payload index '{field_name}' params changed — rebuilding")
+                qdrant_client.delete_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                )
+                current = None
+
+            if current is None:
+                qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=field_name,
+                    field_schema=schema_type,
+                )
+                logger.info(f"Payload index created: {field_name} ({schema_type})")
+            else:
+                logger.debug(f"Payload index already present: {field_name}")
         except Exception as exc:
             # Non-fatal: log and continue. An existing index or unsupported
             # schema on an older Qdrant server version will not break search.
-            logger.warning(f"Could not create payload index for '{field_name}': {exc}")
+            logger.warning(f"Could not ensure payload index for '{field_name}': {exc}")
 
 
 def batch_points(points: list, batch_size: int = 100):

@@ -29,17 +29,19 @@ class TextEmbeddingSearchService:
             # Generate embedding for the query
             query_embedding = generate_single_embedding(request.query)
             
-            # Search in Qdrant using only the 'text' vector
-            search_results = qdrant_client.search(
+            # Search in Qdrant using only the 'text' vector (Query API; search() removed in qdrant-client>=1.14)
+            search_results = qdrant_client.query_points(
                 collection_name=self.collection_name,
-                query_vector=("text", query_embedding.tolist()),
-                limit=request.top_k
+                query=query_embedding.tolist(),
+                using="text",
+                limit=request.top_k,
+                with_payload=True,
             )
-            
+
             # Collect all matching chunks that meet the threshold
             matching_chunks: List[Dict[str, Any]] = []
-            
-            for result in search_results:
+
+            for result in search_results.points:
                 source_id = result.payload.get("source_id")
                 
                 if not source_id:

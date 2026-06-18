@@ -1,7 +1,7 @@
 import logging
 from typing import List, Dict, Optional, Any
 from qdrant_client import models
-from qdrant_client.models import QueryRequest, NearestQuery, NamedVector
+from qdrant_client.models import QueryRequest
 from app.core.clients.qdrant import qdrant_client
 from app.core.clients.embedding import generate_embeddings
 from app.config import settings
@@ -94,8 +94,10 @@ class PrioritizedSearchService:
         for result_data in top_results:
             try:
                 field_scores = dict(result_data['field_scores'])
-                # Extract title_match from field_scores so it surfaces as a top-level field
+                # Extract match types so they surface as top-level fields and
+                # field_scores stays a pure {field: float} map.
                 title_match = field_scores.pop("title_match", None)
+                summary_match = field_scores.pop("summary_match", None)
 
                 result_items.append(SearchResultItem(
                     id=str(result_data['id']),
@@ -108,6 +110,7 @@ class PrioritizedSearchService:
                     score=result_data['weighted_score'],
                     field_scores=field_scores,
                     title_match=title_match,
+                    summary_match=summary_match,
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")
@@ -211,7 +214,9 @@ class PrioritizedSearchService:
                     query_text=query_for_embedding,
                     query_embedding=query_embedding,
                     filter_conditions=filter_conditions,
-                    limit=top_k * 100000,
+                    # Retrieve a bounded candidate pool for re-ranking. Qdrant caps
+                    # results at 10k/query; top_k * 100000 would request up to 1M.
+                    limit=min(top_k * 20, 10000),
                 )
             else:
                 logger.info("Starting parallel batch search across all fields")
@@ -220,7 +225,8 @@ class PrioritizedSearchService:
                     weights=weights,
                     query_embedding=query_embedding,
                     filter_conditions=filter_conditions,
-                    limit=top_k * 100000,
+                    # Bounded candidate pool per field for re-ranking (see note above).
+                    limit=min(top_k * 20, 10000),
                 )
             
             if not all_results:
@@ -252,24 +258,61 @@ class PrioritizedSearchService:
             # the default "hybrid") opts in.
             search_mode = getattr(request, "search_mode", "hybrid")
             if settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic":
-                logger.info("Applying hybrid title boost")
-                title_matches = self._get_title_match_sources(
-                    query_for_embedding, filter_conditions
-                )
-                top_results = self._apply_title_boost(top_results, title_matches)
+                logger.info("Applying hybrid title + summary boost")
 
-                # Inject title-matched documents that were filtered out by the
+                # Title boost (highest priority). Scroll retrieves prefix/partial
+                # matches; the supplement adds any mid/infix matches already present
+                # in the dense candidate pool that the scroll missed.
+                title_matches = self._get_field_match_sources(
+                    query_for_embedding, filter_conditions, "title"
+                )
+                self._supplement_matches_from_results(
+                    query_for_embedding, top_results, "title", title_matches
+                )
+                top_results = self._apply_field_boost(
+                    top_results, title_matches, "title",
+                    settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
+                )
+
+                # Summary boost (lower priority, applied after title).
+                summary_matches = self._get_field_match_sources(
+                    query_for_embedding, filter_conditions, "summary"
+                )
+                self._supplement_matches_from_results(
+                    query_for_embedding, top_results, "summary", summary_matches
+                )
+                top_results = self._apply_field_boost(
+                    top_results, summary_matches, "summary",
+                    settings.EXACT_SUMMARY_BOOST, settings.PARTIAL_SUMMARY_BOOST,
+                )
+
+                # Inject title/summary-matched documents that were filtered out by the
                 # semantic score threshold (e.g. short abbreviation queries like "SMC").
-                # Without this, _apply_title_boost iterates an empty list and the
-                # matched document never appears.
-                if title_matches:
-                    present_ids = {r["payload"].get("source_id") for r in top_results}
-                    missing_ids = [sid for sid in title_matches if sid not in present_ids]
-                    if missing_ids:
-                        injected = self._fetch_title_match_docs(missing_ids, title_matches)
-                        top_results = top_results + injected
-                        top_results.sort(key=lambda x: x["weighted_score"], reverse=True)
-                        logger.info(f"Injected {len(injected)} title-match docs missing from semantic results")
+                # Title takes precedence when a source matched on both fields.
+                present_ids = {r["payload"].get("source_id") for r in top_results}
+                missing_title = [sid for sid in title_matches if sid not in present_ids]
+                if missing_title:
+                    injected = self._fetch_field_match_docs(
+                        missing_title, title_matches, "title",
+                        settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
+                    )
+                    top_results = top_results + injected
+                    present_ids.update(missing_title)
+                    logger.info(f"Injected {len(injected)} title-match docs missing from semantic results")
+
+                missing_summary = [
+                    sid for sid in summary_matches
+                    if sid not in present_ids and sid not in title_matches
+                ]
+                if missing_summary:
+                    injected = self._fetch_field_match_docs(
+                        missing_summary, summary_matches, "summary",
+                        settings.EXACT_SUMMARY_BOOST, settings.PARTIAL_SUMMARY_BOOST,
+                    )
+                    top_results = top_results + injected
+                    logger.info(f"Injected {len(injected)} summary-match docs missing from semantic results")
+
+                top_results.sort(key=lambda x: x["weighted_score"], reverse=True)
 
                 # Re-cap top_k after re-sorting
                 top_results = top_results[:top_k]
@@ -347,7 +390,8 @@ class PrioritizedSearchService:
             
             search_requests.append(
                 QueryRequest(
-                    query=NearestQuery(nearest=NamedVector(name=field, vector=query_embedding.tolist())),
+                    query=query_embedding.tolist(),
+                    using=field,
                     limit=limit,
                     with_payload=True,
                     filter=filter_conditions
@@ -404,15 +448,15 @@ class PrioritizedSearchService:
                 FusionQuery,
                 Fusion,
                 SparseVector,
-                NamedVector,
-                NamedSparseVector,
             )
             from app.core.clients.sparse_encoder import generate_sparse_vector
 
-            # Dense prefetches — one per named vector field
+            # Dense prefetches — one per named vector field.
+            # The named vector is selected via ``using`` (1.18 Query API).
             prefetches = [
                 Prefetch(
-                    query=NamedVector(name=field, vector=query_embedding.tolist()),
+                    query=query_embedding.tolist(),
+                    using=field,
                     limit=limit * 2,
                     filter=filter_conditions,
                 )
@@ -425,13 +469,11 @@ class PrioritizedSearchService:
             if sparse_indices:
                 prefetches.append(
                     Prefetch(
-                        query=NamedSparseVector(
-                            name=settings.SPARSE_VECTOR_NAME,
-                            vector=SparseVector(
-                                indices=sparse_indices,
-                                values=sparse_values,
-                            ),
+                        query=SparseVector(
+                            indices=sparse_indices,
+                            values=sparse_values,
                         ),
+                        using=settings.SPARSE_VECTOR_NAME,
                         limit=limit * 2,
                         filter=filter_conditions,
                     )
@@ -582,22 +624,28 @@ class PrioritizedSearchService:
             List of ranked results sorted by weighted score (descending)
         """
         ranked = []
-        
+
         for point_id, result in all_results.items():
             weighted_score = 0.0
             field_score_dict = field_scores.get(point_id, {})
-            
-            # Calculate weighted score
-            for field in search_fields:
-                if field in field_score_dict and field in weights:
-                    field_score = field_score_dict[field]
-                    weight = weights[field]
-                    weighted_score += field_score * weight
-            
-            # Ensure score doesn't exceed 1.0
+
+            if "rrf" in field_score_dict:
+                # Hybrid search path: the Qdrant server fuses dense + sparse results
+                # with Reciprocal Rank Fusion and returns a single fused score. The
+                # per-field weights don't apply here, so use the RRF score directly.
+                weighted_score = field_score_dict["rrf"]
+            else:
+                # Dense multi-field path: weighted sum of per-field similarity scores.
+                for field in search_fields:
+                    if field in field_score_dict and field in weights:
+                        field_score = field_score_dict[field]
+                        weight = weights[field]
+                        weighted_score += field_score * weight
+
+            # Do NOT cap at 1.0 here — the title/summary boost (applied later) needs
+            # the uncapped score to differentiate matches, and enforces its own cap.
             num_fields_matched = len(field_score_dict)
-            weighted_score = min(weighted_score, 1.0)
-            
+
             ranked.append({
                 'id': result.id,
                 'payload': result.payload,
@@ -752,26 +800,41 @@ class PrioritizedSearchService:
                 continue
         return result_items
 
-    def _get_title_match_sources(
+    @staticmethod
+    def _classify_text_match(query_lower: str, field_lower: str) -> Optional[str]:
+        """Classify how ``query_lower`` matches ``field_lower``.
+
+        Returns 'exact' (whole field equals query), 'partial' (substring match —
+        covers both prefix and mid/infix occurrences), or None (no match). Infix
+        ('mid') matches are intentionally folded into 'partial' so the response
+        contract stays {exact, partial, None}.
+        """
+        if not field_lower or query_lower not in field_lower:
+            return None
+        return "exact" if field_lower == query_lower else "partial"
+
+    def _get_field_match_sources(
         self,
         query: str,
         filter_conditions: Optional[models.Filter],
+        field: str,
     ) -> Dict[str, str]:
-        """Return a map of source_id → match_type ('exact' or 'partial') for documents
-        whose title payload field contains the query string.
+        """Return a map of source_id → match_type ('exact'|'partial') for documents
+        whose ``field`` payload (e.g. 'title' or 'summary') contains the query string.
 
-        Uses Qdrant MatchText payload filter — available in qdrant-client 1.6.x and above.
+        Uses a MatchText payload filter against the prefix-tokenized index, then refines
+        with a Python substring check so prefix and mid/infix occurrences are classified.
         The scroll retrieves all matching points (batched) so no relevant document is missed.
         """
-        title_matches: Dict[str, str] = {}
+        matches: Dict[str, str] = {}
         query_lower = query.strip().lower()
         if not query_lower:
-            return title_matches
+            return matches
 
-        title_filter = models.Filter(
+        field_filter = models.Filter(
             must=[
                 models.FieldCondition(
-                    key="title",
+                    key=field,
                     match=models.MatchText(text=query_lower),
                 )
             ]
@@ -779,10 +842,10 @@ class PrioritizedSearchService:
 
         # Combine with any existing hard filters (org / category / etc.)
         if filter_conditions and filter_conditions.must:
-            combined_must = list(filter_conditions.must) + list(title_filter.must)
+            combined_must = list(filter_conditions.must) + list(field_filter.must)
             combined_filter = models.Filter(must=combined_must)
         else:
-            combined_filter = title_filter
+            combined_filter = field_filter
 
         try:
             offset = None
@@ -801,84 +864,109 @@ class PrioritizedSearchService:
 
                 for point in points:
                     source_id = point.payload.get("source_id")
-                    raw_title = point.payload.get("title") or ""
-                    title_lower = raw_title.lower()
-
-                    if not source_id or source_id in title_matches:
+                    raw_value = point.payload.get(field) or ""
+                    if not source_id or source_id in matches:
                         continue
 
-                    if title_lower == query_lower:
-                        title_matches[source_id] = "exact"
-                    elif query_lower in title_lower:
-                        title_matches[source_id] = "partial"
+                    match_type = self._classify_text_match(query_lower, raw_value.lower())
+                    if match_type:
+                        matches[source_id] = match_type
 
                 if not next_offset:
                     break
                 offset = next_offset
 
         except Exception as exc:
-            logger.warning(f"Title match scroll failed (non-fatal): {exc}")
+            logger.warning(f"{field} match scroll failed (non-fatal): {exc}")
 
         logger.info(
-            f"Title match sources found: {len(title_matches)} "
-            f"(exact={sum(1 for v in title_matches.values() if v == 'exact')}, "
-            f"partial={sum(1 for v in title_matches.values() if v == 'partial')})"
+            f"{field} match sources found: {len(matches)} "
+            f"(exact={sum(1 for v in matches.values() if v == 'exact')}, "
+            f"partial={sum(1 for v in matches.values() if v == 'partial')})"
         )
-        return title_matches
+        return matches
 
-    def _apply_title_boost(
+    def _supplement_matches_from_results(
         self,
+        query: str,
         ranked_results: List[Dict[str, Any]],
-        title_matches: Dict[str, str],
-    ) -> List[Dict[str, Any]]:
-        """Multiply the weighted_score of documents whose titles match the query.
+        field: str,
+        matches: Dict[str, str],
+    ) -> None:
+        """Catch mid/infix matches present in the already-retrieved candidate pool.
 
-        Boost tiers (both capped at 1.0):
-          - exact match → score × EXACT_TITLE_BOOST (default 2.5)
-          - partial match → score × PARTIAL_TITLE_BOOST (default 1.5)
-
-        The title_match type is recorded in field_scores so callers can surface it.
-        Results are re-sorted after boosting so the final list remains ordered.
+        The prefix-tokenized index broadens MatchText recall to prefixes, but a true
+        infix query (e.g. 'sur' in 'insurance') may not be retrieved by the scroll.
+        This in-memory pass scans the dense candidates' ``field`` payloads with a plain
+        substring check — no extra Qdrant calls — and adds any newly found matches.
         """
-        exact_boost = settings.EXACT_TITLE_BOOST
-        partial_boost = settings.PARTIAL_TITLE_BOOST
-
+        query_lower = query.strip().lower()
+        if not query_lower:
+            return
         for result in ranked_results:
             source_id = result["payload"].get("source_id")
-            match_type = title_matches.get(source_id)
+            if not source_id or source_id in matches:
+                continue
+            raw_value = (result["payload"].get(field) or "").lower()
+            match_type = self._classify_text_match(query_lower, raw_value)
+            if match_type:
+                matches[source_id] = match_type
+
+    def _apply_field_boost(
+        self,
+        ranked_results: List[Dict[str, Any]],
+        matches: Dict[str, str],
+        field: str,
+        exact_boost: float,
+        partial_boost: float,
+    ) -> List[Dict[str, Any]]:
+        """Multiply the weighted_score of documents whose ``field`` matched the query.
+
+        Boost tiers (capped at 1.0): exact → ×exact_boost, partial → ×partial_boost.
+        The match type is recorded in field_scores as ``f"{field}_match"`` so callers
+        can surface it. Results are re-sorted after boosting.
+        """
+        match_key = f"{field}_match"
+        for result in ranked_results:
+            source_id = result["payload"].get("source_id")
+            match_type = matches.get(source_id)
             if not match_type:
-                result["field_scores"]["title_match"] = None
+                result["field_scores"].setdefault(match_key, None)
                 continue
 
             multiplier = exact_boost if match_type == "exact" else partial_boost
             original = result["weighted_score"]
             boosted = min(original * multiplier, 1.0)
             result["weighted_score"] = boosted
-            result["field_scores"]["title_match"] = match_type
+            result["field_scores"][match_key] = match_type
 
             logger.debug(
-                f"Title boost applied to {source_id}: "
+                f"{field} boost applied to {source_id}: "
                 f"{match_type} match, {original:.4f} → {boosted:.4f}"
             )
 
         ranked_results.sort(key=lambda x: x["weighted_score"], reverse=True)
         return ranked_results
 
-    def _fetch_title_match_docs(
+    def _fetch_field_match_docs(
         self,
         source_ids: List[str],
-        title_matches: Dict[str, str],
+        matches: Dict[str, str],
+        field: str,
+        exact_boost: float,
+        partial_boost: float,
     ) -> List[Dict[str, Any]]:
         """Fetch one representative chunk per source_id for documents that matched
-        by title but were absent from semantic search results (e.g. short abbreviation
-        queries where cosine similarity is too low to pass filter_score).
+        by ``field`` but were absent from semantic search results (e.g. short
+        abbreviation queries where cosine similarity is too low to pass filter_score).
 
-        Each injected document receives a score derived from the title-boost multiplier
+        Each injected document receives a score derived from the boost multiplier
         applied to a small floor value so it ranks below semantically strong results
         but above no-result.
         """
         injected: List[Dict[str, Any]] = []
         FLOOR_SCORE = 0.15  # baseline before multiplier — keeps injected below strong semantic hits
+        match_key = f"{field}_match"
 
         for source_id in source_ids:
             try:
@@ -897,19 +985,19 @@ class PrioritizedSearchService:
                     with_vectors=False,
                 )
             except Exception as exc:
-                logger.warning(f"Could not fetch title-match doc {source_id}: {exc}")
+                logger.warning(f"Could not fetch {field}-match doc {source_id}: {exc}")
                 continue
 
             if not points:
                 continue
 
             point = points[0]
-            match_type = title_matches.get(source_id, "partial")
-            boost = settings.EXACT_TITLE_BOOST if match_type == "exact" else settings.PARTIAL_TITLE_BOOST
+            match_type = matches.get(source_id, "partial")
+            boost = exact_boost if match_type == "exact" else partial_boost
             score = min(FLOOR_SCORE * boost, 1.0)
 
             field_scores: Dict[str, Any] = {f: 0.0 for f in self.priority_order}
-            field_scores["title_match"] = match_type
+            field_scores[match_key] = match_type
 
             injected.append({
                 "id": point.id,
@@ -917,9 +1005,37 @@ class PrioritizedSearchService:
                 "weighted_score": score,
                 "field_scores": field_scores,
             })
-            logger.debug(f"Injected title-match doc {source_id} ({match_type}) with floor score {score:.4f}")
+            logger.debug(f"Injected {field}-match doc {source_id} ({match_type}) with floor score {score:.4f}")
 
         return injected
+
+    # ── Backward-compatible title wrappers (kept for existing callers/tests) ──────
+    def _get_title_match_sources(
+        self,
+        query: str,
+        filter_conditions: Optional[models.Filter],
+    ) -> Dict[str, str]:
+        return self._get_field_match_sources(query, filter_conditions, "title")
+
+    def _apply_title_boost(
+        self,
+        ranked_results: List[Dict[str, Any]],
+        title_matches: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        return self._apply_field_boost(
+            ranked_results, title_matches, "title",
+            settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
+        )
+
+    def _fetch_title_match_docs(
+        self,
+        source_ids: List[str],
+        title_matches: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        return self._fetch_field_match_docs(
+            source_ids, title_matches, "title",
+            settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
+        )
 
     def _get_unique_source_documents(self, request: PrioritizedSearchRequest) -> PrioritizedSearchResponse:
         """

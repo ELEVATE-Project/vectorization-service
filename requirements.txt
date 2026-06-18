@@ -5,11 +5,12 @@ uvicorn
 sqlalchemy
 psycopg2-binary
 redis
-# Phase 2 upgrade: >=1.9.0 enables sparse vectors (BM25) and the Query API with RRF.
-# All versions 1.9.x–1.18.x require Python >=3.8 or >=3.9/3.10 — fully compatible
-# with the enforced Python 3.10.16 runtime. Do not upgrade beyond <2.0.0 without
-# re-testing, as major versions break API.
-qdrant-client[fastembed]>=1.9.0,<2.0.0
+# Pinned to >=1.18.0: enables sparse vectors (BM25) and the Query API with RRF.
+# NOTE: search()/scroll()/search_batch() were removed in the 1.14–1.16 line — all
+# call sites use query_points()/query_batch_points(). Requires Python >=3.9/3.10 —
+# fully compatible with the enforced Python 3.10.16 runtime. Do not upgrade beyond
+# <2.0.0 without re-testing, as major versions break API.
+qdrant-client[fastembed]>=1.18.0,<2.0.0
 
 # File Processing
 pandas
