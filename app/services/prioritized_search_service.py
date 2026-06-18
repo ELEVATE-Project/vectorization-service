@@ -1,7 +1,7 @@
 import logging
 from typing import List, Dict, Optional, Any
 from qdrant_client import models
-from qdrant_client.models import SearchRequest, NamedVector
+from qdrant_client.models import QueryRequest, NearestQuery, NamedVector
 from app.core.clients.qdrant import qdrant_client
 from app.core.clients.embedding import generate_embeddings
 from app.config import settings
@@ -346,8 +346,8 @@ class PrioritizedSearchService:
                 continue
             
             search_requests.append(
-                SearchRequest(
-                    vector=NamedVector(name=field, vector=query_embedding.tolist()),
+                QueryRequest(
+                    query=NearestQuery(nearest=NamedVector(name=field, vector=query_embedding.tolist())),
                     limit=limit,
                     with_payload=True,
                     filter=filter_conditions
@@ -356,15 +356,16 @@ class PrioritizedSearchService:
             valid_fields.append(field)
         
         logger.info(f"Executing batch search across {len(valid_fields)} fields: {valid_fields}")
-        batch_results = qdrant_client.search_batch(
+        batch_results = qdrant_client.query_batch_points(
             collection_name=self.collection_name,
             requests=search_requests
         )
-        
+
         all_results = {}
         field_scores = {}
-        
-        for field, results in zip(valid_fields, batch_results):
+
+        for field, query_response in zip(valid_fields, batch_results):
+            results = query_response.points
             logger.info(f"Field '{field}' returned {len(results)} results")
             
             for result in results:
