@@ -80,6 +80,15 @@ class Settings(BaseSettings):
     SPARSE_VECTOR_NAME: str = os.getenv("SPARSE_VECTOR_NAME", "bm25")
     SPARSE_SEARCH_ENABLED: bool = os.getenv("SPARSE_SEARCH_ENABLED", "false").lower() == "true"
 
+    # Hybrid score fusion weights. In hybrid mode the dense (cosine) and sparse
+    # (BM25) scores are each min-max normalized to [0, 1] across the candidate
+    # pool, then combined as: HYBRID_DENSE_WEIGHT * dense + HYBRID_SPARSE_WEIGHT * sparse.
+    # This yields a calibrated 0-1 weighted_score comparable to filter_score
+    # (raw RRF fused scores are ~0-0.1 and would never clear a cosine-scale
+    # threshold like 0.35, silently dropping every hybrid result).
+    HYBRID_DENSE_WEIGHT: float = float(os.getenv("HYBRID_DENSE_WEIGHT", "0.7"))
+    HYBRID_SPARSE_WEIGHT: float = float(os.getenv("HYBRID_SPARSE_WEIGHT", "0.3"))
+
     # Environment configuration
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "local")  # local, production, staging, etc.
 
