@@ -89,6 +89,21 @@ class Settings(BaseSettings):
     HYBRID_DENSE_WEIGHT: float = float(os.getenv("HYBRID_DENSE_WEIGHT", "0.7"))
     HYBRID_SPARSE_WEIGHT: float = float(os.getenv("HYBRID_SPARSE_WEIGHT", "0.3"))
 
+    # Candidate pool sizing for multi-field search. Each dense named-vector search
+    # (title/text/tags/summary/metadata) and the sparse BM25 search retrieves up to
+    # `min(top_k * SEARCH_CANDIDATE_FANOUT, SEARCH_CANDIDATE_MAX)` candidates; the
+    # union is fused/ranked client-side. The CAP bounds HNSW `ef` — the dominant
+    # query cost — so a large top_k cannot trigger a 10k-deep traversal per field;
+    # the FANOUT gives small-top_k callers a re-ranking margin (retrieve more than
+    # you return). For top_k=1000 the CAP wins → 2000/field (was 10000).
+    #
+    # CAP also influences result `count`: the hybrid score is min-max normalized
+    # across the candidate pool, so a larger pool lets more docs clear filter_score.
+    # 2000 balances latency (~2x faster than the old 10000) against count fidelity.
+    # Raise toward 10000 for fuller counts, lower toward 500 for max speed.
+    SEARCH_CANDIDATE_FANOUT: int = int(os.getenv("SEARCH_CANDIDATE_FANOUT", "8"))
+    SEARCH_CANDIDATE_MAX: int = int(os.getenv("SEARCH_CANDIDATE_MAX", "2000"))
+
     # Environment configuration
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "local")  # local, production, staging, etc.
 

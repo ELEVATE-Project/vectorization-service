@@ -42,7 +42,19 @@ class PrioritizedSearchService:
         self.priority_order = settings.SEARCH_PRIORITY_ORDER
         self.default_weights = settings.SEARCH_PRIORITY_WEIGHTS
         self.min_score_threshold = settings.MIN_WEIGHTED_SCORE_THRESHOLD
-    
+
+    def _candidate_limit(self, top_k: int) -> int:
+        """Per-field candidate pool size for multi-field search.
+
+        Each of the dense named-vector searches and the sparse BM25 search retrieves
+        this many candidates; the union is fused/ranked. The CAP bounds HNSW ``ef``
+        (the dominant query cost) so a large top_k can't trigger a 10k-deep traversal
+        per field; the FANOUT gives small-top_k callers a re-ranking margin. The union
+        across fields still fills top_k after source-level dedup. Env-tunable via
+        SEARCH_CANDIDATE_FANOUT / SEARCH_CANDIDATE_MAX. For top_k=1000 → 500 (was 10000).
+        """
+        return min(max(top_k, 1) * settings.SEARCH_CANDIDATE_FANOUT, settings.SEARCH_CANDIDATE_MAX)
+
     def _log_search_request(self, request: PrioritizedSearchRequest, top_k: int, filter_conditions):
         """Log search request details"""
         logger.info("========== SEARCH REQUEST ==========" )
@@ -234,9 +246,9 @@ class PrioritizedSearchService:
                     query_text=query_for_embedding,
                     query_embedding=query_embedding,
                     filter_conditions=filter_conditions,
-                    # Retrieve a bounded candidate pool for re-ranking. Qdrant caps
-                    # results at 10k/query; top_k * 100000 would request up to 1M.
-                    limit=min(top_k * 20, 10000),
+                    # Bounded candidate pool per field — keeps HNSW ef small (dominant
+                    # query cost). See _candidate_limit / SEARCH_CANDIDATE_* config.
+                    limit=self._candidate_limit(top_k),
                 )
             else:
                 logger.info("Starting parallel batch search across all fields")
@@ -245,8 +257,8 @@ class PrioritizedSearchService:
                     weights=weights,
                     query_embedding=query_embedding,
                     filter_conditions=filter_conditions,
-                    # Bounded candidate pool per field for re-ranking (see note above).
-                    limit=min(top_k * 20, 10000),
+                    # Bounded candidate pool per field (see note above).
+                    limit=self._candidate_limit(top_k),
                 )
             
             if not all_results:
