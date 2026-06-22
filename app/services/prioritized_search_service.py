@@ -587,9 +587,19 @@ class PrioritizedSearchService:
             logger.info(f"Client-side RRF search returned {len(all_results)} unique documents (metadata-only)")
             return all_results, field_scores
 
-        except (ImportError, AttributeError) as exc:
+        except (ImportError, AttributeError, RuntimeError) as exc:
+            # ImportError/AttributeError: optional sparse deps (fastembed / qdrant
+            # SparseVector) missing. RuntimeError: the BM25 encoder failed to
+            # initialise or encode at runtime — generate_sparse_vector() wraps every
+            # encoder failure (corrupted model cache, download failure, OOM, even a
+            # missing-fastembed ImportError) as RuntimeError. All of these are
+            # sparse-side problems, so degrade gracefully to dense-only search.
+            # NOTE: Qdrant transport errors (timeouts, connection failures) raise
+            # other exception types and are intentionally NOT caught here, so genuine
+            # infra problems still surface instead of being masked.
             logger.warning(
-                f"Hybrid search dependencies unavailable ({exc}); falling back to dense-only parallel search."
+                f"Hybrid search unavailable ({type(exc).__name__}: {exc}); "
+                "falling back to dense-only parallel search."
             )
             return self._parallel_batch_search(
                 search_fields=search_fields,
