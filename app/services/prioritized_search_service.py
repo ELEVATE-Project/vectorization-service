@@ -1,5 +1,6 @@
 import logging
-from typing import List, Dict, Optional, Any
+import time
+from typing import List, Dict, Optional, Any, Set
 from qdrant_client import models
 from qdrant_client.models import QueryRequest
 from app.core.clients.qdrant import qdrant_client
@@ -963,35 +964,67 @@ class PrioritizedSearchService:
         Each injected document receives a score derived from the boost multiplier
         applied to a small floor value so it ranks below semantically strong results
         but above no-result.
+
+        Optimized to fetch all missing documents in a single MatchAny query.
         """
+        # Step 1: Guard against empty lists to avoid an unnecessary network round trip
+        if not source_ids:
+            return []
+
         injected: List[Dict[str, Any]] = []
         FLOOR_SCORE = 0.15  # baseline before multiplier — keeps injected below strong semantic hits
         match_key = f"{field}_match"
+        num_requests_before = len(source_ids)
 
-        for source_id in source_ids:
-            try:
-                points, _ = qdrant_client.scroll(
-                    collection_name=self.collection_name,
-                    scroll_filter=models.Filter(
-                        must=[
-                            models.FieldCondition(
-                                key="source_id",
-                                match=models.MatchValue(value=source_id),
-                            )
-                        ]
-                    ),
-                    limit=1,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-            except Exception as exc:
-                logger.warning(f"Could not fetch {field}-match doc {source_id}: {exc}")
+        logger.info(
+            f"Resolving {num_requests_before} missing documents for field '{field}' boost. "
+            f"Optimizing from {num_requests_before} Qdrant requests to 1 request."
+        )
+
+        try:
+            start_time = time.perf_counter()
+            # Step 2: Query Qdrant once using models.MatchAny.
+            # This fetches all records whose metadata/payload source_id matches any of our target IDs.
+            points, _ = qdrant_client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="source_id",
+                            match=models.MatchAny(any=source_ids),
+                        )
+                    ]
+                ),
+                # Request a safety factor limit of len(source_ids) * 10 to ensure we capture
+                # representative points if sources contain multiple chunks.
+                limit=len(source_ids) * 10,
+                with_payload=True,
+                with_vectors=False,
+            )
+            elapsed_time = time.perf_counter() - start_time
+            logger.info(
+                f"Bulk fetch of {len(points)} points for {len(source_ids)} source IDs "
+                f"completed in {elapsed_time:.3f}s (1 request)"
+            )
+        except Exception as exc:
+            logger.warning(f"Could not bulk fetch {field}-match docs: {exc}")
+            return []
+
+        # Step 3: Deduplicate matching points in-memory.
+        # Since we only want one representative chunk per unique source_id, we process them
+        # sequentially and keep the first one we see.
+        seen_sources: Set[str] = set()
+        for point in points:
+            source_id = point.payload.get("source_id")
+            if not source_id or source_id not in source_ids:
                 continue
-
-            if not points:
+            if source_id in seen_sources:
                 continue
+            seen_sources.add(source_id)
 
-            point = points[0]
+            # Step 4: Compute the boosted score.
+            # Match type is fetched from the matches cache (either 'exact' or 'partial')
+            # and multiplied with the floor score.
             match_type = matches.get(source_id, "partial")
             boost = exact_boost if match_type == "exact" else partial_boost
             score = min(FLOOR_SCORE * boost, 1.0)
@@ -1006,6 +1039,14 @@ class PrioritizedSearchService:
                 "field_scores": field_scores,
             })
             logger.debug(f"Injected {field}-match doc {source_id} ({match_type}) with floor score {score:.4f}")
+
+        missing_after = len(source_ids) - len(seen_sources)
+        logger.info(
+            f"Finished resolving missing documents for field '{field}'. "
+            f"Requests before: {num_requests_before}, Requests after: 1. "
+            f"Successfully resolved: {len(seen_sources)}/{len(source_ids)}. "
+            f"Missing/Not Found IDs: {missing_after}."
+        )
 
         return injected
 
