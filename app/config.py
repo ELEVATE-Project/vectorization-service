@@ -1,6 +1,10 @@
 # config.py
 import os
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Disable tokenizers parallelism warning when using pdf2image for OCR
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
