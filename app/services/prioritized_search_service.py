@@ -90,15 +90,34 @@ class PrioritizedSearchService:
         return top_results, unique_source_results
 
     def _build_result_items(self, top_results) -> List[SearchResultItem]:
-        """Build result items from top results"""
+        """Build result items from top results.
+
+        Strips internal scoring keys ("rrf", SPARSE_VECTOR_NAME) before serializing
+        to the API response — those keys are ranking internals, not per-field
+        cosine similarities. Only float scores corresponding to actual dense vector
+        fields (title, tags, summary, metadata, text) are surfaced to the client.
+
+        For documents injected via _fetch_field_match_docs (keyword/text-match only),
+        field scores are None — meaning no vector similarity was computed for that
+        field — rather than 0.0, which would be misleading.
+        """
+        # Keys that are used internally for ranking but must not appear in
+        # the public field_scores contract.
+        INTERNAL_SCORE_KEYS = {"rrf", settings.SPARSE_VECTOR_NAME}
+
         result_items = []
         for result_data in top_results:
             try:
                 field_scores = dict(result_data['field_scores'])
                 # Extract match types so they surface as top-level fields and
-                # field_scores stays a pure {field: float} map.
+                # field_scores stays a pure {field: float | None} map.
                 title_match = field_scores.pop("title_match", None)
                 summary_match = field_scores.pop("summary_match", None)
+
+                # Remove internal RRF/BM25 keys — they are fusion mechanics,
+                # not per-field cosine similarity scores.
+                for key in INTERNAL_SCORE_KEYS:
+                    field_scores.pop(key, None)
 
                 result_items.append(SearchResultItem(
                     id=str(result_data['id']),
@@ -318,6 +337,28 @@ class PrioritizedSearchService:
                 # Re-cap top_k after re-sorting
                 top_results = top_results[:top_k]
 
+            # Late Payload Retrieval: Fetch full payloads (including 'text')
+            # for ONLY the final top_k results when hybrid/sparse search is active.
+            if settings.SPARSE_SEARCH_ENABLED and top_results:
+                points_to_fetch = [r["id"] for r in top_results]
+                try:
+                    t2 = time.time()
+                    full_points = qdrant_client.retrieve(
+                        collection_name=self.collection_name,
+                        ids=points_to_fetch,
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    t3 = time.time()
+                    logger.info(f"TIMING: late retrieve of {len(points_to_fetch)} docs took {t3-t2:.2f}s")
+                    payload_map = {p.id: p.payload for p in full_points}
+                    for r in top_results:
+                        r["payload"] = payload_map.get(r["id"], r["payload"])
+                    logger.info(f"Successfully retrieved full payloads for final top {len(top_results)} results")
+                except Exception as exc:
+                    logger.error(f"Failed late payload retrieval: {exc}")
+                    # Fallback to the partial metadata payload already present rather than failing the search
+
             result_items = self._build_result_items(top_results)
             
             search_config = {
@@ -432,81 +473,104 @@ class PrioritizedSearchService:
         filter_conditions: Optional[models.Filter],
         limit: int,
     ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
-        """Phase 2: Execute hybrid search using Qdrant Query API with server-side RRF.
+        """Execute hybrid search using parallel batch queries with client-side RRF fusion.
 
-        Prefetches results from both:
-          - 5 dense named vector fields (existing semantic search)
-          - 1 BM25 sparse vector field (keyword/exact search)
+        This maintains keyword (BM25 sparse) search active while exposing raw field-level 
+        similarity scores for detail_filter_score verification.
 
-        Then fuses them with Reciprocal Rank Fusion on the Qdrant server.
-
-        Requires qdrant-client>=1.9.0 and a Qdrant server >=1.7.0.
-        Falls back to ``_parallel_batch_search`` if imports fail.
+        To minimize network bandwidth and memory footprint, payloads are projected to exclude
+        heavy text content; full payloads are fetched late for the final top results.
         """
         try:
-            from qdrant_client.models import (  # type: ignore[import]
-                Prefetch,
-                FusionQuery,
-                Fusion,
-                SparseVector,
-            )
+            from qdrant_client.models import QueryRequest, SparseVector
             from app.core.clients.sparse_encoder import generate_sparse_vector
 
-            # Dense prefetches — one per named vector field.
-            # The named vector is selected via ``using`` (1.18 Query API).
-            prefetches = [
-                Prefetch(
-                    query=query_embedding.tolist(),
-                    using=field,
-                    limit=limit * 2,
-                    filter=filter_conditions,
-                )
-                for field in search_fields
-                if field in self.default_weights
-            ]
+            search_requests = []
+            valid_fields = []
 
-            # Sparse BM25 prefetch — encode the raw (preprocessed) query text
+            # Project payload to retrieve only small metadata keys needed for filters and boosts.
+            # Excludes the heavy 'text' payload field during candidate scoring.
+            metadata_payload_fields = ["source_id", "title", "summary", "tags", "metadata"]
+
+            # 1. Build Query Requests for Dense Fields
+            for field in search_fields:
+                if field in self.default_weights:
+                    search_requests.append(
+                        QueryRequest(
+                            query=query_embedding.tolist(),
+                            using=field,
+                            limit=limit,
+                            with_payload=metadata_payload_fields,
+                            filter=filter_conditions
+                        )
+                    )
+                    valid_fields.append(field)
+
+            # 2. Build Query Request for BM25 Sparse Field
             sparse_indices, sparse_values = generate_sparse_vector(query_text)
             if sparse_indices:
-                prefetches.append(
-                    Prefetch(
+                search_requests.append(
+                    QueryRequest(
                         query=SparseVector(
                             indices=sparse_indices,
                             values=sparse_values,
                         ),
                         using=settings.SPARSE_VECTOR_NAME,
-                        limit=limit * 2,
-                        filter=filter_conditions,
+                        limit=limit,
+                        with_payload=metadata_payload_fields,
+                        filter=filter_conditions
                     )
                 )
+                valid_fields.append(settings.SPARSE_VECTOR_NAME)
 
-            query_results = qdrant_client.query_points(
+            logger.info(f"Executing client-side hybrid batch search across {len(valid_fields)} fields: {valid_fields}")
+            
+            # 3. Execute all queries in a single network batch call
+            import time
+            t0 = time.time()
+            batch_results = qdrant_client.query_batch_points(
                 collection_name=self.collection_name,
-                prefetch=prefetches,
-                query=FusionQuery(fusion=Fusion.RRF),
-                limit=limit,
-                with_payload=True,
+                requests=search_requests
             )
+            t1 = time.time()
+            logger.info(f"TIMING: query_batch_points took {t1-t0:.2f}s")
 
+            # 4. Compute RRF Rank Scores in Python
+            # Reciprocal Rank Fusion formula: RRF_Score = Sum( 1 / (RRF_K + rank) )
+            rrf_scores: Dict[str, float] = {}
+            RRF_K = settings.RRF_K
+
+            for field, query_response in zip(valid_fields, batch_results):
+                points = query_response.points
+                # Qdrant guarantees points are returned sorted descending by score
+                for rank_idx, point in enumerate(points):
+                    pid = point.id
+                    rank = rank_idx + 1
+                    rrf_scores[pid] = rrf_scores.get(pid, 0.0) + (1.0 / (RRF_K + rank))
+
+            # 5. Populate return dictionaries
             all_results: Dict[str, Any] = {}
             field_scores: Dict[str, Dict[str, float]] = {}
 
-            for point in query_results.points:
-                pid = point.id
-                all_results[pid] = point
-                # RRF fusion score exposed as the overall score; individual field
-                # scores are not available from the Query API fusion endpoint.
-                field_scores[pid] = {"rrf": getattr(point, "score", 0.0)}
+            for field, query_response in zip(valid_fields, batch_results):
+                for point in query_response.points:
+                    pid = point.id
+                    all_results[pid] = point
+                    if pid not in field_scores:
+                        field_scores[pid] = {}
+                    # Store individual raw similarity score for the field (for detail_filter_score check)
+                    field_scores[pid][field] = getattr(point, "score", 0.0)
 
-            logger.info(
-                f"Hybrid (RRF) search returned {len(all_results)} unique documents"
-            )
+            # Inject the calculated RRF score under "rrf" key (for _rank_results)
+            for pid in all_results:
+                field_scores[pid]["rrf"] = rrf_scores.get(pid, 0.0)
+
+            logger.info(f"Client-side RRF search returned {len(all_results)} unique documents (metadata-only)")
             return all_results, field_scores
 
         except (ImportError, AttributeError) as exc:
             logger.warning(
-                f"Hybrid search unavailable ({exc}); falling back to dense-only search. "
-                "Ensure qdrant-client[fastembed]>=1.9.0 is installed."
+                f"Hybrid search dependencies unavailable ({exc}); falling back to dense-only parallel search."
             )
             return self._parallel_batch_search(
                 search_fields=search_fields,
@@ -645,7 +709,7 @@ class PrioritizedSearchService:
 
             # Do NOT cap at 1.0 here — the title/summary boost (applied later) needs
             # the uncapped score to differentiate matches, and enforces its own cap.
-            num_fields_matched = len(field_score_dict)
+            num_fields_matched = len([k for k in field_score_dict.keys() if k not in ("rrf", settings.SPARSE_VECTOR_NAME)])
 
             ranked.append({
                 'id': result.id,
@@ -1029,7 +1093,11 @@ class PrioritizedSearchService:
             boost = exact_boost if match_type == "exact" else partial_boost
             score = min(FLOOR_SCORE * boost, 1.0)
 
-            field_scores: Dict[str, Any] = {f: 0.0 for f in self.priority_order}
+            # Injected docs were fetched via keyword/payload scroll — no vector query
+            # was run against them so no per-field cosine similarity exists.
+            # Use None (not 0.0) so the API consumer can distinguish
+            # "field was not scored" from "field scored exactly zero".
+            field_scores: Dict[str, Any] = {f: None for f in self.priority_order}
             field_scores[match_key] = match_type
 
             injected.append({

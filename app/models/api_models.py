@@ -98,9 +98,15 @@ class SearchResultItem(BaseModel):
     metadata: Dict[str, Any]
     source_id: str
     score: float
-    field_scores: Dict[str, float] = Field(
+    field_scores: Dict[str, Optional[float]] = Field(
         default_factory=dict,
-        description="Individual scores from each search field"
+        description=(
+            "Per-field cosine similarity scores for semantically retrieved documents "
+            "(keys: title, tags, summary, metadata, text, values 0–1). "
+            "Internal fusion keys (rrf, bm25_sparse) are excluded. "
+            "Keyword-injected documents that bypassed vector scoring carry None "
+            "for unscored fields to distinguish them from a genuine zero-score."
+        )
     )
     keyword_score: Optional[float] = Field(
         default=None,
