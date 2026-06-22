@@ -565,6 +565,25 @@ class PrioritizedSearchService:
             for pid in all_results:
                 field_scores[pid]["rrf"] = rrf_scores.get(pid, 0.0)
 
+            # 6. Remap raw Qdrant vector-field names to the semantic field names that
+            #    _apply_detail_filter checks against ("title", "text", "tags",
+            #    "summary", "metadata"). The keys of self.default_weights are the
+            #    authoritative semantic names; the corresponding Qdrant vector name is
+            #    VECTOR_FIELD_PREFIX + semantic_name. This collection configures its
+            #    named vectors with no prefix (see app/core/clients/qdrant.py), so the
+            #    mapping is an identity today — but doing it explicitly keeps the
+            #    field_scores contract correct if a prefix is ever introduced.
+            #    "rrf" and "bm25" (SPARSE_VECTOR_NAME) keys are preserved untouched —
+            #    they are consumed by _rank_results and surfaced for debugging.
+            prefix = getattr(settings, "VECTOR_FIELD_PREFIX", "") or ""
+            qdrant_to_semantic = {
+                f"{prefix}{semantic}": semantic for semantic in self.default_weights
+            }
+            for scores in field_scores.values():
+                for qdrant_name, semantic_name in qdrant_to_semantic.items():
+                    if qdrant_name in scores and semantic_name not in scores:
+                        scores[semantic_name] = scores[qdrant_name]
+
             logger.info(f"Client-side RRF search returned {len(all_results)} unique documents (metadata-only)")
             return all_results, field_scores
 
@@ -666,6 +685,23 @@ class PrioritizedSearchService:
         logger.info("No filters applied")
         return None
     
+    @staticmethod
+    def _min_max_normalize(scores: Dict[Any, float]) -> Dict[Any, float]:
+        """Min-max normalize a {key: score} map to the [0, 1] range.
+
+        When every score is equal (single candidate or a flat pool) the range is
+        zero and a min-max is undefined; a positive value maps to 1.0 and a zero
+        value to 0.0 so that present candidates are never spuriously zeroed out.
+        """
+        if not scores:
+            return {}
+        values = list(scores.values())
+        lo, hi = min(values), max(values)
+        if hi <= lo:
+            return {k: (1.0 if v > 0 else 0.0) for k, v in scores.items()}
+        span = hi - lo
+        return {k: (v - lo) / span for k, v in scores.items()}
+
     def _rank_results(
         self,
         all_results: Dict[str, Any],
@@ -675,32 +711,64 @@ class PrioritizedSearchService:
     ) -> List[Dict[str, Any]]:
         """
         Rank results using weighted multi-field scoring.
-        
-        Scoring Formula:
-        Final_Score = Σ(Field_Weight × Field_Score)
-        
+
+        Dense-only path (sparse disabled):
+            Final_Score = Σ(Field_Weight × Field_Score)
+
+        Hybrid path (dense + BM25 sparse): each modality is min-max normalized to
+        [0, 1] across the candidate pool, then fused:
+            Final_Score = HYBRID_DENSE_WEIGHT × dense_norm + HYBRID_SPARSE_WEIGHT × sparse_norm
+        The dense component is itself the weighted multi-field cosine sum. This keeps
+        the final score on a calibrated 0-1 scale comparable to filter_score, instead
+        of the raw RRF fused value (~0-0.1) which never clears a cosine-scale threshold.
+
         Args:
             all_results: Dictionary of search results by point ID
             field_scores: Scores for each field per point
             weights: Weight configuration for each field
             search_fields: List of fields searched
-            
+
         Returns:
             List of ranked results sorted by weighted score (descending)
         """
+        sparse_name = settings.SPARSE_VECTOR_NAME
+        # Hybrid mode is signalled by the presence of an "rrf" key (injected by
+        # _hybrid_batch_search). In that mode fuse normalized dense + sparse scores.
+        is_hybrid = any("rrf" in fs for fs in field_scores.values())
+
+        norm_dense: Dict[Any, float] = {}
+        norm_sparse: Dict[Any, float] = {}
+        if is_hybrid:
+            raw_dense: Dict[Any, float] = {}
+            raw_sparse: Dict[Any, float] = {}
+            for point_id, fs in field_scores.items():
+                dense = 0.0
+                for field in search_fields:
+                    if field in weights:
+                        score = fs.get(field)
+                        if score is not None:
+                            dense += score * weights[field]
+                raw_dense[point_id] = dense
+                raw_sparse[point_id] = fs.get(sparse_name) or 0.0
+            norm_dense = self._min_max_normalize(raw_dense)
+            norm_sparse = self._min_max_normalize(raw_sparse)
+            dense_w = settings.HYBRID_DENSE_WEIGHT
+            sparse_w = settings.HYBRID_SPARSE_WEIGHT
+
         ranked = []
 
         for point_id, result in all_results.items():
-            weighted_score = 0.0
             field_score_dict = field_scores.get(point_id, {})
 
-            if "rrf" in field_score_dict:
-                # Hybrid search path: the Qdrant server fuses dense + sparse results
-                # with Reciprocal Rank Fusion and returns a single fused score. The
-                # per-field weights don't apply here, so use the RRF score directly.
-                weighted_score = field_score_dict["rrf"]
+            if is_hybrid:
+                # Fuse the two min-max normalized modalities into a calibrated 0-1 score.
+                weighted_score = (
+                    dense_w * norm_dense.get(point_id, 0.0)
+                    + sparse_w * norm_sparse.get(point_id, 0.0)
+                )
             else:
                 # Dense multi-field path: weighted sum of per-field similarity scores.
+                weighted_score = 0.0
                 for field in search_fields:
                     if field in field_score_dict and field in weights:
                         field_score = field_score_dict[field]
@@ -709,7 +777,7 @@ class PrioritizedSearchService:
 
             # Do NOT cap at 1.0 here — the title/summary boost (applied later) needs
             # the uncapped score to differentiate matches, and enforces its own cap.
-            num_fields_matched = len([k for k in field_score_dict.keys() if k not in ("rrf", settings.SPARSE_VECTOR_NAME)])
+            num_fields_matched = len([k for k in field_score_dict.keys() if k not in ("rrf", sparse_name)])
 
             ranked.append({
                 'id': result.id,
@@ -718,7 +786,7 @@ class PrioritizedSearchService:
                 'field_scores': field_score_dict,
                 'num_fields_matched': num_fields_matched
             })
-        
+
         ranked.sort(key=lambda x: x['weighted_score'], reverse=True)
         return ranked
     
@@ -757,14 +825,33 @@ class PrioritizedSearchService:
             field_score_dict = result.get('field_scores', {})
             passed = False
             passing_fields = []
-            
+
             # Check if ANY field meets its threshold (OR logic)
             for field, threshold in thresholds.items():
-                field_score = field_score_dict.get(field, 0.0)
+                field_score = field_score_dict.get(field, 0.0) or 0.0
                 if field_score >= threshold:
                     passed = True
                     passing_fields.append(f"{field}={field_score:.3f}")
-            
+
+            # RRF fallback: a document retrieved only via the BM25 sparse field has
+            # no per-field cosine similarity (all semantic scores absent/zero) and
+            # would be dropped here despite a valid fused rank. When that happens and
+            # an "rrf" score is present, fall back to comparing it against the
+            # *minimum* of the configured field thresholds (the easiest bar to clear)
+            # so legitimate sparse-only hits survive instead of silently disappearing.
+            if not passed and "rrf" in field_score_dict:
+                all_semantic_zero = all(
+                    (field_score_dict.get(field) or 0.0) == 0.0 for field in thresholds
+                )
+                if all_semantic_zero:
+                    rrf_score = field_score_dict.get("rrf", 0.0) or 0.0
+                    min_threshold = min(thresholds.values())
+                    if rrf_score >= min_threshold:
+                        passed = True
+                        passing_fields.append(
+                            f"rrf={rrf_score:.4f}>=min_threshold({min_threshold})"
+                        )
+
             if passed:
                 total_passed += 1
                 filtered.append(result)
