@@ -88,6 +88,14 @@ class PrioritizedSearchRequest(BaseModel):
         description="Search mode: 'hybrid' (semantic + title boost), 'semantic' (vector only), "
                     "or 'keyword' (title/keyword match only). Defaults to 'hybrid'."
     )
+    include_scoring_debug: bool = Field(
+        default=settings.INCLUDE_SCORING_DEBUG,
+        description="When true, each result includes the hybrid fusion breakdown "
+                    "(keyword_score, rrf_score, dense_rank, sparse_rank) for inspecting "
+                    "how the final score was produced. Defaults to the INCLUDE_SCORING_DEBUG "
+                    "env setting; a request may override it per call. Off by default to keep "
+                    "responses lean."
+    )
 
 class SearchResultItem(BaseModel):
     id: str
@@ -110,7 +118,24 @@ class SearchResultItem(BaseModel):
     )
     keyword_score: Optional[float] = Field(
         default=None,
-        description="BM25 sparse vector score (Phase 2 only; None when sparse search is disabled)"
+        description="Raw BM25 sparse vector score (Phase 2). Populated only when the request sets "
+                    "include_scoring_debug=true; None otherwise or when sparse search is disabled."
+    )
+    rrf_score: Optional[float] = Field(
+        default=None,
+        description="Raw Reciprocal Rank Fusion value before min-max normalization "
+                    "(1/(k+dense_rank) + 1/(k+sparse_rank)). Populated only when "
+                    "include_scoring_debug=true and HYBRID_FUSION_METHOD=rrf."
+    )
+    dense_rank: Optional[int] = Field(
+        default=None,
+        description="1-indexed rank of this document in the combined dense list (ranked by the "
+                    "weighted multi-field cosine sum). Debug-only (include_scoring_debug=true)."
+    )
+    sparse_rank: Optional[int] = Field(
+        default=None,
+        description="1-indexed rank of this document in the BM25 sparse list, or None if it had no "
+                    "sparse hit. Debug-only (include_scoring_debug=true)."
     )
     title_match: Optional[str] = Field(
         default=None,

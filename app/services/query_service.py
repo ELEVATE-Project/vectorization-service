@@ -121,6 +121,7 @@ class QueryService:
             )
 
             logger.debug(f"Executing priority-filtered search with limit: {search_limit}")
+            # Single-field text vector search scoped to the requested priority bucket.
             search_results = qdrant_client.query_points(
                 collection_name=settings.COLLECTION_NAME,
                 query=query_embedding.tolist(),

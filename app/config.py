@@ -89,6 +89,25 @@ class Settings(BaseSettings):
     HYBRID_DENSE_WEIGHT: float = float(os.getenv("HYBRID_DENSE_WEIGHT", "0.7"))
     HYBRID_SPARSE_WEIGHT: float = float(os.getenv("HYBRID_SPARSE_WEIGHT", "0.3"))
 
+    # Hybrid fusion method — how the dense and sparse modalities are combined into
+    # the final weighted_score that orders results. Selectable per deployment:
+    #   "weighted" (default): HYBRID_DENSE_WEIGHT * minmax(dense) +
+    #                         HYBRID_SPARSE_WEIGHT * minmax(sparse). Score-based.
+    #   "rrf": Reciprocal Rank Fusion over two lists — the combined dense list
+    #          (ranked by the weighted multi-field cosine sum) and the sparse list —
+    #          rrf = 1/(RRF_K+dense_rank) + 1/(RRF_K+sparse_rank), then min-max
+    #          normalized to [0, 1]. Rank-based; robust across retrievers.
+    # In BOTH modes the dense component remains the weighted multi-field cosine sum
+    # (SEARCH_PRIORITY_WEIGHTS) — only the dense+sparse fusion step differs.
+    HYBRID_FUSION_METHOD: str = os.getenv("HYBRID_FUSION_METHOD", "weighted").lower()
+
+    # Default for the per-request `include_scoring_debug` flag. When true, search
+    # responses surface the hybrid fusion breakdown (keyword_score, rrf_score,
+    # dense_rank, sparse_rank) on every result. A request may still override this
+    # per call by sending include_scoring_debug explicitly. Keep false in
+    # production (responses stay lean given the large default top_k).
+    INCLUDE_SCORING_DEBUG: bool = os.getenv("INCLUDE_SCORING_DEBUG", "false").lower() == "true"
+
     # Candidate pool sizing for multi-field search. Each dense named-vector search
     # (title/text/tags/summary/metadata) and the sparse BM25 search retrieves up to
     # `min(top_k * SEARCH_CANDIDATE_FANOUT, SEARCH_CANDIDATE_MAX)` candidates; the
