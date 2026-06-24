@@ -229,7 +229,13 @@ class PrioritizedSearchService:
             # Use preprocessed query for embedding generation
             # Fallback to original if preprocessing returns empty
             query_for_embedding = preprocessed_query if preprocessed_query.strip() else request.query
-            
+
+            # Title/summary boost is a KEYWORD substring match, not a semantic match: it must
+            # use the ORIGINAL query. The preprocessed query drops stop-words, which breaks the
+            # contiguous-substring check in _classify_text_match when a stop-word sits between
+            # content words (e.g. "ministry of education" → "ministry education"). See CLAUDE.md §15.
+            query_for_keyword_match = request.query
+
             logger.info(f"Generating embedding for query: '{query_for_embedding}'")
             try:
                 query_embedding = generate_embeddings([query_for_embedding])[0]
@@ -308,10 +314,10 @@ class PrioritizedSearchService:
                 # matches; the supplement adds any mid/infix matches already present
                 # in the dense candidate pool that the scroll missed.
                 title_matches = self._get_field_match_sources(
-                    query_for_embedding, filter_conditions, "title"
+                    query_for_keyword_match, filter_conditions, "title"
                 )
                 self._supplement_matches_from_results(
-                    query_for_embedding, top_results, "title", title_matches
+                    query_for_keyword_match, top_results, "title", title_matches
                 )
                 top_results = self._apply_field_boost(
                     top_results, title_matches, "title",
@@ -320,10 +326,10 @@ class PrioritizedSearchService:
 
                 # Summary boost (lower priority, applied after title).
                 summary_matches = self._get_field_match_sources(
-                    query_for_embedding, filter_conditions, "summary"
+                    query_for_keyword_match, filter_conditions, "summary"
                 )
                 self._supplement_matches_from_results(
-                    query_for_embedding, top_results, "summary", summary_matches
+                    query_for_keyword_match, top_results, "summary", summary_matches
                 )
                 top_results = self._apply_field_boost(
                     top_results, summary_matches, "summary",
