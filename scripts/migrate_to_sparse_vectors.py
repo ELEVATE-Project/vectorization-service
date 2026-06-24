@@ -621,7 +621,9 @@ def main() -> None:
     collection = os.getenv("COLLECTION_NAME", "documents")
     sparse_name = os.getenv("SPARSE_VECTOR_NAME", "bm25")
 
-    client = QdrantClient(host=host, port=port)
+    # check_compatibility=False: client 1.18 / server 1.12 is a known, verified gap
+    # (server can't be upgraded; client pinned for BM25). See CLAUDE.md compat matrix.
+    client = QdrantClient(host=host, port=port, check_compatibility=False)
     logger.info(f"Connected to Qdrant at {host}:{port}")
 
     if args.new_collection:

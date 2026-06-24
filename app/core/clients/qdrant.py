@@ -8,8 +8,20 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Initialize client
-qdrant_client = QdrantClient(settings.QDRANT_HOST, port=settings.QDRANT_PORT)
+# Initialize client.
+# check_compatibility=False: the server is pinned at 1.12 and the client at 1.18
+# (required for BM25 sparse search). The client emits a blanket version-gap warning
+# because the minor diff exceeds 1, but every operation this service uses — multi-field
+# dense + BM25 sparse query_batch_points, scroll/MatchText/MatchAny, retrieve, named-
+# dense + sparse(IDF) upsert, payload indexes, set_payload — is supported by server 1.12
+# and verified working. See the "Qdrant 1.18 client <-> 1.12 server compatibility"
+# section in CLAUDE.md for the supported/unsupported feature matrix before adding any
+# newer Qdrant feature (MatchPhrase, FormulaQuery, post-1.12 TextIndexParams fields).
+qdrant_client = QdrantClient(
+    settings.QDRANT_HOST,
+    port=settings.QDRANT_PORT,
+    check_compatibility=False,
+)
 
 # Prefix-tokenized text index for title/summary. The PREFIX tokenizer indexes every
 # prefix of each token (e.g. "insurance" → "in", "ins", "insu", ...), so partial and

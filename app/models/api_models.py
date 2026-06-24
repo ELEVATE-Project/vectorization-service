@@ -36,7 +36,7 @@ class MultilingualQueryRequest(BaseModel):
     priority_filter: Optional[str] = None
 
 class SimilarityCheckRequest(BaseModel):
-    text: str = Field(..., description="Text to check for similarity")
+    text: str = Field(..., min_length=1, description="Text to check for similarity")
     company_id: str = Field(..., description="Company ID to filter by")
     threshold: float = Field(default=0.85, description="Similarity threshold")
     exclude_source_id: Optional[str] = Field(None, description="Source ID to exclude")
@@ -158,7 +158,7 @@ class PrioritizedSearchResponse(BaseModel):
     )
 
 class TextSearchRequest(BaseModel):
-    query: str = Field(..., description="Search query text")
+    query: str = Field(..., min_length=1, description="Search query text")
     top_k: int = Field(default=10, description="Number of unique documents to return (default: 5)")
     threshold: float = Field(default=0.40, description="Minimum similarity score threshold (default: 0.40)")
 

@@ -14,7 +14,9 @@ FIELD_DOCUMENT_TYPE_NEW = "DOCUMENT_TYPE"
 def rename_field_in_documents():
     """Rename DOCUMENT TYPE to DOCUMENT_TYPE in all documents"""
     
-    client = QdrantClient(settings.QDRANT_HOST, port=settings.QDRANT_PORT)
+    # check_compatibility=False: client 1.18 / server 1.12 is a known, verified gap
+    # (server can't be upgraded; client pinned for BM25). See CLAUDE.md compat matrix.
+    client = QdrantClient(settings.QDRANT_HOST, port=settings.QDRANT_PORT, check_compatibility=False)
     collection_name = settings.COLLECTION_NAME
     
     print("="  * 80)

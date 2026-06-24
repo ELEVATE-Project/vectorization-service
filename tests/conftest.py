@@ -29,6 +29,18 @@ except Exception:
     def log_test_end(logger, name, status): pass
 
 
+def pytest_configure(config):
+    """Register custom markers to avoid PytestUnknownMarkWarning."""
+    config.addinivalue_line(
+        "markers",
+        "requires_qdrant: test needs a live Qdrant server; skipped if unreachable.",
+    )
+    config.addinivalue_line(
+        "markers",
+        "compat: client/server version-compatibility guard (live Qdrant required).",
+    )
+
+
 @pytest.fixture(scope="session")
 def logger():
     """Provide test logger for all tests"""
