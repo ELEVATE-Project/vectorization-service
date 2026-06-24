@@ -83,10 +83,10 @@ class PrioritizedSearchRequest(BaseModel):
         default=None,
         description="Optional list of document types to filter (searches in 'metadata.type' field, OR condition)"
     )
-    search_mode: Literal["hybrid", "semantic", "keyword"] = Field(
+    search_mode: Literal["hybrid", "semantic"] = Field(
         default="hybrid",
-        description="Search mode: 'hybrid' (semantic + title boost), 'semantic' (vector only), "
-                    "or 'keyword' (title/keyword match only). Defaults to 'hybrid'. "
+        description="Search mode: 'hybrid' (semantic + title/summary boost) or "
+                    "'semantic' (vector only, no boosts). Defaults to 'hybrid'. "
                     "Any other value is rejected with a 422 validation error."
     )
     include_scoring_debug: bool = Field(
