@@ -108,9 +108,9 @@ class PrioritizedSearchService:
     def _build_result_items(self, top_results, include_scoring_debug: bool = False) -> List[SearchResultItem]:
         """Build result items from top results.
 
-        Strips internal scoring keys ("rrf", SPARSE_VECTOR_NAME) before serializing
-        to the API response — those keys are ranking internals, not per-field
-        cosine similarities. Only float scores corresponding to actual dense vector
+        Strips the internal sparse (BM25) scoring key (SPARSE_VECTOR_NAME) before
+        serializing to the API response — it is a ranking internal, not a per-field
+        cosine similarity. Only float scores corresponding to actual dense vector
         fields (title, tags, summary, metadata, text) are surfaced to the client.
 
         For documents injected via _fetch_field_match_docs (keyword/text-match only),
@@ -121,9 +121,9 @@ class PrioritizedSearchService:
         _rank_results (keyword_score, rrf_score, dense_rank, sparse_rank) is surfaced
         on each item; otherwise those stay None to keep responses lean.
         """
-        # Keys that are used internally for ranking but must not appear in
+        # Key used internally for ranking (raw BM25 score) but must not appear in
         # the public field_scores contract.
-        INTERNAL_SCORE_KEYS = {"rrf", settings.SPARSE_VECTOR_NAME}
+        INTERNAL_SCORE_KEYS = {settings.SPARSE_VECTOR_NAME}
 
         result_items = []
         for result_data in top_results:
@@ -134,8 +134,8 @@ class PrioritizedSearchService:
                 title_match = field_scores.pop("title_match", None)
                 summary_match = field_scores.pop("summary_match", None)
 
-                # Remove internal RRF/BM25 keys — they are fusion mechanics,
-                # not per-field cosine similarity scores.
+                # Remove the internal BM25 score key — it is fusion mechanics,
+                # not a per-field cosine similarity score.
                 for key in INTERNAL_SCORE_KEYS:
                     field_scores.pop(key, None)
 
@@ -595,20 +595,14 @@ class PrioritizedSearchService:
             t1 = time.time()
             logger.info(f"TIMING: query_batch_points took {t1-t0:.2f}s")
 
-            # 4. Compute RRF Rank Scores in Python
-            # Reciprocal Rank Fusion formula: RRF_Score = Sum( 1 / (RRF_K + rank) )
-            rrf_scores: Dict[str, float] = {}
-            RRF_K = settings.RRF_K
-
-            for field, query_response in zip(valid_fields, batch_results):
-                points = query_response.points
-                # Qdrant guarantees points are returned sorted descending by score
-                for rank_idx, point in enumerate(points):
-                    pid = point.id
-                    rank = rank_idx + 1
-                    rrf_scores[pid] = rrf_scores.get(pid, 0.0) + (1.0 / (RRF_K + rank))
-
-            # 5. Populate return dictionaries
+            # 4. Collect per-field raw similarity scores from the batch results.
+            #    Each doc keeps the raw cosine score for every dense field that
+            #    retrieved it, plus the raw BM25 score under the sparse field key
+            #    (SPARSE_VECTOR_NAME) when the sparse query participated and returned
+            #    hits. The presence of that sparse key is what _rank_results uses to
+            #    detect hybrid mode and to fuse dense + sparse — the actual dense/sparse
+            #    fusion (weighted or two-list RRF) lives there, so there is no separate
+            #    all-field RRF computed or stored here.
             all_results: Dict[str, Any] = {}
             field_scores: Dict[str, Dict[str, float]] = {}
 
@@ -621,11 +615,7 @@ class PrioritizedSearchService:
                     # Store individual raw similarity score for the field (for detail_filter_score check)
                     field_scores[pid][field] = getattr(point, "score", 0.0)
 
-            # Inject the calculated RRF score under "rrf" key (for _rank_results)
-            for pid in all_results:
-                field_scores[pid]["rrf"] = rrf_scores.get(pid, 0.0)
-
-            # 6. Remap raw Qdrant vector-field names to the semantic field names that
+            # 5. Remap raw Qdrant vector-field names to the semantic field names that
             #    _apply_detail_filter checks against ("title", "text", "tags",
             #    "summary", "metadata"). The keys of self.default_weights are the
             #    authoritative semantic names; the corresponding Qdrant vector name is
@@ -633,8 +623,9 @@ class PrioritizedSearchService:
             #    named vectors with no prefix (see app/core/clients/qdrant.py), so the
             #    mapping is an identity today — but doing it explicitly keeps the
             #    field_scores contract correct if a prefix is ever introduced.
-            #    "rrf" and "bm25" (SPARSE_VECTOR_NAME) keys are preserved untouched —
-            #    they are consumed by _rank_results and surfaced for debugging.
+            #    The "bm25" (SPARSE_VECTOR_NAME) key is preserved untouched — it carries
+            #    the raw BM25 score consumed by _rank_results' dense+sparse fusion and
+            #    signals hybrid mode.
             prefix = getattr(settings, "VECTOR_FIELD_PREFIX", "") or ""
             qdrant_to_semantic = {
                 f"{prefix}{semantic}": semantic for semantic in self.default_weights
@@ -644,19 +635,23 @@ class PrioritizedSearchService:
                     if qdrant_name in scores and semantic_name not in scores:
                         scores[semantic_name] = scores[qdrant_name]
 
-            logger.info(f"Client-side RRF search returned {len(all_results)} unique documents (metadata-only)")
+            logger.info(f"Client-side hybrid search returned {len(all_results)} unique documents (metadata-only)")
             return all_results, field_scores
 
-        except (ImportError, AttributeError, RuntimeError) as exc:
-            # ImportError/AttributeError: optional sparse deps (fastembed / qdrant
-            # SparseVector) missing. RuntimeError: the BM25 encoder failed to
-            # initialise or encode at runtime — generate_sparse_vector() wraps every
-            # encoder failure (corrupted model cache, download failure, OOM, even a
-            # missing-fastembed ImportError) as RuntimeError. All of these are
-            # sparse-side problems, so degrade gracefully to dense-only search.
-            # NOTE: Qdrant transport errors (timeouts, connection failures) raise
-            # other exception types and are intentionally NOT caught here, so genuine
-            # infra problems still surface instead of being masked.
+        except (ImportError, RuntimeError) as exc:
+            # ImportError: optional sparse deps (fastembed / qdrant SparseVector)
+            # missing — the module-level `from ... import` at the top of the try fails.
+            # RuntimeError: the BM25 encoder failed to initialise or encode at runtime —
+            # generate_sparse_vector() wraps every encoder failure (corrupted model
+            # cache, download failure, OOM, even a missing-fastembed ImportError) as
+            # RuntimeError. Both are sparse-side problems, so degrade gracefully to
+            # dense-only search.
+            # NOTE: AttributeError is intentionally NOT caught — it is not a genuine
+            # sparse-availability signal (the deps are imported, not attribute-accessed)
+            # and catching it would silently swallow programming errors (e.g. a typo
+            # like query_response.point) as a quiet dense-only degradation. Likewise,
+            # Qdrant transport errors (timeouts, connection failures) raise other
+            # exception types and surface instead of being masked.
             logger.warning(
                 f"Hybrid search unavailable ({type(exc).__name__}: {exc}); "
                 "falling back to dense-only parallel search."
@@ -809,9 +804,13 @@ class PrioritizedSearchService:
         filter_score, instead of the raw RRF fused value (~0-0.1) which never clears a
         cosine-scale threshold.
 
-        Note: the per-field "rrf" key injected by _hybrid_batch_search is a separate,
-        independent value consumed only by _apply_detail_filter's sparse-only fallback;
-        it is unaffected by HYBRID_FUSION_METHOD.
+        Note: hybrid mode is detected by the presence of a raw sparse (BM25) score in
+        field_scores (the sparse field key), not a separate all-field RRF value. The
+        "rrf" fusion method below computes its own RRF over exactly TWO lists — the
+        single combined dense list (the 5 dense fields collapsed into one weighted
+        cosine sum, raw_dense) and the sparse list (raw_sparse) — i.e. up to two rank
+        terms per doc, NOT one RRF term per dense field. _apply_detail_filter is pure
+        per-field OR logic and does not consume any fusion score.
 
         Args:
             all_results: Dictionary of search results by point ID
@@ -823,9 +822,15 @@ class PrioritizedSearchService:
             List of ranked results sorted by weighted score (descending)
         """
         sparse_name = settings.SPARSE_VECTOR_NAME
-        # Hybrid mode is signalled by the presence of an "rrf" key (injected by
-        # _hybrid_batch_search). In that mode fuse normalized dense + sparse scores.
-        is_hybrid = any("rrf" in fs for fs in field_scores.values())
+        # Hybrid mode is signalled by the presence of a raw sparse (BM25) score under
+        # the sparse field key — _hybrid_batch_search injects it only when the BM25
+        # query actually participated and returned hits. This is the same key the rrf/
+        # weighted fusion below reads as raw_sparse, so detection and fusion stay tied
+        # to one signal. Detecting it this way (rather than via a global flag or a
+        # separate all-field RRF marker) keeps the dense-only fallback and the
+        # empty-sparse edge case on the plain weighted-sum path, avoiding score
+        # deflation. In hybrid mode we fuse normalized dense + sparse scores.
+        is_hybrid = any(sparse_name in fs for fs in field_scores.values())
 
         # Fusion method (env-selectable): "weighted" min-max score fusion, or "rrf"
         # rank fusion of the combined dense list vs the sparse list. The dense
@@ -906,7 +911,7 @@ class PrioritizedSearchService:
 
             # Do NOT cap at 1.0 here — the title/summary boost (applied later) needs
             # the uncapped score to differentiate matches, and enforces its own cap.
-            num_fields_matched = len([k for k in field_score_dict.keys() if k not in ("rrf", sparse_name)])
+            num_fields_matched = len([k for k in field_score_dict.keys() if k != sparse_name])
 
             entry = {
                 'id': result.id,
@@ -970,25 +975,6 @@ class PrioritizedSearchService:
                 if field_score >= threshold:
                     passed = True
                     passing_fields.append(f"{field}={field_score:.3f}")
-
-            # RRF fallback: a document retrieved only via the BM25 sparse field has
-            # no per-field cosine similarity (all semantic scores absent/zero) and
-            # would be dropped here despite a valid fused rank. When that happens and
-            # an "rrf" score is present, fall back to comparing it against the
-            # *minimum* of the configured field thresholds (the easiest bar to clear)
-            # so legitimate sparse-only hits survive instead of silently disappearing.
-            if not passed and "rrf" in field_score_dict:
-                all_semantic_zero = all(
-                    (field_score_dict.get(field) or 0.0) == 0.0 for field in thresholds
-                )
-                if all_semantic_zero:
-                    rrf_score = field_score_dict.get("rrf", 0.0) or 0.0
-                    min_threshold = min(thresholds.values())
-                    if rrf_score >= min_threshold:
-                        passed = True
-                        passing_fields.append(
-                            f"rrf={rrf_score:.4f}>=min_threshold({min_threshold})"
-                        )
 
             if passed:
                 total_passed += 1
