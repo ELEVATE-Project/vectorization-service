@@ -4,7 +4,11 @@ from typing import List, Dict, Optional, Any, Set
 from qdrant_client import models
 from qdrant_client.models import QueryRequest
 from app.core.clients.qdrant import qdrant_client
-from app.core.clients.embedding import generate_embeddings
+# Imported as a module (not `from ... import embed_query`) so a single patch point
+# `app.core.clients.embedding.embed_query` works in tests, and so the validated query
+# helpers are always resolved through the canonical reference.
+from app.core.clients import embedding
+from app.core.clients.embedding import EmbeddingError
 from app.config import settings
 from app.models.api_models import (
     PrioritizedSearchRequest,
@@ -237,11 +241,18 @@ class PrioritizedSearchService:
             query_for_keyword_match = request.query
 
             logger.info(f"Generating embedding for query: '{query_for_embedding}'")
+            # embed_query rejects empty/whitespace input and validates the produced
+            # vector (length == EMBEDDING_DIM, finite values) so a malformed vector can
+            # never reach Qdrant. Returns a validated list[float].
             try:
-                query_embedding = generate_embeddings([query_for_embedding])[0]
-            except Exception as e:
-                logger.error(f"Failed to generate embeddings: {str(e)}")
-                raise ValueError(f"Failed to generate embeddings for query: {str(e)}")
+                query_embedding = embedding.embed_query(query_for_embedding)
+            except EmbeddingError as e:
+                logger.error(
+                    "Query embedding invalid: service=prioritized_search "
+                    f"query='{query_for_embedding[:80]}' expected_dim={embedding.EMBEDDING_DIM} "
+                    f"error={e}"
+                )
+                raise
             
             filter_conditions = self._build_filters(
                 categories=request.categories,
@@ -464,15 +475,20 @@ class PrioritizedSearchService:
         """
         search_requests = []
         valid_fields = []
-        
+
+        # Defense-in-depth: validate the dense vector immediately before it is sent to
+        # Qdrant. query_embedding is already a validated list from embed_query, but this
+        # guards against any future caller passing a raw/empty vector.
+        dense_vector = embedding.validate_vector(query_embedding)
+
         for field in search_fields:
             if field not in weights:
                 logger.warning(f"Field '{field}' not in weights config, skipping")
                 continue
-            
+
             search_requests.append(
                 QueryRequest(
-                    query=query_embedding.tolist(),
+                    query=dense_vector,
                     using=field,
                     limit=limit,
                     with_payload=True,
@@ -528,6 +544,10 @@ class PrioritizedSearchService:
             search_requests = []
             valid_fields = []
 
+            # Defense-in-depth: validate the dense vector before it reaches Qdrant
+            # (prevents the "expected dim: 384, got 0" batch 400).
+            dense_vector = embedding.validate_vector(query_embedding)
+
             # Project payload to retrieve only small metadata keys needed for filters and boosts.
             # Excludes the heavy 'text' payload field during candidate scoring.
             metadata_payload_fields = ["source_id", "title", "summary", "tags", "metadata"]
@@ -537,7 +557,7 @@ class PrioritizedSearchService:
                 if field in self.default_weights:
                     search_requests.append(
                         QueryRequest(
-                            query=query_embedding.tolist(),
+                            query=dense_vector,
                             using=field,
                             limit=limit,
                             with_payload=metadata_payload_fields,

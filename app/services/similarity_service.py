@@ -3,7 +3,7 @@ from typing import List, Dict, Any
 from fastapi import HTTPException
 from qdrant_client import models
 from app.core.clients.qdrant import qdrant_client
-from app.core.clients.embedding import generate_single_embedding
+from app.core.clients import embedding
 from app.config import settings
 from app.models.api_models import SimilarityCheckRequest, SimilarityCheckResponse
 
@@ -21,8 +21,9 @@ class SimilarityService:
         try:
             logger.info(f"Checking similarity for text: {request.text[:100]}...")
 
-            # Generate embedding for the text (limit to 1000 chars for performance)
-            text_embedding = generate_single_embedding(request.text[:1000])
+            # Generate + validate the embedding (limit to 1000 chars for performance).
+            # embed_query rejects empty/whitespace text and malformed vectors before Qdrant.
+            text_vector = embedding.embed_query(request.text[:1000])
 
             # Build search filter
             filter_conditions = [
@@ -55,7 +56,7 @@ class SimilarityService:
             logger.debug(f"Searching with threshold: {request.threshold}")
             search_results = qdrant_client.query_points(
                 collection_name=settings.COLLECTION_NAME,
-                query=text_embedding.tolist(),
+                query=text_vector,
                 using="text",
                 limit=5,  # Get top 5 similar documents
                 query_filter=search_filter,
@@ -87,6 +88,9 @@ class SimilarityService:
                 similar_documents=similar_docs
             )
 
+        except embedding.EmbeddingError:
+            # Empty/invalid query vector — let the global handler return HTTP 422.
+            raise
         except Exception as e:
             logger.error(f"Similarity check failed: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Similarity check failed: {str(e)}")
