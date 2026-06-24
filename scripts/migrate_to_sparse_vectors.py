@@ -81,6 +81,7 @@ WHY A MIGRATION IS NEEDED (not just a schema update)
 import argparse
 import logging
 import os
+import re
 import sys
 import time
 
@@ -92,6 +93,28 @@ logger = logging.getLogger(__name__)
 
 EMBED_SIZE = 384          # all-MiniLM-L6-v2 output dimension
 DENSE_FIELDS = ["text", "title", "summary", "tags", "metadata"]
+
+# Allowed characters for a collection name. This is intentionally strict:
+# the value is written verbatim into the .env file, which start_mac.sh sources
+# as a shell script (`set -a; source .env`). Anything outside this set — newlines,
+# quotes, shell metacharacters, command substitution — could inject variables or
+# execute arbitrary commands when .env is sourced. The pattern also matches
+# Qdrant's own collection naming constraints.
+_COLLECTION_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_collection_name(name: str) -> str:
+    """Return name if it is a safe collection identifier, else raise ValueError.
+
+    Guards the value before it is ever written to the .env file (see
+    _update_env_file) — see _COLLECTION_NAME_RE for why this must be strict.
+    """
+    if not name or not _COLLECTION_NAME_RE.match(name):
+        raise ValueError(
+            f"Invalid collection name {name!r}: only letters, digits, '_' and '-' "
+            "are allowed (must be non-empty, no whitespace/quotes/shell metacharacters)."
+        )
+    return name
 
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -326,6 +349,13 @@ def _update_env_file(env_path: str, old_col: str, new_col: str) -> bool:
 
     Returns True on success, False on any error.
     """
+    # Defense-in-depth: never write an unvalidated value into .env, regardless of
+    # caller. .env is sourced by start_mac.sh, so an unsafe value is code execution.
+    try:
+        _validate_collection_name(new_col)
+    except ValueError as exc:
+        logger.error(f"  ❌ Refusing to update .env: {exc}")
+        return False
     if not os.path.isfile(env_path):
         logger.warning(f"  .env file not found at '{env_path}' — skipping auto-update.")
         return False
@@ -559,6 +589,15 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
 
 def main() -> None:
     args = parse_args()
+
+    # Validate the target collection name before doing anything: it is written
+    # verbatim into the .env file on success, which start_mac.sh sources as shell.
+    if args.new_collection is not None:
+        try:
+            _validate_collection_name(args.new_collection)
+        except ValueError as exc:
+            logger.error(str(exc))
+            sys.exit(2)
 
     try:
         from qdrant_client import QdrantClient
