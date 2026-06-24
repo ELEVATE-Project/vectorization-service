@@ -297,6 +297,10 @@ class PrioritizedSearchService:
             # search_mode="semantic" explicitly opts out; any other value (including
             # the default "hybrid") opts in.
             search_mode = getattr(request, "search_mode", "hybrid")
+            # Source_ids injected by the title/summary boost below (filtered out of the
+            # semantic pool). Tracked so total_results counts them — otherwise the
+            # response could report fewer total than it returns.
+            injected_source_ids: set = set()
             if settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic":
                 logger.info("Applying hybrid title + summary boost")
 
@@ -338,6 +342,7 @@ class PrioritizedSearchService:
                     )
                     top_results = top_results + injected
                     present_ids.update(missing_title)
+                    injected_source_ids.update(d["payload"].get("source_id") for d in injected)
                     logger.info(f"Injected {len(injected)} title-match docs missing from semantic results")
 
                 missing_summary = [
@@ -350,6 +355,7 @@ class PrioritizedSearchService:
                         settings.EXACT_SUMMARY_BOOST, settings.PARTIAL_SUMMARY_BOOST,
                     )
                     top_results = top_results + injected
+                    injected_source_ids.update(d["payload"].get("source_id") for d in injected)
                     logger.info(f"Injected {len(injected)} summary-match docs missing from semantic results")
 
                 top_results.sort(key=lambda x: x["weighted_score"], reverse=True)
@@ -403,12 +409,18 @@ class PrioritizedSearchService:
                     "metadata": detail_filter_score.metadata
                 }
             
+            # total_results = all unique matched sources (semantic pool ∪ injected boost docs),
+            # so the count never reports fewer than the results actually returned.
+            matched_source_ids = {r["payload"].get("source_id") for r in unique_source_results}
+            matched_source_ids |= injected_source_ids
+            total_results = len(matched_source_ids)
+
             logger.info("========== SEARCH COMPLETED ==========" )
-            logger.info(f"Returned {len(result_items)} results from {len(unique_source_results)} unique sources")
-            
+            logger.info(f"Returned {len(result_items)} results from {total_results} unique sources")
+
             return PrioritizedSearchResponse(
                 query=request.query,
-                total_results=len(unique_source_results),
+                total_results=total_results,
                 top_k=top_k,
                 results=result_items,
                 search_config=search_config
