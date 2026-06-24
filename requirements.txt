@@ -6,10 +6,8 @@ sqlalchemy
 psycopg2-binary
 redis
 # Pinned to >=1.18.0: enables sparse vectors (BM25) and the Query API with RRF.
-# NOTE: search()/scroll()/search_batch() were removed in the 1.14–1.16 line — all
-# call sites use query_points()/query_batch_points(). Requires Python >=3.9/3.10 —
-# fully compatible with the enforced Python 3.10.16 runtime. Do not upgrade beyond
-# <2.0.0 without re-testing, as major versions break API.
+# NOTE: Compatible with the project's Python 3.10.16 runtime.
+# Re-test before upgrading to qdrant-client 2.x, as major versions may introduce breaking API changes.
 qdrant-client[fastembed]>=1.18.0,<2.0.0
 
 # File Processing

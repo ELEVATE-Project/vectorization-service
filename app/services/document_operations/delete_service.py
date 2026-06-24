@@ -2,7 +2,7 @@ import logging
 import traceback
 from typing import Optional
 from fastapi import HTTPException
-from qdrant_client.http import models
+from qdrant_client import models
 from app.services.document_operations.base_operation import BaseDocumentOperation
 from app.core.clients.qdrant import qdrant_client
 from app.config import settings
