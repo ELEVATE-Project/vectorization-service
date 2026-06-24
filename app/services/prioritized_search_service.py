@@ -621,7 +621,9 @@ class PrioritizedSearchService:
                     # Store individual raw similarity score for the field (for detail_filter_score check)
                     field_scores[pid][field] = getattr(point, "score", 0.0)
 
-            # Inject the calculated RRF score under "rrf" key (for _rank_results)
+            # Inject the calculated RRF score under "rrf" key. Its presence is the
+            # signal _rank_results uses to detect hybrid mode (is_hybrid); the value
+            # itself is not consumed by the detail filter (per-field OR logic only).
             for pid in all_results:
                 field_scores[pid]["rrf"] = rrf_scores.get(pid, 0.0)
 
@@ -809,9 +811,10 @@ class PrioritizedSearchService:
         filter_score, instead of the raw RRF fused value (~0-0.1) which never clears a
         cosine-scale threshold.
 
-        Note: the per-field "rrf" key injected by _hybrid_batch_search is a separate,
-        independent value consumed only by _apply_detail_filter's sparse-only fallback;
-        it is unaffected by HYBRID_FUSION_METHOD.
+        Note: the per-field "rrf" key injected by _hybrid_batch_search is used here
+        only as the is_hybrid marker (its presence signals hybrid mode); its numeric
+        value is not consumed by ranking or by _apply_detail_filter (which is pure
+        per-field OR logic). It is unaffected by HYBRID_FUSION_METHOD.
 
         Args:
             all_results: Dictionary of search results by point ID
@@ -970,25 +973,6 @@ class PrioritizedSearchService:
                 if field_score >= threshold:
                     passed = True
                     passing_fields.append(f"{field}={field_score:.3f}")
-
-            # RRF fallback: a document retrieved only via the BM25 sparse field has
-            # no per-field cosine similarity (all semantic scores absent/zero) and
-            # would be dropped here despite a valid fused rank. When that happens and
-            # an "rrf" score is present, fall back to comparing it against the
-            # *minimum* of the configured field thresholds (the easiest bar to clear)
-            # so legitimate sparse-only hits survive instead of silently disappearing.
-            if not passed and "rrf" in field_score_dict:
-                all_semantic_zero = all(
-                    (field_score_dict.get(field) or 0.0) == 0.0 for field in thresholds
-                )
-                if all_semantic_zero:
-                    rrf_score = field_score_dict.get("rrf", 0.0) or 0.0
-                    min_threshold = min(thresholds.values())
-                    if rrf_score >= min_threshold:
-                        passed = True
-                        passing_fields.append(
-                            f"rrf={rrf_score:.4f}>=min_threshold({min_threshold})"
-                        )
 
             if passed:
                 total_passed += 1
