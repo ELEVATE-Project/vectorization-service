@@ -1,7 +1,7 @@
 import json
 import logging
 from typing import List, Dict, Optional
-from qdrant_client.http import models
+from qdrant_client import models
 from app.core.clients.qdrant import qdrant_client, ensure_collections_exist
 from app.config import settings
 

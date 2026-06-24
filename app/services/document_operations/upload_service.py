@@ -314,7 +314,7 @@ class UploadService(BaseDocumentOperation):
         if settings.SPARSE_SEARCH_ENABLED:
             try:
                 from app.core.clients.sparse_encoder import generate_sparse_vector
-                from qdrant_client.http.models import SparseVector  # type: ignore[import]
+                from qdrant_client.models import SparseVector  # type: ignore[import]
                 for chunk in processed_chunks:
                     indices, values = generate_sparse_vector(chunk.get("text", ""))
                     sparse_vectors.append(
