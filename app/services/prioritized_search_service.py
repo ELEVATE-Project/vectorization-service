@@ -311,8 +311,8 @@ class PrioritizedSearchService:
             )
 
             # Apply title boost when hybrid mode is active.
-            # search_mode="semantic" explicitly opts out; any other value (including
-            # the default "hybrid") opts in.
+            # Only two modes exist: "semantic" opts out of boosts; "hybrid" (the
+            # default) opts in. search_mode is validated to that set by Pydantic.
             search_mode = getattr(request, "search_mode", "hybrid")
             # Source_ids injected by the title/summary boost below (filtered out of the
             # semantic pool). Tracked so total_results counts them — otherwise the
