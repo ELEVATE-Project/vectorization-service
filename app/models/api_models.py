@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from app.config import settings
 
 class DocumentMetadata(BaseModel):
@@ -83,10 +83,11 @@ class PrioritizedSearchRequest(BaseModel):
         default=None,
         description="Optional list of document types to filter (searches in 'metadata.type' field, OR condition)"
     )
-    search_mode: str = Field(
+    search_mode: Literal["hybrid", "semantic", "keyword"] = Field(
         default="hybrid",
         description="Search mode: 'hybrid' (semantic + title boost), 'semantic' (vector only), "
-                    "or 'keyword' (title/keyword match only). Defaults to 'hybrid'."
+                    "or 'keyword' (title/keyword match only). Defaults to 'hybrid'. "
+                    "Any other value is rejected with a 422 validation error."
     )
     include_scoring_debug: bool = Field(
         default=settings.INCLUDE_SCORING_DEBUG,
