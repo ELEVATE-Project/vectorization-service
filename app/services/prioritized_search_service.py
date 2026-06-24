@@ -42,7 +42,19 @@ class PrioritizedSearchService:
         self.priority_order = settings.SEARCH_PRIORITY_ORDER
         self.default_weights = settings.SEARCH_PRIORITY_WEIGHTS
         self.min_score_threshold = settings.MIN_WEIGHTED_SCORE_THRESHOLD
-    
+
+    def _candidate_limit(self, top_k: int) -> int:
+        """Per-field candidate pool size for multi-field search.
+
+        Each of the dense named-vector searches and the sparse BM25 search retrieves
+        this many candidates; the union is fused/ranked. The CAP bounds HNSW ``ef``
+        (the dominant query cost) so a large top_k can't trigger a 10k-deep traversal
+        per field; the FANOUT gives small-top_k callers a re-ranking margin. The union
+        across fields still fills top_k after source-level dedup. Env-tunable via
+        SEARCH_CANDIDATE_FANOUT / SEARCH_CANDIDATE_MAX. For top_k=1000 → 500 (was 10000).
+        """
+        return min(max(top_k, 1) * settings.SEARCH_CANDIDATE_FANOUT, settings.SEARCH_CANDIDATE_MAX)
+
     def _log_search_request(self, request: PrioritizedSearchRequest, top_k: int, filter_conditions):
         """Log search request details"""
         logger.info("========== SEARCH REQUEST ==========" )
@@ -89,7 +101,7 @@ class PrioritizedSearchService:
         # Return unique_source_results for total_results to show unique sources count
         return top_results, unique_source_results
 
-    def _build_result_items(self, top_results) -> List[SearchResultItem]:
+    def _build_result_items(self, top_results, include_scoring_debug: bool = False) -> List[SearchResultItem]:
         """Build result items from top results.
 
         Strips internal scoring keys ("rrf", SPARSE_VECTOR_NAME) before serializing
@@ -100,6 +112,10 @@ class PrioritizedSearchService:
         For documents injected via _fetch_field_match_docs (keyword/text-match only),
         field scores are None — meaning no vector similarity was computed for that
         field — rather than 0.0, which would be misleading.
+
+        When include_scoring_debug is True, the hybrid fusion breakdown stashed by
+        _rank_results (keyword_score, rrf_score, dense_rank, sparse_rank) is surfaced
+        on each item; otherwise those stay None to keep responses lean.
         """
         # Keys that are used internally for ranking but must not appear in
         # the public field_scores contract.
@@ -131,6 +147,10 @@ class PrioritizedSearchService:
                     field_scores=field_scores,
                     title_match=title_match,
                     summary_match=summary_match,
+                    keyword_score=result_data.get('keyword_score') if include_scoring_debug else None,
+                    rrf_score=result_data.get('rrf_score') if include_scoring_debug else None,
+                    dense_rank=result_data.get('dense_rank') if include_scoring_debug else None,
+                    sparse_rank=result_data.get('sparse_rank') if include_scoring_debug else None,
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")
@@ -234,9 +254,9 @@ class PrioritizedSearchService:
                     query_text=query_for_embedding,
                     query_embedding=query_embedding,
                     filter_conditions=filter_conditions,
-                    # Retrieve a bounded candidate pool for re-ranking. Qdrant caps
-                    # results at 10k/query; top_k * 100000 would request up to 1M.
-                    limit=min(top_k * 20, 10000),
+                    # Bounded candidate pool per field — keeps HNSW ef small (dominant
+                    # query cost). See _candidate_limit / SEARCH_CANDIDATE_* config.
+                    limit=self._candidate_limit(top_k),
                 )
             else:
                 logger.info("Starting parallel batch search across all fields")
@@ -245,8 +265,8 @@ class PrioritizedSearchService:
                     weights=weights,
                     query_embedding=query_embedding,
                     filter_conditions=filter_conditions,
-                    # Bounded candidate pool per field for re-ranking (see note above).
-                    limit=min(top_k * 20, 10000),
+                    # Bounded candidate pool per field (see note above).
+                    limit=self._candidate_limit(top_k),
                 )
             
             if not all_results:
@@ -277,6 +297,10 @@ class PrioritizedSearchService:
             # search_mode="semantic" explicitly opts out; any other value (including
             # the default "hybrid") opts in.
             search_mode = getattr(request, "search_mode", "hybrid")
+            # Source_ids injected by the title/summary boost below (filtered out of the
+            # semantic pool). Tracked so total_results counts them — otherwise the
+            # response could report fewer total than it returns.
+            injected_source_ids: set = set()
             if settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic":
                 logger.info("Applying hybrid title + summary boost")
 
@@ -318,6 +342,7 @@ class PrioritizedSearchService:
                     )
                     top_results = top_results + injected
                     present_ids.update(missing_title)
+                    injected_source_ids.update(d["payload"].get("source_id") for d in injected)
                     logger.info(f"Injected {len(injected)} title-match docs missing from semantic results")
 
                 missing_summary = [
@@ -330,6 +355,7 @@ class PrioritizedSearchService:
                         settings.EXACT_SUMMARY_BOOST, settings.PARTIAL_SUMMARY_BOOST,
                     )
                     top_results = top_results + injected
+                    injected_source_ids.update(d["payload"].get("source_id") for d in injected)
                     logger.info(f"Injected {len(injected)} summary-match docs missing from semantic results")
 
                 top_results.sort(key=lambda x: x["weighted_score"], reverse=True)
@@ -359,8 +385,8 @@ class PrioritizedSearchService:
                     logger.error(f"Failed late payload retrieval: {exc}")
                     # Fallback to the partial metadata payload already present rather than failing the search
 
-            result_items = self._build_result_items(top_results)
-            
+            result_items = self._build_result_items(top_results, request.include_scoring_debug)
+
             search_config = {
                 "search_fields": search_fields,
                 "weights": weights,
@@ -370,6 +396,8 @@ class PrioritizedSearchService:
                 "filter_score": None if use_detail_filter else filter_score,
                 "search_mode": search_mode,
                 "hybrid_search_enabled": settings.HYBRID_SEARCH_ENABLED,
+                "sparse_search_enabled": settings.SPARSE_SEARCH_ENABLED,
+                "fusion_method": settings.HYBRID_FUSION_METHOD,
             }
             
             if use_detail_filter:
@@ -381,12 +409,18 @@ class PrioritizedSearchService:
                     "metadata": detail_filter_score.metadata
                 }
             
+            # total_results = all unique matched sources (semantic pool ∪ injected boost docs),
+            # so the count never reports fewer than the results actually returned.
+            matched_source_ids = {r["payload"].get("source_id") for r in unique_source_results}
+            matched_source_ids |= injected_source_ids
+            total_results = len(matched_source_ids)
+
             logger.info("========== SEARCH COMPLETED ==========" )
-            logger.info(f"Returned {len(result_items)} results from {len(unique_source_results)} unique sources")
-            
+            logger.info(f"Returned {len(result_items)} results from {total_results} unique sources")
+
             return PrioritizedSearchResponse(
                 query=request.query,
-                total_results=len(unique_source_results),
+                total_results=total_results,
                 top_k=top_k,
                 results=result_items,
                 search_config=search_config
@@ -712,6 +746,17 @@ class PrioritizedSearchService:
         span = hi - lo
         return {k: (v - lo) / span for k, v in scores.items()}
 
+    @staticmethod
+    def _rank_positions(scores: Dict[Any, float]) -> Dict[Any, int]:
+        """Assign 1-indexed ranks to keys ordered by descending score.
+
+        Used by the RRF fusion path: the top-scoring key gets rank 1, the next
+        rank 2, and so on. Ties are broken deterministically by the sort's
+        stability so the same input always yields the same ranks.
+        """
+        ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        return {key: idx + 1 for idx, (key, _) in enumerate(ordered)}
+
     def _rank_results(
         self,
         all_results: Dict[str, Any],
@@ -725,12 +770,22 @@ class PrioritizedSearchService:
         Dense-only path (sparse disabled):
             Final_Score = Σ(Field_Weight × Field_Score)
 
-        Hybrid path (dense + BM25 sparse): each modality is min-max normalized to
-        [0, 1] across the candidate pool, then fused:
-            Final_Score = HYBRID_DENSE_WEIGHT × dense_norm + HYBRID_SPARSE_WEIGHT × sparse_norm
-        The dense component is itself the weighted multi-field cosine sum. This keeps
-        the final score on a calibrated 0-1 scale comparable to filter_score, instead
-        of the raw RRF fused value (~0-0.1) which never clears a cosine-scale threshold.
+        Hybrid path (dense + BM25 sparse): the dense component is always the weighted
+        multi-field cosine sum; the dense+sparse fusion is selected by
+        settings.HYBRID_FUSION_METHOD:
+          - "weighted" (default): each modality is min-max normalized to [0, 1] across
+            the candidate pool, then fused:
+                Final_Score = HYBRID_DENSE_WEIGHT × dense_norm + HYBRID_SPARSE_WEIGHT × sparse_norm
+          - "rrf": Reciprocal Rank Fusion over two lists — the combined dense list
+            (ranked by the weighted cosine sum) and the sparse list:
+                Final_Score = minmax( 1/(RRF_K+dense_rank) + 1/(RRF_K+sparse_rank) )
+        Both modes keep the final score on a calibrated 0-1 scale comparable to
+        filter_score, instead of the raw RRF fused value (~0-0.1) which never clears a
+        cosine-scale threshold.
+
+        Note: the per-field "rrf" key injected by _hybrid_batch_search is a separate,
+        independent value consumed only by _apply_detail_filter's sparse-only fallback;
+        it is unaffected by HYBRID_FUSION_METHOD.
 
         Args:
             all_results: Dictionary of search results by point ID
@@ -746,11 +801,23 @@ class PrioritizedSearchService:
         # _hybrid_batch_search). In that mode fuse normalized dense + sparse scores.
         is_hybrid = any("rrf" in fs for fs in field_scores.values())
 
+        # Fusion method (env-selectable): "weighted" min-max score fusion, or "rrf"
+        # rank fusion of the combined dense list vs the sparse list. The dense
+        # component is the weighted multi-field cosine sum in BOTH modes — only the
+        # dense+sparse combination step differs.
+        fusion_method = settings.HYBRID_FUSION_METHOD
+
         norm_dense: Dict[Any, float] = {}
         norm_sparse: Dict[Any, float] = {}
+        hybrid_scores: Dict[Any, float] = {}
+        # Diagnostic maps surfaced via include_scoring_debug (empty outside hybrid /
+        # the rrf branch, so .get() yields None for those results).
+        raw_sparse: Dict[Any, float] = {}
+        rrf_raw: Dict[Any, float] = {}
+        dense_rank: Dict[Any, int] = {}
+        sparse_rank: Dict[Any, int] = {}
         if is_hybrid:
             raw_dense: Dict[Any, float] = {}
-            raw_sparse: Dict[Any, float] = {}
             for point_id, fs in field_scores.items():
                 dense = 0.0
                 for field in search_fields:
@@ -760,10 +827,39 @@ class PrioritizedSearchService:
                             dense += score * weights[field]
                 raw_dense[point_id] = dense
                 raw_sparse[point_id] = fs.get(sparse_name) or 0.0
-            norm_dense = self._min_max_normalize(raw_dense)
-            norm_sparse = self._min_max_normalize(raw_sparse)
-            dense_w = settings.HYBRID_DENSE_WEIGHT
-            sparse_w = settings.HYBRID_SPARSE_WEIGHT
+
+            if fusion_method == "rrf":
+                # Reciprocal Rank Fusion over two lists: the combined dense list
+                # (ranked by the weighted multi-field cosine sum) and the sparse
+                # list. This keeps the dense weighting intact (constraint) while
+                # fusing by rank position rather than raw score.
+                rrf_k = settings.RRF_K
+                dense_rank = self._rank_positions(raw_dense)
+                # Only docs with an actual sparse hit get a sparse rank.
+                sparse_hits = {pid: s for pid, s in raw_sparse.items() if s > 0.0}
+                sparse_rank = self._rank_positions(sparse_hits)
+                for point_id in raw_dense:
+                    fused = 0.0
+                    if point_id in dense_rank:
+                        fused += 1.0 / (rrf_k + dense_rank[point_id])
+                    if point_id in sparse_rank:
+                        fused += 1.0 / (rrf_k + sparse_rank[point_id])
+                    rrf_raw[point_id] = fused
+                # Normalize to [0, 1] so filter_score keeps a comparable scale
+                # (raw RRF values are ~0-0.03 and would never clear a threshold).
+                # rrf_raw is retained for debug surfacing (pre-normalization).
+                hybrid_scores = self._min_max_normalize(rrf_raw)
+            else:
+                # Weighted min-max score fusion (default).
+                norm_dense = self._min_max_normalize(raw_dense)
+                norm_sparse = self._min_max_normalize(raw_sparse)
+                dense_w = settings.HYBRID_DENSE_WEIGHT
+                sparse_w = settings.HYBRID_SPARSE_WEIGHT
+                for point_id in raw_dense:
+                    hybrid_scores[point_id] = (
+                        dense_w * norm_dense.get(point_id, 0.0)
+                        + sparse_w * norm_sparse.get(point_id, 0.0)
+                    )
 
         ranked = []
 
@@ -771,11 +867,8 @@ class PrioritizedSearchService:
             field_score_dict = field_scores.get(point_id, {})
 
             if is_hybrid:
-                # Fuse the two min-max normalized modalities into a calibrated 0-1 score.
-                weighted_score = (
-                    dense_w * norm_dense.get(point_id, 0.0)
-                    + sparse_w * norm_sparse.get(point_id, 0.0)
-                )
+                # Calibrated 0-1 fused score per the selected fusion method.
+                weighted_score = hybrid_scores.get(point_id, 0.0)
             else:
                 # Dense multi-field path: weighted sum of per-field similarity scores.
                 weighted_score = 0.0
@@ -789,13 +882,22 @@ class PrioritizedSearchService:
             # the uncapped score to differentiate matches, and enforces its own cap.
             num_fields_matched = len([k for k in field_score_dict.keys() if k not in ("rrf", sparse_name)])
 
-            ranked.append({
+            entry = {
                 'id': result.id,
                 'payload': result.payload,
                 'weighted_score': weighted_score,
                 'field_scores': field_score_dict,
                 'num_fields_matched': num_fields_matched
-            })
+            }
+            if is_hybrid:
+                # Internal scoring diagnostics, surfaced only when the request sets
+                # include_scoring_debug (see _build_result_items). rrf_score /
+                # dense_rank / sparse_rank are None outside the rrf fusion branch.
+                entry['keyword_score'] = raw_sparse.get(point_id)
+                entry['rrf_score'] = rrf_raw.get(point_id)
+                entry['dense_rank'] = dense_rank.get(point_id)
+                entry['sparse_rank'] = sparse_rank.get(point_id)
+            ranked.append(entry)
 
         ranked.sort(key=lambda x: x['weighted_score'], reverse=True)
         return ranked
