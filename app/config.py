@@ -13,6 +13,12 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class Settings(BaseSettings):
     QDRANT_HOST: str = os.getenv("QDRANT_HOST", "127.0.0.1")
     QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", 6333))
+    # QA runs Qdrant server 1.12 while the client is pinned at 1.18 (required for BM25 sparse search).
+    # The 6-minor-version gap exceeds Qdrant's allowed ≤1 diff, causing a blanket UserWarning on every
+    # startup. Setting this to false suppresses that check. All operations the service uses have been
+    # verified to work on server 1.12 — the warning is a false alarm for our feature set.
+    # Set to true once QA server is upgraded to 1.18 to re-enable the check.
+    QDRANT_CHECK_COMPATIBILITY: bool = os.getenv("QDRANT_CHECK_COMPATIBILITY", "false").lower() == "true"
     COLLECTION_NAME: str = os.getenv("COLLECTION_NAME", "documents")
     QA_CACHE_COLLECTION: str = os.getenv("QA_CACHE_COLLECTION", "qa_cache")
     AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")

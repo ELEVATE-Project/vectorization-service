@@ -283,10 +283,12 @@ class UploadService(BaseDocumentOperation):
         return chunk_metadata
 
     def _create_point_vectors(self, text_embedding, field_embeddings: dict, sparse_vector=None):
-        """Create vectors dictionary with text and field embeddings.
+        """Build the vectors dict for a Qdrant point.
 
-        When sparse_vector is provided (Phase 2 only) it is stored under the
-        configured sparse vector name so Qdrant can use it for BM25 hybrid search.
+        Always includes the dense "text" vector plus any available field vectors
+        (title, summary, tags, metadata). When sparse_vector is provided it is
+        stored under settings.SPARSE_VECTOR_NAME (default "bm25") to enable
+        BM25 keyword search alongside dense retrieval.
         """
         vectors_dict = {"text": text_embedding.tolist()}
 

@@ -9,7 +9,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Initialize client.
-# check_compatibility=False: the server is pinned at 1.12 and the client at 1.18
+# check_compatibility driven by QDRANT_CHECK_COMPATIBILITY env var (default false).
+# QA server is pinned at 1.12, client at 1.18
 # (required for BM25 sparse search). The client emits a blanket version-gap warning
 # because the minor diff exceeds 1, but every operation this service uses — multi-field
 # dense + BM25 sparse query_batch_points, scroll/MatchText/MatchAny, retrieve, named-
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 qdrant_client = QdrantClient(
     settings.QDRANT_HOST,
     port=settings.QDRANT_PORT,
-    check_compatibility=False,
+    check_compatibility=settings.QDRANT_CHECK_COMPATIBILITY,
 )
 
 # Prefix-tokenized text index for title/summary. The PREFIX tokenizer indexes every
