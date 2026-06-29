@@ -6,7 +6,7 @@ from fastapi import HTTPException, UploadFile
 from qdrant_client import models
 from app.services.document_operations.base_operation import BaseDocumentOperation
 from app.core.clients.qdrant import upload_to_qdrant
-from app.core.clients.embedding import generate_embeddings
+from app.core.clients.embedding import generate_embeddings, validate_vector
 from app.config import settings
 from app.services.file_processors.csv_processor import CSVProcessor
 from app.services.file_processors.pdf_processor import PDFProcessor
@@ -290,11 +290,11 @@ class UploadService(BaseDocumentOperation):
         stored under settings.SPARSE_VECTOR_NAME (default "bm25") to enable
         BM25 keyword search alongside dense retrieval.
         """
-        vectors_dict = {"text": text_embedding.tolist()}
+        vectors_dict = {"text": validate_vector(text_embedding)}
 
         for field_name in ['title', 'summary', 'tags', 'metadata']:
             if field_name in field_embeddings:
-                vectors_dict[field_name] = field_embeddings[field_name].tolist()
+                vectors_dict[field_name] = validate_vector(field_embeddings[field_name])
 
         if sparse_vector is not None:
             # sparse_vector is a qdrant_client SparseVector model instance

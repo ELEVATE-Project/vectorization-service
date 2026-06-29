@@ -474,6 +474,7 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
         logger.info("Skipping copy step (--skip-copy).")
 
     # Step 3: Generate and write BM25 sparse vectors
+    bm25_errors = 0
     if not args.skip_bm25:
         logger.info("=" * 60)
         logger.info("STEP 3: Generating BM25 sparse vectors on target collection")
@@ -540,8 +541,12 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
             f"BM25 encoding complete in {elapsed:.1f}s — "
             f"migrated={migrated}, skipped={skipped}, errors={errors}"
         )
+        bm25_errors = errors
         if errors:
-            logger.warning(f"{errors} errors. Re-run with --skip-copy to retry BM25 only (idempotent).")
+            logger.warning("=" * 60)
+            logger.warning(f"⚠️  BM25 ENCODING: {errors} point(s) failed — these points will lack sparse vectors.")
+            logger.warning("    Re-run with --skip-copy to retry (idempotent).")
+            logger.warning("=" * 60)
     else:
         logger.info("Skipping BM25 step (--skip-bm25).")
 
@@ -558,6 +563,9 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
     if migration_ok:
         logger.info("=" * 60)
         logger.info("✅ MIGRATION SUCCESSFUL")
+        if bm25_errors:
+            logger.warning(f"  ⚠️  {bm25_errors} point(s) had BM25 encoding errors and lack sparse vectors.")
+            logger.warning("     Re-run with --skip-copy to back-fill them (idempotent).")
         logger.info("")
         # Auto-update .env
         logger.info(f"Updating .env file at '{env_path}'...")
@@ -569,16 +577,18 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
         if env_updated:
             logger.warning(f"  ✅ .env has been automatically updated: COLLECTION_NAME={new_col}")
         else:
-            logger.warning(f"  ❌ .env could NOT be updated automatically.")
+            logger.warning("  ❌ .env could NOT be updated automatically.")
             logger.warning(f"     Manually set COLLECTION_NAME={new_col} in your .env / prod config.")
         logger.warning("  ⚠️  YOU MUST RESTART the vectorization-service for changes to take effect.")
-        logger.warning(f"  After confirming search works, delete the old collection with:")
+        logger.warning("  After confirming search works, delete the old collection with:")
         logger.warning(f"     curl -X DELETE http://{host}:{port}/collections/{old_col}")
         logger.info("=" * 60)
     else:
         logger.info("=" * 60)
         logger.error("❌ MIGRATION FAILED VERIFICATION")
         logger.error("   The new collection has issues. Do NOT update your .env yet.")
+        if bm25_errors:
+            logger.error(f"   Additionally, {bm25_errors} point(s) had BM25 encoding errors.")
         logger.error("   Re-run the script with --skip-copy to retry the BM25 encoding step:")
         logger.error(f"     PYTHONPATH=. COLLECTION_NAME={old_col} .venv/bin/python3 scripts/migrate_to_sparse_vectors.py --new-collection {new_col} --skip-copy")
         logger.info("=" * 60)

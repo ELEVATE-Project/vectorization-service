@@ -567,7 +567,11 @@ class PrioritizedSearchService:
                     valid_fields.append(field)
 
             # 2. Build Query Request for BM25 Sparse Field
-            sparse_indices, sparse_values = generate_sparse_vector(query_text)
+            # Replace underscores with spaces so BM25 tokenises compound
+            # underscore-joined terms (e.g. "agentic_engineering") as separate
+            # words rather than a single unknown token that produces empty indices.
+            bm25_query_text = query_text.replace("_", " ")
+            sparse_indices, sparse_values = generate_sparse_vector(bm25_query_text)
             if sparse_indices:
                 search_requests.append(
                     QueryRequest(

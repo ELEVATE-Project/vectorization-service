@@ -42,6 +42,7 @@ _PREFIX_TEXT_INDEX = models.TextIndexParams(
 _PAYLOAD_INDEXES = [
     ("source_id",              PayloadSchemaType.KEYWORD),
     ("metadata.company",       PayloadSchemaType.KEYWORD),
+    ("metadata.type",          PayloadSchemaType.KEYWORD),
     ("tags",                   PayloadSchemaType.KEYWORD),
     ("metadata.DOCUMENT_TYPE", PayloadSchemaType.TEXT),
     ("title",                  _PREFIX_TEXT_INDEX),
@@ -140,7 +141,17 @@ def _ensure_sparse_vector_field(collection_name: str) -> None:
     """
     try:
         from qdrant_client.models import SparseVectorParams, Modifier  # type: ignore[import]
-        from app.config import settings as _s
+    except ImportError:
+        logger.warning(
+            "Cannot add sparse vector field: qdrant-client<1.9.0. "
+            "Upgrade to enable Phase 2 hybrid search."
+        )
+        return
+
+    from qdrant_client.http.exceptions import UnexpectedResponse
+    from app.config import settings as _s
+
+    try:
         qdrant_client.update_collection(
             collection_name=collection_name,
             sparse_vectors_config={
@@ -151,15 +162,18 @@ def _ensure_sparse_vector_field(collection_name: str) -> None:
             f"Sparse vector field '{_s.SPARSE_VECTOR_NAME}' "
             f"added/verified on existing collection '{collection_name}'"
         )
-    except ImportError:
-        logger.warning(
-            "Cannot add sparse vector field: qdrant-client<1.9.0. "
-            "Upgrade to enable Phase 2 hybrid search."
-        )
-    except Exception as exc:
-        # Non-fatal: the field may already exist, or the server version may not
-        # support sparse vectors yet.
-        logger.warning(f"Could not update collection with sparse vectors: {exc}")
+    except UnexpectedResponse as exc:
+        content = exc.content.decode("utf-8", errors="replace").lower()
+        if "already" in content:
+            # Benign: field is already present; update_collection is idempotent.
+            logger.debug(
+                f"Sparse vector field already present on '{collection_name}', skipping update"
+            )
+        else:
+            logger.error(
+                f"Server rejected sparse-vector field update for '{collection_name}': {exc}"
+            )
+            raise
 
 
 def _index_params_match(existing_schema: Any, desired_schema: Any) -> bool:
