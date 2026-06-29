@@ -328,7 +328,7 @@ class PrioritizedSearchService:
                     query_for_keyword_match, filter_conditions, "title"
                 )
                 self._supplement_matches_from_results(
-                    query_for_keyword_match, top_results, "title", title_matches
+                    query_for_keyword_match, unique_source_results, "title", title_matches
                 )
                 top_results = self._apply_field_boost(
                     top_results, title_matches, "title",
@@ -340,7 +340,7 @@ class PrioritizedSearchService:
                     query_for_keyword_match, filter_conditions, "summary"
                 )
                 self._supplement_matches_from_results(
-                    query_for_keyword_match, top_results, "summary", summary_matches
+                    query_for_keyword_match, unique_source_results, "summary", summary_matches
                 )
                 top_results = self._apply_field_boost(
                     top_results, summary_matches, "summary",
@@ -869,7 +869,8 @@ class PrioritizedSearchService:
                 # list. This keeps the dense weighting intact (constraint) while
                 # fusing by rank position rather than raw score.
                 rrf_k = settings.RRF_K
-                dense_rank = self._rank_positions(raw_dense)
+                dense_hits = {pid: s for pid, s in raw_dense.items() if s > 0.0}
+                dense_rank = self._rank_positions(dense_hits)
                 # Only docs with an actual sparse hit get a sparse rank.
                 sparse_hits = {pid: s for pid, s in raw_sparse.items() if s > 0.0}
                 sparse_rank = self._rank_positions(sparse_hits)
@@ -1262,28 +1263,48 @@ class PrioritizedSearchService:
 
         try:
             start_time = time.perf_counter()
-            # Step 2: Query Qdrant once using models.MatchAny.
-            # This fetches all records whose metadata/payload source_id matches any of our target IDs.
-            points, _ = qdrant_client.scroll(
-                collection_name=self.collection_name,
-                scroll_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="source_id",
-                            match=models.MatchAny(any=source_ids),
-                        )
-                    ]
-                ),
-                # Request a safety factor limit of len(source_ids) * 10 to ensure we capture
-                # representative points if sources contain multiple chunks.
-                limit=len(source_ids) * 10,
-                with_payload=True,
-                with_vectors=False,
-            )
+            # Step 2: Paginate scroll with MatchAny until every requested source_id has
+            # at least one point or Qdrant returns no further results.  A single page
+            # of len(source_ids)*10 points (capped at 1000) is almost always enough;
+            # the loop only continues when sources with unusually many chunks exhaust
+            # the first page before all source_ids have been seen.
+            all_points: List = []
+            covered_sources: Set[str] = set()
+            source_ids_set = set(source_ids)
+            page_size = min(len(source_ids) * 10, 1000)
+            offset = None
+            num_pages = 0
+
+            while True:
+                batch, offset = qdrant_client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="source_id",
+                                match=models.MatchAny(any=source_ids),
+                            )
+                        ]
+                    ),
+                    limit=page_size,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                num_pages += 1
+                all_points.extend(batch)
+                for pt in batch:
+                    sid = pt.payload.get("source_id")
+                    if sid:
+                        covered_sources.add(sid)
+                if offset is None or source_ids_set <= covered_sources:
+                    break
+
+            points = all_points
             elapsed_time = time.perf_counter() - start_time
             logger.info(
                 f"Bulk fetch of {len(points)} points for {len(source_ids)} source IDs "
-                f"completed in {elapsed_time:.3f}s (1 request)"
+                f"completed in {elapsed_time:.3f}s ({num_pages} page(s))"
             )
         except Exception as exc:
             logger.warning(f"Could not bulk fetch {field}-match docs: {exc}")

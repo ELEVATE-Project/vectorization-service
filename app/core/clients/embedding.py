@@ -13,7 +13,7 @@ embedding_model = SentenceTransformer(settings.EMBEDDING_MODEL)
 # Expected dimensionality of every vector this service produces/queries (e.g. 384 for
 # all-MiniLM-L6-v2). Resolved once from the loaded model so it tracks the configured
 # EMBEDDING_MODEL rather than being hard-coded.
-EMBEDDING_DIM: int = embedding_model.get_sentence_embedding_dimension()
+EMBEDDING_DIM: int = embedding_model.get_embedding_dimension()
 
 
 class EmbeddingError(ValueError):

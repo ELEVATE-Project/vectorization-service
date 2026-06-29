@@ -11,31 +11,36 @@ that helper was removed in qdrant-client 1.14+, so we use the underlying
 ``fastembed.SparseTextEmbedding`` model directly.
 """
 import logging
+import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 # Lazy singleton — loaded only when sparse search is first requested.
 _sparse_encoder: Optional[object] = None
+_encoder_lock = threading.Lock()
 _SPARSE_MODEL = "Qdrant/bm25"
 
 
 def _get_sparse_encoder():
     """Return a cached ``fastembed.SparseTextEmbedding`` BM25 encoder."""
     global _sparse_encoder
-    if _sparse_encoder is not None:
+    if _sparse_encoder is not None:  # fast path — no lock
         return _sparse_encoder
 
-    try:
-        from fastembed import SparseTextEmbedding  # type: ignore[import]
-        _sparse_encoder = SparseTextEmbedding(model_name=_SPARSE_MODEL)
-        logger.info(f"Sparse BM25 encoder initialised (model: {_SPARSE_MODEL})")
-    except Exception as exc:
-        logger.error(
-            f"Failed to initialise sparse BM25 encoder: {exc}. "
-            "Ensure qdrant-client[fastembed]>=1.18.0 (or fastembed) is installed."
-        )
-        raise
+    with _encoder_lock:
+        if _sparse_encoder is not None:  # second check inside lock
+            return _sparse_encoder
+        try:
+            from fastembed import SparseTextEmbedding  # type: ignore[import]
+            _sparse_encoder = SparseTextEmbedding(model_name=_SPARSE_MODEL)
+            logger.info(f"Sparse BM25 encoder initialised (model: {_SPARSE_MODEL})")
+        except Exception as exc:
+            logger.error(
+                f"Failed to initialise sparse BM25 encoder: {exc}. "
+                "Ensure qdrant-client[fastembed]>=1.18.0 (or fastembed) is installed."
+            )
+            raise
 
     return _sparse_encoder
 
