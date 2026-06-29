@@ -58,30 +58,30 @@ async def ensure_collections_exist():
 
         # Single vector config for backward compatibility
         single_vector_config = models.VectorParams(
-            size=embedding_model.get_sentence_embedding_dimension(),
+            size=embedding_model.get_embedding_dimension(),
             distance=models.Distance.COSINE,
         )
 
         # Named vectors config for multiple embeddings (text, title, summary, tags, metadata)
         named_vectors_config = {
             "text": models.VectorParams(
-                size=embedding_model.get_sentence_embedding_dimension(),
+                size=embedding_model.get_embedding_dimension(),
                 distance=models.Distance.COSINE,
             ),
             "title": models.VectorParams(
-                size=embedding_model.get_sentence_embedding_dimension(),
+                size=embedding_model.get_embedding_dimension(),
                 distance=models.Distance.COSINE,
             ),
             "summary": models.VectorParams(
-                size=embedding_model.get_sentence_embedding_dimension(),
+                size=embedding_model.get_embedding_dimension(),
                 distance=models.Distance.COSINE,
             ),
             "tags": models.VectorParams(
-                size=embedding_model.get_sentence_embedding_dimension(),
+                size=embedding_model.get_embedding_dimension(),
                 distance=models.Distance.COSINE,
             ),
             "metadata": models.VectorParams(
-                size=embedding_model.get_sentence_embedding_dimension(),
+                size=embedding_model.get_embedding_dimension(),
                 distance=models.Distance.COSINE,
             ),
         }

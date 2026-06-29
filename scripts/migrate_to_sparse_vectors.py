@@ -552,6 +552,19 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
             logger.warning(f"⚠️  BM25 ENCODING: {errors} point(s) failed — these points will lack sparse vectors.")
             logger.warning("    Re-run with --skip-copy to retry (idempotent).")
             logger.warning("=" * 60)
+
+        total_text_bearing = migrated + skipped + errors
+        if total_text_bearing > 0:
+            error_rate = errors / total_text_bearing
+            if error_rate > 0.10:
+                logger.error("=" * 60)
+                logger.error(
+                    f"❌ BM25 encoding failure rate {error_rate:.1%} exceeds 10% threshold "
+                    f"({errors}/{total_text_bearing} points). Skipping .env update."
+                )
+                logger.error("   Re-run with --skip-copy to back-fill missing vectors (idempotent).")
+                logger.error("=" * 60)
+                sys.exit(1)
     else:
         logger.info("Skipping BM25 step (--skip-bm25).")
 
