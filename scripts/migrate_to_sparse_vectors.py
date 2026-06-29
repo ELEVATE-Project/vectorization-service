@@ -401,6 +401,14 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
         logger.error(f"Cannot read source collection '{old_col}': {exc}")
         sys.exit(1)
 
+    # Mirror the source collection's actual vector schema so the target matches
+    # regardless of which embedding model (and dimension) was used.
+    try:
+        src_vectors_config = client.get_collection(old_col).config.params.vectors
+    except Exception as exc:
+        logger.error(f"Cannot read source collection config '{old_col}': {exc}")
+        sys.exit(1)
+
     # Step 1: Create target collection
     existing_cols = [c.name for c in client.get_collections().collections]
     if new_col in existing_cols:
@@ -409,15 +417,12 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
         logger.info(f"Creating target collection '{new_col}'...")
         client.create_collection(
             collection_name=new_col,
-            vectors_config={
-                field: VectorParams(size=EMBED_SIZE, distance=Distance.COSINE)
-                for field in DENSE_FIELDS
-            },
+            vectors_config=src_vectors_config,
             sparse_vectors_config={
                 sparse_name: SparseVectorParams(modifier=Modifier.IDF)
             },
         )
-        logger.info(f"Created '{new_col}' with dense={DENSE_FIELDS} + sparse=[{sparse_name}]")
+        logger.info(f"Created '{new_col}' with dense={list(src_vectors_config)} + sparse=[{sparse_name}]")
     else:
         logger.info(f"[DRY RUN] Would create target collection '{new_col}'")
 
