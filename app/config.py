@@ -1,6 +1,8 @@
 # config.py
+import math
 import os
 from dotenv import load_dotenv
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 # Load environment variables from .env file
@@ -131,6 +133,30 @@ class Settings(BaseSettings):
 
     # Environment configuration
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "local")  # local, production, staging, etc.
+
+    @model_validator(mode='after')
+    def _validate_fusion_config(self) -> 'Settings':
+        valid_methods = {"weighted", "rrf"}
+        if self.HYBRID_FUSION_METHOD not in valid_methods:
+            raise ValueError(
+                f"HYBRID_FUSION_METHOD must be one of {sorted(valid_methods)}, "
+                f"got {self.HYBRID_FUSION_METHOD!r}"
+            )
+        dw, sw = self.HYBRID_DENSE_WEIGHT, self.HYBRID_SPARSE_WEIGHT
+        if not (math.isfinite(dw) and dw >= 0.0):
+            raise ValueError(
+                f"HYBRID_DENSE_WEIGHT must be a finite non-negative number, got {dw}"
+            )
+        if not (math.isfinite(sw) and sw >= 0.0):
+            raise ValueError(
+                f"HYBRID_SPARSE_WEIGHT must be a finite non-negative number, got {sw}"
+            )
+        if dw + sw > 1.0 + 1e-9:
+            raise ValueError(
+                f"HYBRID_DENSE_WEIGHT + HYBRID_SPARSE_WEIGHT must not exceed 1.0 "
+                f"(got {dw} + {sw} = {dw + sw:.6f})"
+            )
+        return self
 
 
 settings = Settings()
