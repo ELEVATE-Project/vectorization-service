@@ -172,7 +172,12 @@ def _encode_and_queue(generate_sparse_vector, SparseVector, PointVectors,
                       point, sparse_name: str, pending: list) -> str:
     """
     Generate BM25 vector for a point and append to pending list.
-    Returns 'queued', 'skipped', or 'error'.
+    Returns 'queued', 'skipped', 'no_tokens', or 'error'.
+    'skipped'   — point has no text payload (nothing to encode).
+    'no_tokens' — text exists but BM25 produced empty indices (e.g. pure
+                  markdown table separators like |:---|:---|); no vector written.
+    'error'     — encoder raised an exception.
+    'queued'    — vector generated and appended to pending batch.
     """
     text = (point.payload or {}).get("text", "")
     if not text:
@@ -183,7 +188,7 @@ def _encode_and_queue(generate_sparse_vector, SparseVector, PointVectors,
         logger.warning(f"BM25 encoding failed for point {point.id}: {exc}")
         return "error"
     if not indices:
-        return "skipped"
+        return "no_tokens"
     pending.append(
         PointVectors(
             id=point.id,
@@ -207,7 +212,7 @@ def run_inplace(client, collection_name: str, sparse_name: str, args,
     total_points = client.count(collection_name).count
     logger.info(f"  Total points: {total_points}")
 
-    scanned = migrated = skipped = errors = 0
+    scanned = migrated = skipped = no_tokens = errors = 0
     offset = None
     pending: list = []
     start = time.monotonic()
@@ -245,6 +250,8 @@ def run_inplace(client, collection_name: str, sparse_name: str, args,
                 errors += 1
             elif result == "skipped":
                 skipped += 1
+            elif result == "no_tokens":
+                no_tokens += 1
 
             if len(pending) >= args.batch_size:
                 m, e = _flush_update_vectors(client, collection_name, pending, args.dry_run)
@@ -255,7 +262,7 @@ def run_inplace(client, collection_name: str, sparse_name: str, args,
             elapsed = time.monotonic() - start
             logger.info(
                 f"  Progress: scanned={scanned}/{total_points}, migrated={migrated}, "
-                f"skipped={skipped}, errors={errors}, elapsed={elapsed:.1f}s"
+                f"skipped={skipped}, no_tokens={no_tokens}, errors={errors}, elapsed={elapsed:.1f}s"
             )
 
         if not next_offset:
@@ -269,7 +276,7 @@ def run_inplace(client, collection_name: str, sparse_name: str, args,
     elapsed = time.monotonic() - start
     logger.info(
         f"In-place migration complete in {elapsed:.1f}s — "
-        f"scanned={scanned}, migrated={migrated}, skipped={skipped}, errors={errors}"
+        f"scanned={scanned}, migrated={migrated}, skipped={skipped}, no_tokens={no_tokens}, errors={errors}"
     )
     if errors:
         logger.warning(f"{errors} encoding errors. Re-run to retry (script is idempotent).")
@@ -283,7 +290,7 @@ def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> b
 
     Checks:
       1. Point count in new collection matches old collection.
-      2. A sample of points in new collection have a non-empty BM25 sparse vector.
+      2. BM25 missing rate across ALL points is under 10%.
 
     Returns True if all checks pass, False otherwise.
     """
@@ -305,40 +312,52 @@ def _verify_migration(client, old_col: str, new_col: str, sparse_name: str) -> b
         logger.error(f"  ❌ Could not verify point count: {exc}")
         passed = False
 
-    # Check 2: BM25 spot-check — sample up to 5 points
-    logger.info("  Spot-checking BM25 sparse vectors on sample points...")
+    # Check 2: BM25 completeness — scan all points, fail if missing rate > 10%
+    logger.info("  Checking BM25 sparse vectors across all points...")
     try:
-        sample_points, _ = client.scroll(
-            collection_name=new_col,
-            limit=5,
-            with_payload=["text"],
-            with_vectors=[sparse_name],
-        )
         bm25_ok = 0
         bm25_missing = 0
         bm25_no_text = 0
-        for p in sample_points:
-            text = (p.payload or {}).get("text", "")
-            if not text:
-                bm25_no_text += 1
-                continue
-            sv = (getattr(p, "vector", {}) or {}).get(sparse_name)
-            if sv and getattr(sv, "indices", None):
-                bm25_ok += 1
-            else:
-                bm25_missing += 1
-                logger.warning(f"  ⚠️  Point {p.id} has text but missing BM25 vector")
+        offset = None
+        while True:
+            scroll_kw = dict(
+                collection_name=new_col,
+                limit=500,
+                with_payload=["text"],
+                with_vectors=[sparse_name],
+            )
+            if offset is not None:
+                scroll_kw["offset"] = offset
+            batch, next_offset = client.scroll(**scroll_kw)
+            for p in batch:
+                text = (p.payload or {}).get("text", "")
+                if not text:
+                    bm25_no_text += 1
+                    continue
+                sv = (getattr(p, "vector", {}) or {}).get(sparse_name)
+                if sv and getattr(sv, "indices", None):
+                    bm25_ok += 1
+                else:
+                    bm25_missing += 1
+            if not next_offset:
+                break
+            offset = next_offset
+
+        total_text = bm25_ok + bm25_missing
+        missing_rate = bm25_missing / total_text if total_text else 0.0
         logger.info(
-            f"  Sample BM25 check ({len(sample_points)} points): "
-            f"ok={bm25_ok}, missing={bm25_missing}, no_text={bm25_no_text}"
+            f"  BM25 check ({total_text} text-bearing points): "
+            f"ok={bm25_ok}, missing={bm25_missing} ({missing_rate:.1%}), no_text={bm25_no_text}"
         )
-        if bm25_missing > 0:
-            logger.error("  ❌ BM25 spot-check failed — some points are missing sparse vectors.")
+        if missing_rate > 0.10:
+            logger.error(
+                f"  ❌ BM25 check failed — missing rate {missing_rate:.1%} exceeds 10% threshold."
+            )
             passed = False
         else:
-            logger.info("  ✅ BM25 spot-check passed")
+            logger.info(f"  ✅ BM25 check passed (missing rate {missing_rate:.1%} ≤ 10%)")
     except Exception as exc:
-        logger.error(f"  ❌ BM25 spot-check error: {exc}")
+        logger.error(f"  ❌ BM25 check error: {exc}")
         passed = False
 
     return passed
@@ -483,7 +502,7 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
     if not args.skip_bm25:
         logger.info("=" * 60)
         logger.info("STEP 3: Generating BM25 sparse vectors on target collection")
-        migrated = skipped = errors = 0
+        migrated = skipped = no_tokens = errors = 0
         offset = None
         pending: list = []
         start = time.monotonic()
@@ -519,18 +538,20 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
                     errors += 1
                 elif result == "skipped":
                     skipped += 1
+                elif result == "no_tokens":
+                    no_tokens += 1
 
                 if len(pending) >= args.batch_size:
                     m, e = _flush_update_vectors(client, new_col, pending, args.dry_run)
                     migrated += m
                     errors += e
 
-            total_done = migrated + skipped + errors
+            total_done = migrated + skipped + no_tokens + errors
             pct = total_done / max(total_points, 1) * 100
             elapsed = time.monotonic() - start
             logger.info(
                 f"  BM25: {total_done}/{total_points} ({pct:.1f}%) | "
-                f"migrated={migrated} skipped={skipped} errors={errors} — {elapsed:.1f}s"
+                f"migrated={migrated} skipped={skipped} no_tokens={no_tokens} errors={errors} — {elapsed:.1f}s"
             )
 
             if not next_offset:
@@ -544,8 +565,13 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
         elapsed = time.monotonic() - start
         logger.info(
             f"BM25 encoding complete in {elapsed:.1f}s — "
-            f"migrated={migrated}, skipped={skipped}, errors={errors}"
+            f"migrated={migrated}, skipped={skipped}, no_tokens={no_tokens}, errors={errors}"
         )
+        if no_tokens:
+            logger.info(
+                f"  ℹ️  {no_tokens} point(s) had text but produced no BM25 tokens "
+                f"(e.g. markdown table separators). No sparse vector written — expected."
+            )
         bm25_errors = errors
         if errors:
             logger.warning("=" * 60)
@@ -553,7 +579,7 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
             logger.warning("    Re-run with --skip-copy to retry (idempotent).")
             logger.warning("=" * 60)
 
-        total_text_bearing = migrated + skipped + errors
+        total_text_bearing = migrated + no_tokens + errors
         if total_text_bearing > 0:
             error_rate = errors / total_text_bearing
             if error_rate > 0.10:
