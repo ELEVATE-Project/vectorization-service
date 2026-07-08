@@ -170,7 +170,12 @@ Score filtering: use `filter_score` (single threshold) or `detail_filter_score` 
    EXACT_SUMMARY_BOOST=1.4
    PARTIAL_SUMMARY_BOOST=1.2
    SHORT_QUERY_THRESHOLD=3
-   QDRANT_CHECK_COMPATIBILITY=false
+   QDRANT_CHECK_COMPATIBILITY=true
+   HYBRID_DENSE_WEIGHT=0.7
+   HYBRID_SPARSE_WEIGHT=0.3
+   SEARCH_CANDIDATE_FANOUT=8
+   SEARCH_CANDIDATE_MAX=2000
+   INCLUDE_SCORING_DEBUG=true
    ```
 
 5. Install dependencies:
@@ -178,9 +183,18 @@ Score filtering: use `filter_score` (single threshold) or `detail_filter_score` 
    pip install -r requirements.txt
    ```
 
-6. Start the service 
+6. **Install the spaCy model `en_core_web_sm`** — not covered by `requirements.txt`; if missing, long queries return HTTP 500. Run in the same venv the service uses.
+   ```bash
+   # Check (prints "OK" if installed):
+   python -c "import spacy; spacy.load('en_core_web_sm'); print('OK')"
 
-7. **Back-fill BM25 for existing docs** (idempotent — only updates sparse vectors, does not re-embed dense):
+   # Install if the check fails:
+   python -m spacy download en_core_web_sm
+   ```
+
+7. Start the service 
+
+8. **Back-fill BM25 for existing docs** (idempotent — only updates sparse vectors, does not re-embed dense):
    ```bash
    # Dry run first
    COLLECTION_NAME=documents1 SPARSE_SEARCH_ENABLED=true \
