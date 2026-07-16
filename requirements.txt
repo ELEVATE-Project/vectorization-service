@@ -21,7 +21,10 @@ pdf2image
 Pillow
 
 # NLP and ML
-sentence-transformers
+# >=5.4.0: SentenceTransformer.get_embedding_dimension() (renamed from
+# get_sentence_embedding_dimension()); called at import in app/core/clients/embedding.py
+# and in qdrant.py, so an older cached version crashes at startup.
+sentence-transformers>=5.4.0
 langchain
 langchain-text-splitters
 langchain-core

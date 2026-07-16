@@ -208,7 +208,7 @@ async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSe
                                    Applied when filter_score=0, uses OR logic
             - categories: Optional list of tag values to filter (searches in 'tags' field, OR condition)
             - organizations: Optional list of company names to filter (searches in 'metadata.company' field, OR condition)
-            - resource_type: Optional list of key entities to filter (searches in 'metadata.KEY ENTITIES' field, OR condition)
+            - resource_type: Optional list of document types to filter (searches in 'metadata.DOCUMENT_TYPE' field, OR condition)
             - file_type: Optional list of document types to filter (searches in 'metadata.type' field, OR condition)
             - include_scoring_debug: When true, each result includes the hybrid fusion breakdown
                                      (keyword_score, rrf_score, dense_rank, sparse_rank). Off by default.
@@ -226,7 +226,7 @@ async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSe
     Filter Field Mappings:
     - categories → 'tags' field (list of tags)
     - organizations → 'metadata.company' field
-    - resource_type → 'metadata.KEY ENTITIES' field
+    - resource_type → 'metadata.DOCUMENT_TYPE' field
     - file_type → 'metadata.type' field
     
     Filter Logic:

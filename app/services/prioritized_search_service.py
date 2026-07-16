@@ -55,7 +55,7 @@ class PrioritizedSearchService:
         (the dominant query cost) so a large top_k can't trigger a 10k-deep traversal
         per field; the FANOUT gives small-top_k callers a re-ranking margin. The union
         across fields still fills top_k after source-level dedup. Env-tunable via
-        SEARCH_CANDIDATE_FANOUT / SEARCH_CANDIDATE_MAX. For top_k=1000 → 500 (was 10000).
+        SEARCH_CANDIDATE_FANOUT / SEARCH_CANDIDATE_MAX. For top_k=1000 → 2000 (was 10000).
         """
         return min(max(top_k, 1) * settings.SEARCH_CANDIDATE_FANOUT, settings.SEARCH_CANDIDATE_MAX)
 

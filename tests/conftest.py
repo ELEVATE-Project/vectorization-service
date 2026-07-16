@@ -18,8 +18,15 @@ os.environ["REDIS_CACHE_ENABLED"] = "False"
 
 try:
     from app.main import app
-except Exception:
-    app = None  # unit tests don't need the full app
+except Exception as exc:
+    # Pure unit tests don't need the full app, so we tolerate an import failure here
+    # rather than erroring out collection. But keep the real exception around: any
+    # fixture that actually needs `app` re-raises it (see the `client` fixture) so the
+    # original traceback surfaces instead of a confusing NoneType error downstream.
+    app = None
+    _app_import_error = exc
+else:
+    _app_import_error = None
 
 try:
     from tests.logger.test_logger import test_logger, log_test_start, log_test_end
@@ -155,7 +162,16 @@ def mock_redis_client():
 @pytest.fixture(scope="function")
 def client(mock_qdrant_client, mock_redis_client):
     """Create FastAPI test client with mocked dependencies"""
-    
+
+    # This fixture needs the real app. If it failed to import at collection time,
+    # re-raise the original error (chained) so the actual traceback is visible,
+    # instead of letting TestClient(None) blow up with an opaque NoneType error.
+    if app is None:
+        raise RuntimeError(
+            "The 'client' fixture requires app.main.app, which failed to import. "
+            "See the chained traceback below for the real cause."
+        ) from _app_import_error
+
     # Create a mock redis_cache instance
     mock_redis_cache_instance = Mock()
     mock_redis_cache_instance.redis_client = mock_redis_client

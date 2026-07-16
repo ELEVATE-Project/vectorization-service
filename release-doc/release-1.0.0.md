@@ -18,7 +18,7 @@
 
 ## What's New
 
-- **Hybrid search** — dense vectors + BM25 sparse (keyword), fused server-side with RRF. Enabled by setting `SPARSE_SEARCH_ENABLED=true` (new env key this release). When disabled, the service falls back to dense similarity search only (semantic/cosine matching across the 5 named vector fields).
+- **Hybrid search** — dense vectors + BM25 sparse (keyword), fused client-side (min-max weighted by default, or RRF; see `HYBRID_FUSION_METHOD`). Enabled by setting `SPARSE_SEARCH_ENABLED=true` (new env key this release). When disabled, the service falls back to dense similarity search only (semantic/cosine matching across the 5 named vector fields).
 - **BM25 / keyword search** — using `Qdrant/bm25` sparse model via fastembed.
 - **Title matching** — exact, partial (prefix), and mid (infix/substring), each with a configurable score boost.
 - **Summary matching** — summary field now participates in keyword matching and boosting (mirrors title behaviour).
@@ -47,11 +47,13 @@
 <details>
 <summary>Hybrid search (dense + BM25 + RRF)</summary>
 
-When `SPARSE_SEARCH_ENABLED=true`, one batch call is issued with:
-- 5 dense prefetch queries (one per named vector field)
-- 1 BM25 sparse prefetch query
+When `SPARSE_SEARCH_ENABLED=true`, one `query_batch_points()` call is issued with independent requests:
+- 5 dense queries (one per named vector field)
+- BM25 sparse queries
 
-Results are fused server-side using Reciprocal Rank Fusion (`FusionQuery(Fusion.RRF)`).
+Each request returns its own ranked list; the lists are then fused **client-side** in
+`_rank_results()` (`app/services/prioritized_search_service.py`) — min-max weighted by default,
+or two-list RRF when `HYBRID_FUSION_METHOD=rrf`. There is no server-side `FusionQuery`/prefetch.
 
 Falls back to dense-only if sparse encoding fails.
 
@@ -159,10 +161,10 @@ Score filtering: use `filter_score` (single threshold) or `detail_filter_score` 
 
 ### Deploy steps
 
-4. Add the new env keys to `.env`:
+4. Add the new env keys to `.env`. **Leave `SPARSE_SEARCH_ENABLED=false` for now** — it stays off until the back-fill in step 7 completes (matching `.env.sample`), so the service never runs in a half-migrated state where existing docs have no sparse vectors:
    ```dotenv
    HYBRID_SEARCH_ENABLED=true
-   SPARSE_SEARCH_ENABLED=true
+   SPARSE_SEARCH_ENABLED=false   # flipped to true in step 8, after back-fill
    SPARSE_VECTOR_NAME=bm25
    RRF_K=60
    EXACT_TITLE_BOOST=2.5
@@ -192,9 +194,7 @@ Score filtering: use `filter_score` (single threshold) or `detail_filter_score` 
    python -m spacy download en_core_web_sm
    ```
 
-7. Start the service 
-
-8. **Back-fill BM25 for existing docs** (idempotent — only updates sparse vectors, does not re-embed dense):
+7. **Back-fill BM25 for existing docs — do this before enabling sparse search** (idempotent — only updates sparse vectors, does not re-embed dense). The migration script is standalone and does not require the service to be running; the inline `SPARSE_SEARCH_ENABLED=true` applies only to this command, not to the service's `.env`:
    ```bash
    # Dry run first
    COLLECTION_NAME=documents1 SPARSE_SEARCH_ENABLED=true \
@@ -204,7 +204,11 @@ Score filtering: use `filter_score` (single threshold) or `detail_filter_score` 
    COLLECTION_NAME=documents1 SPARSE_SEARCH_ENABLED=true \
      python scripts/migrate_to_sparse_vectors.py
    ```
-   > Pass `COLLECTION_NAME` explicitly — the migration script defaults to `documents`, the service uses `documents1`. New uploads get BM25 vectors automatically; only pre-existing docs need back-fill.
+   > Pass `COLLECTION_NAME` explicitly — the migration script defaults to `documents`, the service uses `documents1`. Once sparse is enabled (step 8) new uploads get BM25 vectors automatically; only pre-existing docs need this back-fill.
+
+8. **Enable sparse search** now that every doc has BM25 vectors — set `SPARSE_SEARCH_ENABLED=true` in `.env`.
+
+9. Start the service.
 
 ### Rollback
 

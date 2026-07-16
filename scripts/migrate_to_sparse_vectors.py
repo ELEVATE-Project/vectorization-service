@@ -55,17 +55,18 @@ space. BM25 ranks by term frequency and rarity, excelling at exact matches.
     Good: synonyms, concepts          Good: codes, names, IDs, acronyms
     Bad:  abbreviations, exact IDs    Bad:  paraphrasing, synonyms
 
-HYBRID SEARCH (RRF FUSION)
-───────────────────────────
-Both searches run simultaneously. Reciprocal Rank Fusion (RRF) merges results,
-promoting documents that rank well in both — the industry-standard approach used
-by Elasticsearch, Weaviate, Pinecone, and Azure AI Search.
+HYBRID SEARCH (CLIENT-SIDE FUSION)
+───────────────────────────────────
+Both searches run simultaneously and each returns its own ranked list. The lists
+are merged in application code (`_rank_results()` in prioritized_search_service.py),
+not by Qdrant — min-max weighted fusion by default, or Reciprocal Rank Fusion (RRF)
+when HYBRID_FUSION_METHOD=rrf. Both promote documents that rank well in both modalities.
 
     User Query: "NCERT Class 5 Maths lesson"
           │
-          ├── Dense Search  → Finds conceptually related docs
-          ├── BM25 Search   → Finds docs containing exact words "NCERT", "Class 5"
-          └── RRF Fusion    → Promotes docs that rank highly in BOTH ✅
+          ├── Dense Search    → Finds conceptually related docs
+          ├── BM25 Search     → Finds docs containing exact words "NCERT", "Class 5"
+          └── Client Fusion   → Promotes docs that rank highly in BOTH ✅
 
 WHY A MIGRATION IS NEEDED (not just a schema update)
 ──────────────────────────────────────────────────────
@@ -90,9 +91,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-EMBED_SIZE = 384          # all-MiniLM-L6-v2 output dimension
-DENSE_FIELDS = ["text", "title", "summary", "tags", "metadata"]
 
 # Allowed characters for a collection name. This is intentionally strict:
 # the value is written verbatim into the .env file, which start_mac.sh sources
