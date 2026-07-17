@@ -4,10 +4,10 @@ import traceback
 from datetime import datetime
 from typing import Dict, Any, List
 from fastapi import HTTPException
-from qdrant_client.http import models
+from qdrant_client import models
 from sqlalchemy import func
 from app.core.clients.qdrant import qdrant_client, ensure_collections_exist
-from app.core.clients.embedding import generate_single_embedding
+from app.core.clients import embedding
 from app.core.clients.redis_cache import redis_cache
 from app.core.database import SessionLocal
 from app.models.db_models import TranslationRecord
@@ -50,8 +50,9 @@ class QueryService:
             # Generate query embedding
             search_query = query_info["translated"] or query_info["original"]
             logger.debug(f"Generating embedding for query: {search_query}")
-            query_embedding = generate_single_embedding(search_query)
-            logger.debug(f"Generated embedding shape: {query_embedding.shape}")
+            # embed_query returns a validated list[float]; rejects empty/malformed vectors.
+            query_embedding = embedding.embed_query(search_query)
+            logger.debug(f"Generated embedding dim: {len(query_embedding)}")
 
             # Search for relevant documents
             search_results = self._search_documents(
@@ -88,6 +89,9 @@ class QueryService:
 
             return response
 
+        except embedding.EmbeddingError:
+            # Empty/invalid query vector — let the global handler return HTTP 422.
+            raise
         except Exception as e:
             logger.error(f"Query failed: {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
@@ -121,14 +125,15 @@ class QueryService:
             )
 
             logger.debug(f"Executing priority-filtered search with limit: {search_limit}")
-            search_results = qdrant_client.search(
+            # Single-field text vector search scoped to the requested priority bucket.
+            search_results = qdrant_client.query_points(
                 collection_name=settings.COLLECTION_NAME,
-                query_vector=query_embedding.tolist(),
+                query=query_embedding,
                 using="text",
                 limit=search_limit,
                 query_filter=search_filter,
                 score_threshold=self.similarity_threshold,
-            )
+            ).points
             logger.debug(f"Found {len(search_results)} results for priority {priority_level}")
             all_search_results.extend(search_results)
 
@@ -153,14 +158,14 @@ class QueryService:
                 )
 
                 logger.debug(f"Searching priority {priority} with limit {remaining_limit}")
-                priority_results = qdrant_client.search(
+                priority_results = qdrant_client.query_points(
                     collection_name=settings.COLLECTION_NAME,
-                    query_vector=query_embedding.tolist(),
+                    query=query_embedding,
                     using="text",
                     limit=remaining_limit,
                     query_filter=search_filter,
                     score_threshold=self.similarity_threshold,
-                )
+                ).points
 
                 logger.debug(f"Found {len(priority_results)} results for priority {priority}")
                 all_search_results.extend(priority_results)

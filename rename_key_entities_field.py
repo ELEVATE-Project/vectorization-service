@@ -14,7 +14,7 @@ FIELD_DOCUMENT_TYPE_NEW = "DOCUMENT_TYPE"
 def rename_field_in_documents():
     """Rename DOCUMENT TYPE to DOCUMENT_TYPE in all documents"""
     
-    client = QdrantClient(settings.QDRANT_HOST, port=settings.QDRANT_PORT)
+    client = QdrantClient(settings.QDRANT_HOST, port=settings.QDRANT_PORT, check_compatibility=settings.QDRANT_CHECK_COMPATIBILITY)
     collection_name = settings.COLLECTION_NAME
     
     print("="  * 80)

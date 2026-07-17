@@ -1,9 +1,9 @@
 import logging
 from typing import List, Dict, Any
 from fastapi import HTTPException
-from qdrant_client.http import models
+from qdrant_client import models
 from app.core.clients.qdrant import qdrant_client
-from app.core.clients.embedding import generate_single_embedding
+from app.core.clients import embedding
 from app.config import settings
 from app.models.api_models import SimilarityCheckRequest, SimilarityCheckResponse
 
@@ -21,8 +21,9 @@ class SimilarityService:
         try:
             logger.info(f"Checking similarity for text: {request.text[:100]}...")
 
-            # Generate embedding for the text (limit to 1000 chars for performance)
-            text_embedding = generate_single_embedding(request.text[:1000])
+            # Generate + validate the embedding (limit to 1000 chars for performance).
+            # embed_query rejects empty/whitespace text and malformed vectors before Qdrant.
+            text_vector = embedding.embed_query(request.text[:1000])
 
             # Build search filter
             filter_conditions = [
@@ -32,31 +33,40 @@ class SimilarityService:
                 )
             ]
 
-            # Exclude specific source_id if provided
+            # Exclude specific source_id if provided.
+            # FieldCondition has no `invert` flag (it was silently ignored before) —
+            # exclusion belongs in the filter's must_not clause.
+            must_not_conditions = []
             if request.exclude_source_id:
-                filter_conditions.append(
+                must_not_conditions.append(
                     models.FieldCondition(
                         key="source_id",
                         match=models.MatchValue(value=request.exclude_source_id),
-                        invert=True  # Exclude this source_id
                     )
                 )
 
-            search_filter = models.Filter(must=filter_conditions)
+            search_filter = models.Filter(
+                must=filter_conditions,
+                must_not=must_not_conditions or None,
+            )
 
-            # Search for similar documents
+            # Search for similar documents on the 'text' named vector.
+            # search() was removed in qdrant-client>=1.14; the Query API requires a
+            # named vector since the collection is configured with named vectors.
             logger.debug(f"Searching with threshold: {request.threshold}")
-            search_results = qdrant_client.search(
+            search_results = qdrant_client.query_points(
                 collection_name=settings.COLLECTION_NAME,
-                query_vector=text_embedding.tolist(),
+                query=text_vector,
+                using="text",
                 limit=5,  # Get top 5 similar documents
                 query_filter=search_filter,
-                score_threshold=request.threshold
+                score_threshold=request.threshold,
+                with_payload=True,
             )
 
             # Process results
             similar_docs = []
-            for hit in search_results:
+            for hit in search_results.points:
                 similar_doc = {
                     "source_id": hit.payload.get("source_id"),
                     "similarity_score": float(hit.score),
@@ -78,6 +88,9 @@ class SimilarityService:
                 similar_documents=similar_docs
             )
 
+        except embedding.EmbeddingError:
+            # Empty/invalid query vector — let the global handler return HTTP 422.
+            raise
         except Exception as e:
             logger.error(f"Similarity check failed: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Similarity check failed: {str(e)}")

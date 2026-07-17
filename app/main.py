@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from app.api.v1.api import api_router
 from app.core.clients.qdrant import ensure_collections_exist
+from app.core.clients.embedding import EmbeddingError
 from app.utils.json_handler import CustomJSONResponse
 from app.config import settings
 import logging
@@ -41,6 +42,17 @@ app = FastAPI(
 )
 
 app.include_router(api_router, prefix="/api")
+
+
+@app.exception_handler(EmbeddingError)
+async def embedding_error_handler(request, exc: EmbeddingError):
+    """Map embedding/query-vector validation failures to a clear HTTP 422.
+
+    Without this, an empty/malformed query vector surfaced as an opaque Qdrant
+    ``400 Vector dimension error: expected dim: 384, got 0`` (or an unhandled 500).
+    """
+    logger.warning(f"Embedding validation failed for {request.url.path}: {exc}")
+    return CustomJSONResponse(status_code=422, content={"detail": str(exc)})
 
 
 @app.get("/api/health")

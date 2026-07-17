@@ -5,7 +5,10 @@ uvicorn
 sqlalchemy
 psycopg2-binary
 redis
-qdrant-client
+# Pinned to >=1.18.0: enables sparse vectors (BM25) and the Query API with RRF.
+# NOTE: Compatible with the project's Python 3.10.16 runtime.
+# Re-test before upgrading to qdrant-client 2.x, as major versions may introduce breaking API changes.
+qdrant-client[fastembed]>=1.18.0,<2.0.0
 
 # File Processing
 pandas
@@ -18,7 +21,10 @@ pdf2image
 Pillow
 
 # NLP and ML
-sentence-transformers
+# >=5.4.0: SentenceTransformer.get_embedding_dimension() (renamed from
+# get_sentence_embedding_dimension()); called at import in app/core/clients/embedding.py
+# and in qdrant.py, so an older cached version crashes at startup.
+sentence-transformers>=5.4.0
 langchain
 langchain-text-splitters
 langchain-core

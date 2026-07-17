@@ -208,13 +208,25 @@ async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSe
                                    Applied when filter_score=0, uses OR logic
             - categories: Optional list of tag values to filter (searches in 'tags' field, OR condition)
             - organizations: Optional list of company names to filter (searches in 'metadata.company' field, OR condition)
-            - resource_type: Optional list of key entities to filter (searches in 'metadata.KEY ENTITIES' field, OR condition)
+            - resource_type: Optional list of document types to filter (searches in 'metadata.DOCUMENT_TYPE' field, OR condition)
             - file_type: Optional list of document types to filter (searches in 'metadata.type' field, OR condition)
-    
+            - include_scoring_debug: When true, each result includes the hybrid fusion breakdown
+                                     (keyword_score, rrf_score, dense_rank, sparse_rank). Off by default.
+
+    Hybrid Fusion (when SPARSE_SEARCH_ENABLED=true):
+    - The dense+sparse fusion method is set by the HYBRID_FUSION_METHOD env var and reported
+      back in response.search_config.fusion_method ("weighted" or "rrf").
+      • "weighted": score = HYBRID_DENSE_WEIGHT*minmax(dense) + HYBRID_SPARSE_WEIGHT*minmax(sparse)
+      • "rrf": score = minmax( 1/(RRF_K+dense_rank) + 1/(RRF_K+sparse_rank) )
+      In both modes the dense component is the weighted multi-field cosine sum and `score` stays 0–1.
+    - With include_scoring_debug=true each result also surfaces: keyword_score (raw BM25),
+      rrf_score (raw fused value pre-normalization), dense_rank, and sparse_rank (null if no
+      sparse hit) so the final `score` can be traced back to the fusion math.
+
     Filter Field Mappings:
     - categories → 'tags' field (list of tags)
     - organizations → 'metadata.company' field
-    - resource_type → 'metadata.KEY ENTITIES' field
+    - resource_type → 'metadata.DOCUMENT_TYPE' field
     - file_type → 'metadata.type' field
     
     Filter Logic:

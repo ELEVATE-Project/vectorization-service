@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from app.config import settings
 
 class DocumentMetadata(BaseModel):
@@ -36,7 +36,7 @@ class MultilingualQueryRequest(BaseModel):
     priority_filter: Optional[str] = None
 
 class SimilarityCheckRequest(BaseModel):
-    text: str = Field(..., description="Text to check for similarity")
+    text: str = Field(..., min_length=1, description="Text to check for similarity")
     company_id: str = Field(..., description="Company ID to filter by")
     threshold: float = Field(default=0.85, description="Similarity threshold")
     exclude_source_id: Optional[str] = Field(None, description="Source ID to exclude")
@@ -68,7 +68,7 @@ class PrioritizedSearchRequest(BaseModel):
                     "A document passes if ANY field meets its threshold (OR logic)."
     )
     categories: Optional[List[str]] = Field(
-        default=None, 
+        default=None,
         description="Optional list of tag values to filter (searches in 'tags' field, OR condition)"
     )
     organizations: Optional[List[str]] = Field(
@@ -83,6 +83,20 @@ class PrioritizedSearchRequest(BaseModel):
         default=None,
         description="Optional list of document types to filter (searches in 'metadata.type' field, OR condition)"
     )
+    search_mode: Literal["hybrid", "semantic"] = Field(
+        default="hybrid",
+        description="Search mode: 'hybrid' (semantic + title/summary boost) or "
+                    "'semantic' (vector only, no boosts). Defaults to 'hybrid'. "
+                    "Any other value is rejected with a 422 validation error."
+    )
+    include_scoring_debug: bool = Field(
+        default=settings.INCLUDE_SCORING_DEBUG,
+        description="When true, each result includes the hybrid fusion breakdown "
+                    "(keyword_score, rrf_score, dense_rank, sparse_rank) for inspecting "
+                    "how the final score was produced. Defaults to the INCLUDE_SCORING_DEBUG "
+                    "env setting; a request may override it per call. Off by default to keep "
+                    "responses lean."
+    )
 
 class SearchResultItem(BaseModel):
     id: str
@@ -93,9 +107,44 @@ class SearchResultItem(BaseModel):
     metadata: Dict[str, Any]
     source_id: str
     score: float
-    field_scores: Dict[str, float] = Field(
+    field_scores: Dict[str, Optional[float]] = Field(
         default_factory=dict,
-        description="Individual scores from each search field"
+        description=(
+            "Per-field cosine similarity scores for semantically retrieved documents "
+            "(keys: title, tags, summary, metadata, text, values 0–1). "
+            "Internal fusion keys (rrf, bm25_sparse) are excluded. "
+            "Keyword-injected documents that bypassed vector scoring carry None "
+            "for unscored fields to distinguish them from a genuine zero-score."
+        )
+    )
+    keyword_score: Optional[float] = Field(
+        default=None,
+        description="Raw BM25 sparse vector score (Phase 2). Populated only when the request sets "
+                    "include_scoring_debug=true; None otherwise or when sparse search is disabled."
+    )
+    rrf_score: Optional[float] = Field(
+        default=None,
+        description="Raw Reciprocal Rank Fusion value before min-max normalization "
+                    "(1/(k+dense_rank) + 1/(k+sparse_rank)). Populated only when "
+                    "include_scoring_debug=true and HYBRID_FUSION_METHOD=rrf."
+    )
+    dense_rank: Optional[int] = Field(
+        default=None,
+        description="1-indexed rank of this document in the combined dense list (ranked by the "
+                    "weighted multi-field cosine sum). Debug-only (include_scoring_debug=true)."
+    )
+    sparse_rank: Optional[int] = Field(
+        default=None,
+        description="1-indexed rank of this document in the BM25 sparse list, or None if it had no "
+                    "sparse hit. Debug-only (include_scoring_debug=true)."
+    )
+    title_match: Optional[str] = Field(
+        default=None,
+        description="Title match type: 'exact', 'partial', or None if no title match"
+    )
+    summary_match: Optional[str] = Field(
+        default=None,
+        description="Summary match type: 'exact', 'partial', or None if no summary match"
     )
 
 class PrioritizedSearchResponse(BaseModel):
@@ -109,7 +158,7 @@ class PrioritizedSearchResponse(BaseModel):
     )
 
 class TextSearchRequest(BaseModel):
-    query: str = Field(..., description="Search query text")
+    query: str = Field(..., min_length=1, description="Search query text")
     top_k: int = Field(default=10, description="Number of unique documents to return (default: 5)")
     threshold: float = Field(default=0.40, description="Minimum similarity score threshold (default: 0.40)")
 

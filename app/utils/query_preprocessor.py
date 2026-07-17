@@ -55,7 +55,25 @@ def preprocess_query(query: str) -> str:
     if not query or not query.strip():
         logger.debug("Empty query provided, returning empty string")
         return ""
-    
+
+    stripped = query.strip()
+
+    # Short queries (fewer words than threshold or fewer than 20 chars) bypass stop-word
+    # removal entirely — stripping "the" from "the AI" or "RTE" would destroy meaning.
+    try:
+        from app.config import settings
+        threshold = settings.SHORT_QUERY_THRESHOLD
+    except Exception:
+        threshold = 3
+
+    word_count = len(stripped.split())
+    if word_count < threshold or len(stripped) < 20:
+        logger.debug(
+            f"Short query ({word_count} words, {len(stripped)} chars) — "
+            "skipping spaCy preprocessing"
+        )
+        return stripped.lower()
+
     try:
         # Load spaCy model
         nlp = _load_spacy_model()
@@ -95,22 +113,24 @@ def preprocess_query(query: str) -> str:
         
         # Join tokens and normalize whitespace
         preprocessed = " ".join(processed_tokens)
-        
-        # Final cleanup: normalize multiple spaces
         preprocessed = " ".join(preprocessed.split())
-        
+
+        # If preprocessing wiped everything out, fall back to the original so the
+        # embedding step always has something to work with.
+        if not preprocessed:
+            logger.debug("Preprocessing produced empty result — falling back to original query")
+            return stripped.lower()
+
         logger.debug(f"Preprocessed result: '{preprocessed}'")
-        
         return preprocessed
-        
+
     except RuntimeError:
         # Re-raise model loading errors
         raise
     except Exception as e:
         logger.error(f"Error preprocessing query '{query}': {str(e)}", exc_info=True)
-        # Fallback: return original query on preprocessing errors
         logger.warning("Returning original query due to preprocessing error")
-        return query.strip()
+        return stripped
 
 
 def is_spacy_model_available() -> bool:

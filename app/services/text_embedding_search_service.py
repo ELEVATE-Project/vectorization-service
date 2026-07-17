@@ -1,7 +1,7 @@
 import logging
 from typing import List, Dict, Any
 from app.core.clients.qdrant import qdrant_client
-from app.core.clients.embedding import generate_single_embedding
+from app.core.clients import embedding
 from app.config import settings
 from app.models.api_models import TextSearchRequest, TextSearchResponse, TextSearchResultItem
 
@@ -26,20 +26,22 @@ class TextEmbeddingSearchService:
             TextSearchResponse with all matching chunks sorted by score
         """
         try:
-            # Generate embedding for the query
-            query_embedding = generate_single_embedding(request.query)
-            
-            # Search in Qdrant using only the 'text' vector
-            search_results = qdrant_client.search(
+            # Generate + validate the query embedding (rejects empty/malformed before Qdrant)
+            query_vector = embedding.embed_query(request.query)
+
+            # Search in Qdrant using only the 'text' vector (Query API; search() removed in qdrant-client>=1.14)
+            search_results = qdrant_client.query_points(
                 collection_name=self.collection_name,
-                query_vector=("text", query_embedding.tolist()),
-                limit=request.top_k
+                query=query_vector,
+                using="text",
+                limit=request.top_k,
+                with_payload=True,
             )
-            
+
             # Collect all matching chunks that meet the threshold
             matching_chunks: List[Dict[str, Any]] = []
-            
-            for result in search_results:
+
+            for result in search_results.points:
                 source_id = result.payload.get("source_id")
                 
                 if not source_id:
