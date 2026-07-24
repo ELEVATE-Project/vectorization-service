@@ -119,8 +119,10 @@ class SearchResultItem(BaseModel):
     )
     keyword_score: Optional[float] = Field(
         default=None,
-        description="Raw BM25 sparse vector score (Phase 2). Populated only when the request sets "
-                    "include_scoring_debug=true; None otherwise or when sparse search is disabled."
+        description="Raw BM25 sparse vector score (Phase 2). Surfaced BY DEFAULT whenever "
+                    "hybrid/sparse search is enabled and produced a score for the document "
+                    "(not gated by include_scoring_debug, unlike the other breakdown fields). "
+                    "None when sparse search is disabled (dense-only mode)."
     )
     rrf_score: Optional[float] = Field(
         default=None,
@@ -137,6 +139,38 @@ class SearchResultItem(BaseModel):
         default=None,
         description="1-indexed rank of this document in the BM25 sparse list, or None if it had no "
                     "sparse hit. Debug-only (include_scoring_debug=true)."
+    )
+    raw_dense: Optional[float] = Field(
+        default=None,
+        description="Weighted multi-field cosine sum (Σ field_weight × field_score), before any "
+                    "hybrid fusion or boosting. In dense-only mode this equals the pre-boost score. "
+                    "Debug-only (include_scoring_debug=true)."
+    )
+    normalized_dense: Optional[float] = Field(
+        default=None,
+        description="raw_dense min-max normalized to 0–1 across the candidate pool "
+                    "((raw_dense − dense_min)/(dense_max − dense_min); see search_config.scoring_context). "
+                    "Batch-relative — shifts with the query's candidate pool. None in dense-only mode. "
+                    "Debug-only (include_scoring_debug=true)."
+    )
+    normalized_sparse: Optional[float] = Field(
+        default=None,
+        description="keyword_score (BM25) min-max normalized to 0–1 across the candidate pool. "
+                    "Batch-relative. None when sparse search is disabled or the doc had no sparse hit. "
+                    "Debug-only (include_scoring_debug=true)."
+    )
+    title_multiplier: Optional[float] = Field(
+        default=None,
+        description="Boost factor applied for a title keyword match (exact/partial). "
+                    "1.0 means NO boost was applied (neutral no-op), not a phantom boost. "
+                    "Debug-only (include_scoring_debug=true)."
+    )
+    summary_multiplier: Optional[float] = Field(
+        default=None,
+        description="Boost factor applied for a summary keyword match (exact/partial). "
+                    "1.0 means NO boost was applied (neutral no-op), not a phantom boost. "
+                    "Applied after title_multiplier, each capped at 1.0. "
+                    "Debug-only (include_scoring_debug=true)."
     )
     title_match: Optional[str] = Field(
         default=None,
