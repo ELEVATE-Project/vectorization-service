@@ -77,12 +77,16 @@ class PrioritizedSearchService:
         else:
             logger.info("No filters applied")
 
-    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None):
-        """Process, rank, filter and deduplicate results"""
+    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None):
+        """Process, rank, filter and deduplicate results.
+
+        scoring_context_out: optional mutable dict forwarded to _rank_results so the
+        caller can capture the per-query normalization context (min/max/pool size).
+        """
         logger.info(f"Total documents matched: {len(all_results)}")
-        
+
         logger.info("Calculating weighted scores and ranking results")
-        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields)
+        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out)
         logger.info(f"Ranked results: {len(ranked_results)} documents")
         
         # Apply filtering based on conditions
@@ -149,12 +153,27 @@ class PrioritizedSearchService:
                     source_id=result_data['payload'].get('source_id', ''),
                     score=result_data['weighted_score'],
                     field_scores=field_scores,
-                    title_match=title_match,
-                    summary_match=summary_match,
-                    keyword_score=result_data.get('keyword_score') if include_scoring_debug else None,
+                    # title_match/summary_match are part of the scoring breakdown, so they
+                    # are debug-gated like the other breakdown fields — surfaced only when
+                    # include_scoring_debug is set (None otherwise keeps the field out of
+                    # the backend response, whose serializer omits None debug keys).
+                    title_match=title_match if include_scoring_debug else None,
+                    summary_match=summary_match if include_scoring_debug else None,
+                    # keyword_score is surfaced BY DEFAULT whenever hybrid/sparse search
+                    # produced a BM25 score (it is only set on the entry in the hybrid path,
+                    # so it stays None in dense-only mode) — NOT debug-gated, unlike the
+                    # other breakdown fields.
+                    keyword_score=result_data.get('keyword_score'),
                     rrf_score=result_data.get('rrf_score') if include_scoring_debug else None,
                     dense_rank=result_data.get('dense_rank') if include_scoring_debug else None,
                     sparse_rank=result_data.get('sparse_rank') if include_scoring_debug else None,
+                    raw_dense=result_data.get('raw_dense') if include_scoring_debug else None,
+                    normalized_dense=result_data.get('normalized_dense') if include_scoring_debug else None,
+                    normalized_sparse=result_data.get('normalized_sparse') if include_scoring_debug else None,
+                    # Multipliers default to 1.0 (no boost) so debug output always carries
+                    # them, even for docs the boost pass didn't touch (e.g. keyword-injected).
+                    title_multiplier=result_data.get('title_multiplier', 1.0) if include_scoring_debug else None,
+                    summary_multiplier=result_data.get('summary_multiplier', 1.0) if include_scoring_debug else None,
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")
@@ -303,11 +322,16 @@ class PrioritizedSearchService:
                     }
                 )
             
-            # Pass detail_filter_score if using field-level filtering
+            # Pass detail_filter_score if using field-level filtering.
+            # scoring_context captures the per-query normalization reference (min/max/pool)
+            # computed inside _rank_results; surfaced under search_config.scoring_context
+            # when include_scoring_debug is set (see below).
+            scoring_context: Dict[str, Any] = {}
             top_results, unique_source_results = self._process_and_filter_results(
                 all_results, field_scores, weights, search_fields, top_k,
                 filter_score if not use_detail_filter else 0,
-                detail_filter_score if use_detail_filter else None
+                detail_filter_score if use_detail_filter else None,
+                scoring_context_out=scoring_context,
             )
 
             # Apply title boost when hybrid mode is active.
@@ -425,7 +449,24 @@ class PrioritizedSearchService:
                     "summary": detail_filter_score.summary,
                     "metadata": detail_filter_score.metadata
                 }
-            
+
+            # Additive debug block: expose the per-query normalization reference + boost
+            # config so QA can reproduce normalized_dense/normalized_sparse and the boost
+            # step by hand. Only when include_scoring_debug is set (keeps prod responses
+            # lean). scoring_context already holds candidate_pool_size and, in hybrid mode,
+            # dense_min/max + sparse_min/max from _rank_results; augment with the fusion
+            # weights and the boost multiplier table (all from settings).
+            if request.include_scoring_debug:
+                scoring_context["dense_weight"] = settings.HYBRID_DENSE_WEIGHT
+                scoring_context["sparse_weight"] = settings.HYBRID_SPARSE_WEIGHT
+                scoring_context["boost_config"] = {
+                    "exact_title_boost": settings.EXACT_TITLE_BOOST,
+                    "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
+                    "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,
+                    "partial_summary_boost": settings.PARTIAL_SUMMARY_BOOST,
+                }
+                search_config["scoring_context"] = scoring_context
+
             # total_results = all unique matched sources (semantic pool ∪ injected boost docs),
             # so the count never reports fewer than the results actually returned.
             matched_source_ids = {r["payload"].get("source_id") for r in unique_source_results}
@@ -787,7 +828,8 @@ class PrioritizedSearchService:
         all_results: Dict[str, Any],
         field_scores: Dict[str, Dict[str, float]],
         weights: Dict[str, float],
-        search_fields: List[str]
+        search_fields: List[str],
+        scoring_context_out: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Rank results using weighted multi-field scoring.
@@ -821,6 +863,12 @@ class PrioritizedSearchService:
             field_scores: Scores for each field per point
             weights: Weight configuration for each field
             search_fields: List of fields searched
+            scoring_context_out: Optional mutable dict. When provided, it is populated
+                with the per-query normalization context (candidate_pool_size and, in
+                hybrid mode, dense_min/max + sparse_min/max) so the caller can surface it
+                under search_config.scoring_context without recomputing raw_dense/raw_sparse
+                or keeping per-request state on the (shared) service instance. Left empty
+                on the dense-only path except for candidate_pool_size.
 
         Returns:
             List of ranked results sorted by weighted score (descending)
@@ -897,6 +945,24 @@ class PrioritizedSearchService:
                         + sparse_w * norm_sparse.get(point_id, 0.0)
                     )
 
+            # Expose the per-query normalization reference (min/max of each modality
+            # across the candidate pool) so a debug caller can reproduce normalized_dense/
+            # normalized_sparse by hand. These are the exact min/max _min_max_normalize
+            # uses. Only meaningful in hybrid mode where min-max normalization runs.
+            if scoring_context_out is not None:
+                dense_vals = list(raw_dense.values())
+                sparse_vals = list(raw_sparse.values())
+                if dense_vals:
+                    scoring_context_out["dense_min"] = min(dense_vals)
+                    scoring_context_out["dense_max"] = max(dense_vals)
+                if sparse_vals:
+                    scoring_context_out["sparse_min"] = min(sparse_vals)
+                    scoring_context_out["sparse_max"] = max(sparse_vals)
+
+        # candidate_pool_size is meaningful in both modes.
+        if scoring_context_out is not None:
+            scoring_context_out["candidate_pool_size"] = len(all_results)
+
         ranked = []
 
         for point_id, result in all_results.items():
@@ -905,6 +971,8 @@ class PrioritizedSearchService:
             if is_hybrid:
                 # Calibrated 0-1 fused score per the selected fusion method.
                 weighted_score = hybrid_scores.get(point_id, 0.0)
+                # raw_dense is the pre-fusion weighted cosine sum computed above.
+                entry_raw_dense = raw_dense.get(point_id, 0.0)
             else:
                 # Dense multi-field path: weighted sum of per-field similarity scores.
                 weighted_score = 0.0
@@ -913,6 +981,8 @@ class PrioritizedSearchService:
                         field_score = field_score_dict[field]
                         weight = weights[field]
                         weighted_score += field_score * weight
+                # In dense-only mode the pre-boost weighted score IS raw_dense.
+                entry_raw_dense = weighted_score
 
             # Do NOT cap at 1.0 here — the title/summary boost (applied later) needs
             # the uncapped score to differentiate matches, and enforces its own cap.
@@ -923,7 +993,10 @@ class PrioritizedSearchService:
                 'payload': result.payload,
                 'weighted_score': weighted_score,
                 'field_scores': field_score_dict,
-                'num_fields_matched': num_fields_matched
+                'num_fields_matched': num_fields_matched,
+                # raw_dense (pre-fusion, pre-boost weighted cosine sum) is meaningful in
+                # both modes; surfaced only when include_scoring_debug (see _build_result_items).
+                'raw_dense': entry_raw_dense,
             }
             if is_hybrid:
                 # Internal scoring diagnostics, surfaced only when the request sets
@@ -933,6 +1006,10 @@ class PrioritizedSearchService:
                 entry['rrf_score'] = rrf_raw.get(point_id)
                 entry['dense_rank'] = dense_rank.get(point_id)
                 entry['sparse_rank'] = sparse_rank.get(point_id)
+                # Per-modality normalized scores (weighted-fusion branch only; norm_dense/
+                # norm_sparse are empty in rrf mode, so .get() yields None there).
+                entry['normalized_dense'] = norm_dense.get(point_id)
+                entry['normalized_sparse'] = norm_sparse.get(point_id)
             ranked.append(entry)
 
         ranked.sort(key=lambda x: x['weighted_score'], reverse=True)
@@ -1205,14 +1282,20 @@ class PrioritizedSearchService:
 
         Boost tiers (capped at 1.0): exact → ×exact_boost, partial → ×partial_boost.
         The match type is recorded in field_scores as ``f"{field}_match"`` so callers
-        can surface it. Results are re-sorted after boosting.
+        can surface it. The numeric multiplier actually applied is recorded on the entry
+        as ``f"{field}_multiplier"`` (1.0 on the no-match path = neutral no-op, so debug
+        output always carries the field). Results are re-sorted after boosting.
         """
         match_key = f"{field}_match"
+        mult_key = f"{field}_multiplier"
         for result in ranked_results:
             source_id = result["payload"].get("source_id")
             match_type = matches.get(source_id)
             if not match_type:
                 result["field_scores"].setdefault(match_key, None)
+                # 1.0 = no boost applied (neutral no-op). setdefault so an earlier
+                # boost pass on the same field is never clobbered.
+                result.setdefault(mult_key, 1.0)
                 continue
 
             multiplier = exact_boost if match_type == "exact" else partial_boost
@@ -1220,6 +1303,7 @@ class PrioritizedSearchService:
             boosted = min(original * multiplier, 1.0)
             result["weighted_score"] = boosted
             result["field_scores"][match_key] = match_type
+            result[mult_key] = multiplier
 
             logger.debug(
                 f"{field} boost applied to {source_id}: "
@@ -1254,6 +1338,7 @@ class PrioritizedSearchService:
         injected: List[Dict[str, Any]] = []
         FLOOR_SCORE = 0.15  # baseline before multiplier — keeps injected below strong semantic hits
         match_key = f"{field}_match"
+        mult_key = f"{field}_multiplier"
         num_requests_before = len(source_ids)
 
         logger.info(
@@ -1341,6 +1426,11 @@ class PrioritizedSearchService:
                 "payload": point.payload,
                 "weighted_score": score,
                 "field_scores": field_scores,
+                # raw_dense is undefined for keyword-injected docs (no vector query ran);
+                # None distinguishes it from a genuine 0.0. The matched field's multiplier
+                # is the boost that produced the floor score.
+                "raw_dense": None,
+                mult_key: boost,
             })
             logger.debug(f"Injected {field}-match doc {source_id} ({match_type}) with floor score {score:.4f}")
 
