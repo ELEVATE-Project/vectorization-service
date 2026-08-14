@@ -1,6 +1,11 @@
 import json
 import logging
-from typing import List, Optional
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
+
+import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
 from app.core.clients import cache_client
@@ -82,3 +87,126 @@ async def warm_cache() -> int:
 
     logger.info(f"Acronym cache warmed: {len(rows)} active acronym(s)")
     return len(rows)
+
+
+def _split_expansions(raw: str) -> List[str]:
+    """Pipe-separated -> deduped list, order preserved (spec §5/§7).
+
+    Deliberately duplicated from the identical helper in migration
+    f13a664a31b6 rather than imported: Alembic migrations must stay
+    self-contained snapshots, frozen at the point they were written, so a
+    future change to this live-app helper can never silently alter what an
+    already-applied historical migration does on re-run."""
+    seen = set()
+    result = []
+    for part in raw.split("|"):
+        expansion = part.strip()
+        if expansion and expansion not in seen:
+            seen.add(expansion)
+            result.append(expansion)
+    return result
+
+
+def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
+    """Validate and upsert a batch of CSV rows (spec §7) in a single transaction.
+
+    Each row is a dict with 'acronym', 'expansions' (pipe-separated string),
+    and optionally 'description'. A row missing acronym/expansions after
+    trimming, or an in-batch duplicate acronym (Postgres' ON CONFLICT can't
+    affect the same row twice in one statement), is recorded as an error and
+    skipped rather than aborting the rest of the batch — last occurrence wins
+    for a repeated acronym. is_active is always forced true on upsert, per
+    spec (the CSV has no is_active column). Does not touch the cache itself —
+    the caller (the endpoint) owns refresh-vs-invalidate per spec's own
+    ordering ("commit, then refresh cache"). Returns
+    (created_acronyms, updated_acronyms, errors).
+    """
+    errors: List[dict] = []
+    valid_by_acronym: dict = {}
+
+    for index, row in enumerate(rows):
+        raw_acronym = (row.get("acronym") or "").strip()
+        acronym = raw_acronym.upper()
+        expansions = _split_expansions(row.get("expansions") or "")
+        description = (row.get("description") or "").strip() or None
+
+        if not acronym or not expansions:
+            errors.append({
+                "index": index,
+                "acronym": raw_acronym or None,
+                "reason": "acronym and expansions must be non-empty after trimming whitespace",
+            })
+            continue
+
+        if acronym in valid_by_acronym:
+            errors.append({
+                "index": valid_by_acronym[acronym]["index"],
+                "acronym": acronym,
+                "reason": f"duplicate acronym in batch, superseded by row {index}",
+            })
+
+        valid_by_acronym[acronym] = {
+            "index": index,
+            "expansions": expansions,
+            "description": description,
+        }
+
+    if not valid_by_acronym:
+        return [], [], errors
+
+    acronym_table = sa.table(
+        "acronym_mapping",
+        sa.column("acronym", sa.String),
+        sa.column("expansions", JSONB),
+        sa.column("description", sa.Text),
+        sa.column("is_active", sa.Boolean),
+        sa.column("created_at", sa.DateTime),
+        sa.column("updated_at", sa.DateTime),
+    )
+    now = datetime.now(timezone.utc)
+    incoming_acronyms = list(valid_by_acronym.keys())
+
+    db = SessionLocal()
+    try:
+        # Determine create vs. update (spec §7 counts them separately) before
+        # the upsert — ON CONFLICT itself doesn't tell us which branch fired
+        # per row.
+        existing = {
+            row.acronym
+            for row in db.query(AcronymMapping.acronym)
+            .filter(AcronymMapping.acronym.in_(incoming_acronyms))
+            .all()
+        }
+        created = [a for a in incoming_acronyms if a not in existing]
+        updated = [a for a in incoming_acronyms if a in existing]
+
+        values = [
+            {
+                "acronym": acronym,
+                "expansions": v["expansions"],
+                "description": v["description"],
+                "is_active": True,
+                "created_at": now,
+                "updated_at": now,
+            }
+            for acronym, v in valid_by_acronym.items()
+        ]
+        stmt = pg_insert(acronym_table).values(values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["acronym"],
+            set_={
+                "expansions": stmt.excluded.expansions,
+                "description": stmt.excluded.description,
+                "is_active": stmt.excluded.is_active,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
+        db.execute(stmt)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    return created, updated, errors

@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     DATABASE_URL: str = os.getenv("POSTGRES_DATABASE_URI", "postgresql://anuj:1234@localhost:5432/ai_vector_service")
     REDIS_CACHE_ENABLED: bool = False
 
+    # Shared secret for internal-only endpoints (e.g. acronym bulk upload), checked
+    # against the X-Internal-Token request header. No default — must be set explicitly.
+    INTERNAL_API_TOKEN: str = os.getenv("INTERNAL_API_TOKEN", "")
+
     # URL extraction settings
     URL_EXTRACTION_CHUNK_SIZE: int = 1500
     URL_EXTRACTION_CHUNK_OVERLAP: int = 300  # 20% overlap
