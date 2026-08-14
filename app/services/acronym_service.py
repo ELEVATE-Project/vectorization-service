@@ -25,9 +25,17 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
     cache_client itself, which stays acronym-agnostic.
 
     Normalizes to uppercase (matching how rows are stored, per spec §3/§8)
-    so this is correct regardless of the caller's input case."""
+    so this is correct regardless of the caller's input case.
+
+    Redis errors (not just misses) fall through to Postgres — a cache
+    outage must degrade lookups, not break them."""
     acronym = acronym.strip().upper()
-    cached = cache_client.get(_cache_key(acronym))
+    try:
+        cached = cache_client.get(_cache_key(acronym))
+    except Exception as e:
+        logger.warning(f"Acronym cache read failed for {acronym!r}, falling back to Postgres: {e}")
+        cached = None
+
     if cached is not None:
         return json.loads(cached)
 
@@ -44,7 +52,11 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
     if row is None:
         return None
 
-    cache_client.set(_cache_key(acronym), json.dumps(row.expansions), settings.REDIS_CACHE_TTL)
+    try:
+        cache_client.set(_cache_key(acronym), json.dumps(row.expansions), settings.REDIS_CACHE_TTL)
+    except Exception as e:
+        logger.warning(f"Acronym cache write-through failed for {acronym!r}: {e}")
+
     return row.expansions
 
 
