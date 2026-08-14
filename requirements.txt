@@ -5,6 +5,7 @@ uvicorn
 sqlalchemy
 psycopg2-binary
 redis
+alembic
 # Pinned to >=1.18.0: enables sparse vectors (BM25) and the Query API with RRF.
 # NOTE: Compatible with the project's Python 3.10.16 runtime.
 # Re-test before upgrading to qdrant-client 2.x, as major versions may introduce breaking API changes.
