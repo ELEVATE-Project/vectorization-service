@@ -81,11 +81,19 @@ def invalidate_cache(acronym: str) -> None:
         logger.warning(f"Acronym cache invalidation failed for {acronym!r}: {e}")
 
 
-async def warm_cache() -> int:
+def warm_cache() -> int:
     """Pre-populate the cache-aside store with every active acronym at startup,
     so first-touch queries after boot are already cache hits rather than DB round-trips.
     Not a substitute for get_expansion()'s per-lookup DB fallback — acronyms added
-    after startup, or evicted via TTL, are still served by that path."""
+    after startup, or evicted via TTL, are still served by that path.
+
+    Deliberately synchronous, not async def — every operation inside is a
+    blocking call (SQLAlchemy's sync Session, cache_client's sync Redis
+    client), so there was never any actual async work here. Async callers
+    must run this via starlette.concurrency.run_in_threadpool rather than
+    awaiting it directly, or these ~600 sequential blocking Redis round-trips
+    stall the whole event loop — every other in-flight request — for the
+    duration."""
     db = SessionLocal()
     try:
         rows = db.query(AcronymMapping).filter(AcronymMapping.is_active.is_(True)).all()
@@ -117,6 +125,11 @@ def _split_expansions(raw: str) -> List[str]:
     return result
 
 
+# Read off the model rather than hardcoded, so this can't silently drift out
+# of sync if the column length is ever changed there.
+_ACRONYM_MAX_LENGTH = AcronymMapping.__table__.c.acronym.type.length
+
+
 def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
     """Validate and upsert a batch of CSV rows (spec §7) in a single transaction.
 
@@ -145,6 +158,18 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
                 "index": index,
                 "acronym": raw_acronym or None,
                 "reason": "acronym and expansions must be non-empty after trimming whitespace",
+            })
+            continue
+
+        if len(acronym) > _ACRONYM_MAX_LENGTH:
+            # Must be caught here, before the batch insert: an over-length
+            # value reaching Postgres raises StringDataRightTruncation on the
+            # single multi-row INSERT, which fails the ENTIRE batch (including
+            # every otherwise-valid row) rather than just this one row.
+            errors.append({
+                "index": index,
+                "acronym": acronym,
+                "reason": f"acronym exceeds max length of {_ACRONYM_MAX_LENGTH} characters",
             })
             continue
 

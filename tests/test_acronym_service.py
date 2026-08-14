@@ -5,7 +5,7 @@ vecsvc-redis) and are skipped automatically if unreachable, mirroring
 tests/test_acronym_mapping.py.
 """
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -157,9 +157,11 @@ class TestStartupFaultTolerance:
     warm-up is an optimization, not a hard dependency."""
 
     def test_warm_cache_failure_does_not_prevent_startup(self):
+        # warm_cache() is sync now (run via run_in_threadpool, not awaited
+        # directly) — the mock must be a plain Mock, not AsyncMock.
         with patch(
             "app.main.warm_acronym_cache",
-            AsyncMock(side_effect=RuntimeError("Postgres unreachable")),
+            Mock(side_effect=RuntimeError("Postgres unreachable")),
         ), patch("app.main.ensure_collections_exist", AsyncMock(return_value=None)):
             from app.main import app, lifespan
 
@@ -177,7 +179,7 @@ class TestStartupFaultTolerance:
         with patch(
             "app.main.ensure_collections_exist",
             AsyncMock(side_effect=RuntimeError("Qdrant unreachable")),
-        ), patch("app.main.warm_acronym_cache", AsyncMock(return_value=0)):
+        ), patch("app.main.warm_acronym_cache", Mock(return_value=0)):
             from app.main import app, lifespan
 
             async def run():

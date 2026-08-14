@@ -82,6 +82,66 @@ class TestBomHandling:
         assert body["updated"] == 0
         assert body["errors"] == []
 
+
+@requires_infra
+class TestOverLengthAcronymRow:
+    """Regression test: an acronym longer than the acronym_mapping.acronym
+    column's max length (String(32)) used to reach a single multi-row
+    INSERT, raise StringDataRightTruncation, and roll back the ENTIRE batch
+    — losing every otherwise-valid row too. Must now be a per-row error."""
+
+    def test_over_length_row_is_a_per_row_error_not_a_batch_failure(
+        self, cleanup_test_acronyms
+    ):
+        from app.services.acronym_service import bulk_upsert
+
+        cleanup_test_acronyms.append("GOODROW")
+        rows = [
+            {"acronym": "GOODROW", "expansions": "A Fine Expansion", "description": ""},
+            {"acronym": "X" * 40, "expansions": "Too Long Acronym Row", "description": ""},
+        ]
+
+        created, updated, errors = bulk_upsert(rows)  # must not raise
+
+        assert created == ["GOODROW"]
+        assert updated == []
+        assert len(errors) == 1
+        assert errors[0]["reason"] == "acronym exceeds max length of 32 characters"
+
+        from app.core.database import SessionLocal
+        from app.models.db_models import AcronymMapping
+
+        db = SessionLocal()
+        try:
+            row = db.query(AcronymMapping).filter(AcronymMapping.acronym == "GOODROW").first()
+            assert row is not None
+        finally:
+            db.close()
+
+
+class TestWarmCacheIsSynchronous:
+    """Structural regression guard: warm_cache() must stay a plain (sync)
+    function, not async def. It's run via run_in_threadpool in both
+    app/main.py's startup and the bulk-upload endpoint specifically because
+    it does ~600 sequential blocking Redis calls — if it were async def
+    again, awaiting it directly would silently reintroduce the event-loop
+    stall this was fixed for, since run_in_threadpool expects a sync
+    callable."""
+
+    def test_warm_cache_is_not_a_coroutine_function(self):
+        import inspect
+
+        from app.services.acronym_service import warm_cache
+
+        assert not inspect.iscoroutinefunction(warm_cache)
+
+    def test_bulk_upsert_is_not_a_coroutine_function(self):
+        import inspect
+
+        from app.services.acronym_service import bulk_upsert
+
+        assert not inspect.iscoroutinefunction(bulk_upsert)
+
     def test_plain_utf8_csv_without_bom_still_works(self, client, cleanup_test_acronyms):
         """Confirms utf-8-sig doesn't regress the non-BOM case."""
         from app.config import settings
