@@ -23,7 +23,11 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
     """
     raw = await file.read()
     try:
-        text = raw.decode("utf-8")
+        # utf-8-sig strips a leading BOM if present (common in CSVs exported
+        # from Excel/Sheets) and is otherwise identical to plain utf-8 — a
+        # BOM left in place would silently become part of the first header
+        # name ("﻿acronym"), making every row fail acronym validation.
+        text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise HTTPException(status_code=400, detail="File must be UTF-8 encoded")
 
