@@ -66,8 +66,18 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
 
 def invalidate_cache(acronym: str) -> None:
     """Drop a single acronym's cached entry. Call after any write to that row
-    (e.g. the bulk upload endpoint) so stale expansions aren't served until TTL expiry."""
-    cache_client.delete(_cache_key(acronym.strip().upper()))
+    (e.g. the bulk upload endpoint) so stale expansions aren't served until TTL expiry.
+
+    Swallows Redis errors (logged) rather than raising — this is already the
+    degraded-mode fallback when the cache is having problems (e.g. the bulk
+    upload endpoint calls this when warm_cache() itself failed), so letting
+    it raise would turn an already-committed, successful write into a 500
+    for the caller."""
+    acronym = acronym.strip().upper()
+    try:
+        cache_client.delete(_cache_key(acronym))
+    except Exception as e:
+        logger.warning(f"Acronym cache invalidation failed for {acronym!r}: {e}")
 
 
 async def load_acronym_cache() -> int:
