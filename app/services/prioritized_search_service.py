@@ -10,6 +10,7 @@ from app.core.clients.qdrant import qdrant_client
 from app.core.clients import embedding
 from app.core.clients.embedding import EmbeddingError
 from app.config import settings
+from app.services.acronym_query_service import build_dense_queries, build_sparse_query, detect_acronyms
 from app.models.api_models import (
     PrioritizedSearchRequest,
     PrioritizedSearchResponse,
@@ -88,7 +89,7 @@ class PrioritizedSearchService:
         logger.info("Calculating weighted scores and ranking results")
         ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out)
         logger.info(f"Ranked results: {len(ranked_results)} documents")
-        
+
         # Apply filtering based on conditions
         if detail_filter_score is not None:
             logger.info("Applying detail_filter_score (field-level thresholds with OR logic)")
@@ -96,13 +97,13 @@ class PrioritizedSearchService:
         else:
             logger.info(f"Applying filter_score threshold: {threshold}")
             filtered_results = [r for r in ranked_results if r['weighted_score'] >= threshold]
-        
+
         logger.info(f"After filtering: {len(filtered_results)} documents (removed {len(ranked_results) - len(filtered_results)})")
-        
+
         logger.info("Deduplicating by source_id (keeping best match per source)")
         unique_source_results = self._filter_best_per_source(filtered_results)
         logger.info(f"Unique sources: {len(unique_source_results)}")
-        
+
         top_results = unique_source_results[:top_k]
         logger.info(f"Returning top {len(top_results)} results")
         
@@ -259,52 +260,99 @@ class PrioritizedSearchService:
             # content words (e.g. "ministry of education" → "ministry education"). See CLAUDE.md §15.
             query_for_keyword_match = request.query
 
-            logger.info(f"Generating embedding for query: '{query_for_embedding}'")
+            # Detection only, not wired into retrieval/ranking yet (that's PR5/PR6 of
+            # the acronym-search rollout) — this computes the mapping and logs it so the
+            # detection module gets exercised on real traffic, but nothing branches on
+            # it, so output is unchanged regardless of ACRONYM_SEARCH_ENABLED.
+            acronyms_detected = {}
+            if settings.ACRONYM_SEARCH_ENABLED:
+                acronyms_detected = detect_acronyms(query_for_keyword_match)
+                if acronyms_detected:
+                    logger.info(f"Acronyms detected in query: {list(acronyms_detected.keys())}")
+
+            # Acronym path: 2 separate dense query strings (never concatenated — see
+            # acronym_query_service.build_dense_queries) + 1 combined sparse OR string.
+            # Non-acronym queries (or nothing detected) fall through unchanged below.
+            dense_query_texts = [query_for_embedding]
+            sparse_query_text = query_for_embedding
+            if acronyms_detected:
+                dense_query_texts = build_dense_queries(query_for_embedding, acronyms_detected)
+                sparse_query_text = build_sparse_query(query_for_keyword_match, acronyms_detected)
+
+            logger.info(f"Generating {len(dense_query_texts)} dense embedding(s) for query: {dense_query_texts}")
             # embed_query rejects empty/whitespace input and validates the produced
             # vector (length == EMBEDDING_DIM, finite values) so a malformed vector can
             # never reach Qdrant. Returns a validated list[float].
-            try:
-                query_embedding = embedding.embed_query(query_for_embedding)
-            except EmbeddingError as e:
-                logger.error(
-                    "Query embedding invalid: service=prioritized_search "
-                    f"query='{query_for_embedding[:80]}' expected_dim={embedding.EMBEDDING_DIM} "
-                    f"error={e}"
-                )
-                raise
-            
+            query_embeddings = []
+            for dense_query_text in dense_query_texts:
+                try:
+                    query_embeddings.append(embedding.embed_query(dense_query_text))
+                except EmbeddingError as e:
+                    logger.error(
+                        "Query embedding invalid: service=prioritized_search "
+                        f"query='{dense_query_text[:80]}' expected_dim={embedding.EMBEDDING_DIM} "
+                        f"error={e}"
+                    )
+                    raise
+
             filter_conditions = self._build_filters(
                 categories=request.categories,
                 organizations=request.organizations,
                 resource_types=request.resource_type,
                 file_types=request.file_type
             )
-            
+
             self._log_search_request(request, top_k, filter_conditions)
             
             logger.info("========== EXECUTING SEARCH ==========" )
+            # Only acronym-detected queries that actually produced a substituted
+            # variant build more than one embedding (see build_dense_queries).
+            # Everything else — flag off, or flag on with no acronym match —
+            # takes the *_multi=False branch, which calls the original
+            # single-embedding functions unchanged from their pre-acronym-feature
+            # form. The *_multi variants (added, not edited in place) hold all the
+            # new per-field/per-embedding fan-out + max()-merge logic.
+            use_acronym_multi_query = len(query_embeddings) > 1
             if settings.SPARSE_SEARCH_ENABLED:
                 logger.info("Starting hybrid batch search (dense + BM25 sparse, RRF fusion)")
-                all_results, field_scores = self._hybrid_batch_search(
-                    search_fields=search_fields,
-                    query_text=query_for_embedding,
-                    query_embedding=query_embedding,
-                    filter_conditions=filter_conditions,
-                    # Bounded candidate pool per field — keeps HNSW ef small (dominant
-                    # query cost). See _candidate_limit / SEARCH_CANDIDATE_* config.
-                    limit=self._candidate_limit(top_k),
-                )
+                if use_acronym_multi_query:
+                    all_results, field_scores = self._hybrid_batch_search_multi(
+                        search_fields=search_fields,
+                        query_text=sparse_query_text,
+                        query_embeddings=query_embeddings,
+                        filter_conditions=filter_conditions,
+                        # Bounded candidate pool per field — keeps HNSW ef small (dominant
+                        # query cost). See _candidate_limit / SEARCH_CANDIDATE_* config.
+                        limit=self._candidate_limit(top_k),
+                    )
+                else:
+                    all_results, field_scores = self._hybrid_batch_search(
+                        search_fields=search_fields,
+                        query_text=sparse_query_text,
+                        query_embedding=query_embeddings[0],
+                        filter_conditions=filter_conditions,
+                        limit=self._candidate_limit(top_k),
+                    )
             else:
                 logger.info("Starting parallel batch search across all fields")
-                all_results, field_scores = self._parallel_batch_search(
-                    search_fields=search_fields,
-                    weights=weights,
-                    query_embedding=query_embedding,
-                    filter_conditions=filter_conditions,
-                    # Bounded candidate pool per field (see note above).
-                    limit=self._candidate_limit(top_k),
-                )
-            
+                if use_acronym_multi_query:
+                    all_results, field_scores = self._parallel_batch_search_multi(
+                        search_fields=search_fields,
+                        weights=weights,
+                        query_embeddings=query_embeddings,
+                        filter_conditions=filter_conditions,
+                        # Bounded candidate pool per field (see note above).
+                        limit=self._candidate_limit(top_k),
+                    )
+                else:
+                    all_results, field_scores = self._parallel_batch_search(
+                        search_fields=search_fields,
+                        weights=weights,
+                        query_embedding=query_embeddings[0],
+                        filter_conditions=filter_conditions,
+                        limit=self._candidate_limit(top_k),
+                    )
+
             if not all_results:
                 logger.info("========== SEARCH RESULTS ==========" )
                 logger.info("No results found")
@@ -501,16 +549,16 @@ class PrioritizedSearchService:
     ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
         """
         Execute parallel batch search across multiple vector fields.
-        
+
         Uses Qdrant's native search_batch for optimal performance.
-        
+
         Args:
             search_fields: Field names to search (title, tags, summary, metadata, text)
             weights: Weight configuration for each field
             query_embedding: Query embedding vector
             filter_conditions: Optional Qdrant filter conditions
             limit: Number of results to retrieve per field
-            
+
         Returns:
             Tuple of (all_results dict, field_scores dict)
         """
@@ -537,7 +585,7 @@ class PrioritizedSearchService:
                 )
             )
             valid_fields.append(field)
-        
+
         logger.info(f"Executing batch search across {len(valid_fields)} fields: {valid_fields}")
         batch_results = qdrant_client.query_batch_points(
             collection_name=self.collection_name,
@@ -550,18 +598,102 @@ class PrioritizedSearchService:
         for field, query_response in zip(valid_fields, batch_results):
             results = query_response.points
             logger.info(f"Field '{field}' returned {len(results)} results")
-            
+
             for result in results:
                 point_id = result.id
                 if point_id not in all_results:
                     all_results[point_id] = result
                     field_scores[point_id] = {}
-                
+
                 field_scores[point_id][field] = result.score
-        
+
         logger.info(f"Batch search completed: {len(all_results)} unique documents found")
         return all_results, field_scores
-    
+
+    def _parallel_batch_search_multi(
+        self,
+        search_fields: List[str],
+        weights: Dict[str, float],
+        query_embeddings: List[Any],
+        filter_conditions: Optional[models.Filter],
+        limit: int
+    ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
+        """
+        Acronym-path variant of _parallel_batch_search: fans a batch of dense
+        requests out across BOTH search_fields and query_embeddings (one request
+        per field per embedding), bundled into a single Qdrant batch call (same
+        1-round-trip design as the singular function), then merges results back
+        per field with max(), since the same point can now be scored twice for
+        the same field (once per embedding). Only called when acronym detection
+        actually produced more than one query embedding — see the call site in
+        search(). Kept as a separate method rather than folded into
+        _parallel_batch_search so the non-acronym path stays byte-identical to
+        its pre-acronym-feature form.
+
+        Args:
+            search_fields: Field names to search (title, tags, summary, metadata, text)
+            weights: Weight configuration for each field
+            query_embeddings: List of query embedding vectors (original +
+                acronym-substituted).
+            filter_conditions: Optional Qdrant filter conditions
+            limit: Number of results to retrieve per field
+
+        Returns:
+            Tuple of (all_results dict, field_scores dict)
+        """
+        search_requests = []
+        valid_fields = []
+
+        # Defense-in-depth: validate each dense vector immediately before it is sent to
+        # Qdrant. Each embedding is already a validated list from embed_query, but this
+        # guards against any future caller passing a raw/empty vector.
+        dense_vectors = [embedding.validate_vector(vec) for vec in query_embeddings]
+
+        for field in search_fields:
+            if field not in weights:
+                logger.warning(f"Field '{field}' not in weights config, skipping")
+                continue
+
+            for dense_vector in dense_vectors:
+                search_requests.append(
+                    QueryRequest(
+                        query=dense_vector,
+                        using=field,
+                        limit=limit,
+                        with_payload=True,
+                        filter=filter_conditions
+                    )
+                )
+                valid_fields.append(field)
+
+        logger.info(f"Executing batch search across {len(valid_fields)} field/query-variant combinations")
+        batch_results = qdrant_client.query_batch_points(
+            collection_name=self.collection_name,
+            requests=search_requests
+        )
+
+        all_results = {}
+        field_scores = {}
+
+        for field, query_response in zip(valid_fields, batch_results):
+            results = query_response.points
+            logger.info(f"Field '{field}' returned {len(results)} results")
+
+            for result in results:
+                point_id = result.id
+                if point_id not in all_results:
+                    all_results[point_id] = result
+                    field_scores[point_id] = {}
+
+                # max(), not overwrite: with multiple query embeddings, the same point
+                # can be scored twice for the same field (once per embedding) — keep
+                # whichever embedding matched it best instead of the last one seen.
+                existing = field_scores[point_id].get(field, float("-inf"))
+                field_scores[point_id][field] = max(existing, result.score)
+
+        logger.info(f"Batch search completed: {len(all_results)} unique documents found")
+        return all_results, field_scores
+
     def _hybrid_batch_search(
         self,
         search_fields: List[str],
@@ -572,7 +704,7 @@ class PrioritizedSearchService:
     ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
         """Execute hybrid search using parallel batch queries with client-side RRF fusion.
 
-        This maintains keyword (BM25 sparse) search active while exposing raw field-level 
+        This maintains keyword (BM25 sparse) search active while exposing raw field-level
         similarity scores for detail_filter_score verification.
 
         To minimize network bandwidth and memory footprint, payloads are projected to exclude
@@ -629,7 +761,7 @@ class PrioritizedSearchService:
                 valid_fields.append(settings.SPARSE_VECTOR_NAME)
 
             logger.info(f"Executing client-side hybrid batch search across {len(valid_fields)} fields: {valid_fields}")
-            
+
             # 3. Execute all queries in a single network batch call
             import time
             t0 = time.time()
@@ -705,6 +837,163 @@ class PrioritizedSearchService:
                 search_fields=search_fields,
                 weights=self.default_weights,
                 query_embedding=query_embedding,
+                filter_conditions=filter_conditions,
+                limit=limit,
+            )
+
+    def _hybrid_batch_search_multi(
+        self,
+        search_fields: List[str],
+        query_text: str,
+        query_embeddings: List[Any],
+        filter_conditions: Optional[models.Filter],
+        limit: int,
+    ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
+        """Acronym-path variant of _hybrid_batch_search: fans dense requests out
+        across BOTH search_fields and query_embeddings (one request per field per
+        embedding), bundled with the single BM25 sparse request into one Qdrant
+        batch call (same 1-round-trip design as the singular function), merging
+        same-field hits back with max() since the same point can now be scored
+        twice for the same field. query_text (for the single BM25 sparse
+        request — sparse fan-out is a string-level OR, not multiple requests)
+        is expected to already carry any acronym OR-expansion baked in by the
+        caller. Only called when acronym detection actually produced more than
+        one query embedding — see the call site in search(). Kept separate
+        from _hybrid_batch_search so the non-acronym path stays byte-identical to
+        its pre-acronym-feature form.
+        """
+        try:
+            from qdrant_client.models import QueryRequest, SparseVector
+            from app.core.clients.sparse_encoder import generate_sparse_vector
+
+            search_requests = []
+            valid_fields = []
+
+            # Defense-in-depth: validate each dense vector before it reaches Qdrant
+            # (prevents the "expected dim: 384, got 0" batch 400).
+            dense_vectors = [embedding.validate_vector(vec) for vec in query_embeddings]
+
+            # Project payload to retrieve only small metadata keys needed for filters and boosts.
+            # Excludes the heavy 'text' payload field during candidate scoring.
+            metadata_payload_fields = ["source_id", "title", "summary", "tags", "metadata"]
+
+            # 1. Build Query Requests for Dense Fields
+            for field in search_fields:
+                if field in self.default_weights:
+                    for dense_vector in dense_vectors:
+                        search_requests.append(
+                            QueryRequest(
+                                query=dense_vector,
+                                using=field,
+                                limit=limit,
+                                with_payload=metadata_payload_fields,
+                                filter=filter_conditions
+                            )
+                        )
+                        valid_fields.append(field)
+
+            # 2. Build Query Request for BM25 Sparse Field
+            # Replace underscores with spaces so BM25 tokenises compound
+            # underscore-joined terms (e.g. "agentic_engineering") as separate
+            # words rather than a single unknown token that produces empty indices.
+            bm25_query_text = query_text.replace("_", " ")
+            sparse_indices, sparse_values = generate_sparse_vector(bm25_query_text)
+            if sparse_indices:
+                search_requests.append(
+                    QueryRequest(
+                        query=SparseVector(
+                            indices=sparse_indices,
+                            values=sparse_values,
+                        ),
+                        using=settings.SPARSE_VECTOR_NAME,
+                        limit=limit,
+                        with_payload=metadata_payload_fields,
+                        filter=filter_conditions
+                    )
+                )
+                valid_fields.append(settings.SPARSE_VECTOR_NAME)
+
+            logger.info(f"Executing client-side hybrid batch search across {len(valid_fields)} fields: {valid_fields}")
+
+            # 3. Execute all queries in a single network batch call
+            import time
+            t0 = time.time()
+            batch_results = qdrant_client.query_batch_points(
+                collection_name=self.collection_name,
+                requests=search_requests
+            )
+            t1 = time.time()
+            logger.info(f"TIMING: query_batch_points took {t1-t0:.2f}s")
+
+            # 4. Collect per-field raw similarity scores from the batch results.
+            #    Each doc keeps the raw cosine score for every dense field that
+            #    retrieved it, plus the raw BM25 score under the sparse field key
+            #    (SPARSE_VECTOR_NAME) when the sparse query participated and returned
+            #    hits. The presence of that sparse key is what _rank_results uses to
+            #    detect hybrid mode and to fuse dense + sparse — the actual dense/sparse
+            #    fusion (weighted or two-list RRF) lives there, so there is no separate
+            #    all-field RRF computed or stored here.
+            all_results: Dict[str, Any] = {}
+            field_scores: Dict[str, Dict[str, float]] = {}
+
+            for field, query_response in zip(valid_fields, batch_results):
+                for point in query_response.points:
+                    pid = point.id
+                    all_results[pid] = point
+                    if pid not in field_scores:
+                        field_scores[pid] = {}
+                    # max(), not overwrite: with multiple dense embeddings for the same
+                    # field (acronym path), the same point can be scored twice for that
+                    # field — keep whichever embedding matched it best.
+                    score = getattr(point, "score", 0.0)
+                    existing = field_scores[pid].get(field, float("-inf"))
+                    field_scores[pid][field] = max(existing, score)
+
+            # 5. Remap raw Qdrant vector-field names to the semantic field names that
+            #    _apply_detail_filter checks against ("title", "text", "tags",
+            #    "summary", "metadata"). The keys of self.default_weights are the
+            #    authoritative semantic names; the corresponding Qdrant vector name is
+            #    VECTOR_FIELD_PREFIX + semantic_name. This collection configures its
+            #    named vectors with no prefix (see app/core/clients/qdrant.py), so the
+            #    mapping is an identity today — but doing it explicitly keeps the
+            #    field_scores contract correct if a prefix is ever introduced.
+            #    The "bm25" (SPARSE_VECTOR_NAME) key is preserved untouched — it carries
+            #    the raw BM25 score consumed by _rank_results' dense+sparse fusion and
+            #    signals hybrid mode.
+            prefix = getattr(settings, "VECTOR_FIELD_PREFIX", "") or ""
+            qdrant_to_semantic = {
+                f"{prefix}{semantic}": semantic for semantic in self.default_weights
+            }
+            for scores in field_scores.values():
+                for qdrant_name, semantic_name in qdrant_to_semantic.items():
+                    if qdrant_name in scores and semantic_name not in scores:
+                        scores[semantic_name] = scores[qdrant_name]
+
+            logger.info(f"Client-side hybrid search returned {len(all_results)} unique documents (metadata-only)")
+            return all_results, field_scores
+
+        except (ImportError, RuntimeError) as exc:
+            # ImportError: optional sparse deps (fastembed / qdrant SparseVector)
+            # missing — the module-level `from ... import` at the top of the try fails.
+            # RuntimeError: the BM25 encoder failed to initialise or encode at runtime —
+            # generate_sparse_vector() wraps every encoder failure (corrupted model
+            # cache, download failure, OOM, even a missing-fastembed ImportError) as
+            # RuntimeError. Both are sparse-side problems, so degrade gracefully to
+            # dense-only search.
+            # NOTE: AttributeError is intentionally NOT caught — it is not a genuine
+            # sparse-availability signal (the deps are imported, not attribute-accessed)
+            # and catching it would silently swallow programming errors (e.g. a typo
+            # like query_response.point) as a quiet dense-only degradation. Likewise,
+            # Qdrant transport errors (timeouts, connection failures) raise other
+            # exception types and surface instead of being masked.
+            logger.warning(
+                f"Hybrid search unavailable ({type(exc).__name__}: {exc}); "
+                "falling back to dense-only parallel search."
+            )
+            return self._parallel_batch_search_multi(
+                search_fields=search_fields,
+                weights=self.default_weights,
+                query_embeddings=query_embeddings,
                 filter_conditions=filter_conditions,
                 limit=limit,
             )

@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     SHORT_QUERY_THRESHOLD: int = int(os.getenv("SHORT_QUERY_THRESHOLD", "3"))
     RRF_K: int = int(os.getenv("RRF_K", "60"))  # standard Reciprocal Rank Fusion constant
 
+    # Acronym Search — default false until the full detect -> expand -> tiered-rank
+    # path lands and passes validation (see ACRONYM_SEARCH_PLAN.md).
+    ACRONYM_SEARCH_ENABLED: bool = os.getenv("ACRONYM_SEARCH_ENABLED", "false").lower() == "true"
+
     # Sparse Vector Configuration (Phase 2 — requires qdrant-client>=1.9.0)
     SPARSE_VECTOR_NAME: str = os.getenv("SPARSE_VECTOR_NAME", "bm25")
     SPARSE_SEARCH_ENABLED: bool = os.getenv("SPARSE_SEARCH_ENABLED", "false").lower() == "true"

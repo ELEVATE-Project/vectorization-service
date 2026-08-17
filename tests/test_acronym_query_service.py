@@ -1,0 +1,153 @@
+"""Unit tests for detection + query expansion (app/services/acronym_query_service.py).
+
+Pure logic tests — get_expansion is mocked so these don't touch Redis/Postgres.
+"""
+from unittest.mock import patch
+
+from app.services.acronym_query_service import (
+    build_dense_queries,
+    build_sparse_query,
+    detect_acronyms,
+)
+
+# Mirrors the real dataset's shape: acronym -> list of expansions (JSONB array,
+# per PR1's schema). SSC is a real multi-expansion case from the seeded data.
+_ACRONYMS = {
+    "DIET": ["District Institute of Education and Training"],
+    "PTM": ["Parent Teacher Meeting"],
+    "SMC": ["School Management Committee"],
+    "SSC": ["Staff Selection Commission", "Sainik School Society"],
+}
+
+
+def _fake_get_expansion(acronym):
+    return _ACRONYMS.get(acronym)
+
+
+class TestDetectAcronyms:
+    def setup_method(self):
+        self._patcher = patch(
+            "app.services.acronym_query_service.get_expansion",
+            side_effect=_fake_get_expansion,
+        )
+        self._patcher.start()
+
+    def teardown_method(self):
+        self._patcher.stop()
+
+    def test_empty_query(self):
+        assert detect_acronyms("") == {}
+        assert detect_acronyms("   ") == {}
+
+    def test_uppercase_token_in_multi_word_query_is_checked(self):
+        assert detect_acronyms("next PTM schedule") == {"PTM": ["Parent Teacher Meeting"]}
+
+    def test_lowercase_word_inside_sentence_is_skipped(self):
+        # "diet" here is the common English word, not the acronym — must not match.
+        assert detect_acronyms("the diet chart for kids") == {}
+
+    def test_lone_lowercase_word_is_checked(self):
+        # Single-word query, no shift key used — still plausibly the acronym.
+        assert detect_acronyms("diet") == {"DIET": ["District Institute of Education and Training"]}
+
+    def test_lone_uppercase_word_is_checked(self):
+        assert detect_acronyms("PTM") == {"PTM": ["Parent Teacher Meeting"]}
+
+    def test_single_word_not_in_dictionary_returns_empty(self):
+        assert detect_acronyms("something") == {}
+
+    def test_punctuation_and_dots_are_normalized(self):
+        assert detect_acronyms("D.I.E.T.") == {"DIET": ["District Institute of Education and Training"]}
+        assert detect_acronyms("what about PTM?") == {"PTM": ["Parent Teacher Meeting"]}
+
+    def test_multiple_acronyms_in_one_query(self):
+        result = detect_acronyms("PTM and SMC meeting schedule")
+        assert result == {
+            "PTM": ["Parent Teacher Meeting"],
+            "SMC": ["School Management Committee"],
+        }
+
+    def test_single_letter_uppercase_is_ignored(self):
+        # len > 1 guard — avoids "A"/"I" false-triggering.
+        assert detect_acronyms("A I") == {}
+
+    def test_mixed_case_word_inside_sentence_is_skipped(self):
+        assert detect_acronyms("Diet plans for children") == {}
+
+    def test_unknown_uppercase_token_returns_empty(self):
+        assert detect_acronyms("ask about XYZ today") == {}
+
+    def test_multi_expansion_acronym_detected_with_full_list(self):
+        assert detect_acronyms("SSC recruitment") == {
+            "SSC": ["Staff Selection Commission", "Sainik School Society"]
+        }
+
+
+class TestBuildDenseQueries:
+    def test_no_mapping_returns_original_only(self):
+        assert build_dense_queries("next ptm schedule", {}) == ["next ptm schedule"]
+
+    def test_substitution_produces_two_variants_never_concatenated(self):
+        result = build_dense_queries("next ptm schedule", {"PTM": ["Parent Teacher Meeting"]})
+        assert result == ["next ptm schedule", "next Parent Teacher Meeting schedule"]
+
+    def test_substitution_is_case_insensitive_and_word_bounded(self):
+        # query_for_embedding is always lowercased upstream; mapping keys are uppercase.
+        result = build_dense_queries("ptm", {"PTM": ["Parent Teacher Meeting"]})
+        assert result == ["ptm", "Parent Teacher Meeting"]
+
+    def test_no_op_substitution_does_not_produce_duplicate_variant(self):
+        # Acronym detected in the original-case query but absent from this particular
+        # (already-transformed) embedding string — substitution changes nothing.
+        result = build_dense_queries("parent teacher meeting", {"PTM": ["Parent Teacher Meeting"]})
+        assert result == ["parent teacher meeting"]
+
+    def test_multiple_acronyms_all_substituted(self):
+        result = build_dense_queries(
+            "ptm and smc schedule",
+            {"PTM": ["Parent Teacher Meeting"], "SMC": ["School Management Committee"]},
+        )
+        assert result == [
+            "ptm and smc schedule",
+            "Parent Teacher Meeting and School Management Committee schedule",
+        ]
+
+    def test_multi_expansion_acronym_uses_only_the_primary_first_expansion(self):
+        """Spec §9: substitution uses the primary (first) expansion — SSC has
+        two, only "Staff Selection Commission" (index 0) should appear."""
+        result = build_dense_queries(
+            "ssc recruitment",
+            {"SSC": ["Staff Selection Commission", "Sainik School Society"]},
+        )
+        assert result == ["ssc recruitment", "Staff Selection Commission recruitment"]
+        assert "Sainik School Society" not in result[1]
+
+
+class TestBuildSparseQuery:
+    def test_no_mapping_returns_original(self):
+        assert build_sparse_query("PTM", {}) == "PTM"
+
+    def test_single_acronym_matches_plan_doc_example(self):
+        assert build_sparse_query("PTM", {"PTM": ["Parent Teacher Meeting"]}) == 'PTM OR "Parent Teacher Meeting"'
+
+    def test_multi_word_query_appends_or_clause(self):
+        result = build_sparse_query("next PTM schedule", {"PTM": ["Parent Teacher Meeting"]})
+        assert result == 'next PTM schedule OR "Parent Teacher Meeting"'
+
+    def test_multiple_acronyms_or_together(self):
+        result = build_sparse_query(
+            "PTM and SMC",
+            {"PTM": ["Parent Teacher Meeting"], "SMC": ["School Management Committee"]},
+        )
+        assert result == 'PTM and SMC OR "Parent Teacher Meeting" OR "School Management Committee"'
+
+    def test_multi_expansion_acronym_ors_in_every_expansion(self):
+        """Unlike build_dense_queries, ALL expansions get OR'd in here — BM25
+        has no dilution risk from adding more matchable phrases."""
+        result = build_sparse_query(
+            "SSC recruitment",
+            {"SSC": ["Staff Selection Commission", "Sainik School Society"]},
+        )
+        assert result == (
+            'SSC recruitment OR "Staff Selection Commission" OR "Sainik School Society"'
+        )
