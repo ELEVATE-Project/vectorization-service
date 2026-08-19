@@ -94,20 +94,27 @@ def build_dense_queries(query_for_embedding: str, mapping: Dict[str, List[str]])
 
 
 def build_sparse_query(query_for_keyword_match: str, mapping: Dict[str, List[str]]) -> str:
-    """Build the combined sparse (BM25) query string: original query text, OR'd
-    with every detected acronym's quoted expansion phrase(s) — all of them, not
-    just the first, unlike build_dense_queries. BM25 does literal token/phrase
-    matching, not meaning-blending, so OR-ing in every known phrasing only adds
-    more ways to match, with no dilution risk (the opposite rule from
-    build_dense_queries, which must pick one to stay a coherent embedding).
+    """Build the combined sparse (BM25) query string: original query text plus
+    the words of every detected acronym's expansion(s) — all of them, not just
+    the first, unlike build_dense_queries. Appending every known phrasing's
+    words only adds more ways to match, with no dilution risk (the opposite
+    rule from build_dense_queries, which must pick one expansion to stay a
+    coherent embedding).
 
-    Safe to combine into one string here — structured boolean syntax works
-    correctly for BM25.
+    Plain word-appending, NOT structured boolean/phrase syntax: the sparse
+    encoder (fastembed's Qdrant/bm25) is a bag-of-words tokenizer with no
+    notion of `OR` or quoted phrases — confirmed empirically, a wrapped
+    query like `PTM OR "Parent Teacher Meeting"` and the plain
+    `PTM Parent Teacher Meeting` produce byte-identical token sets ("or" is
+    stripped as a stopword either way). An earlier version of this docstring
+    claimed boolean syntax worked here; it doesn't, and the OR/quote
+    wrapping was purely decorative — this appends the words directly instead
+    of writing text that looks structured but isn't.
     """
     if not mapping:
         return query_for_keyword_match
 
-    expansion_clauses = " OR ".join(
-        f'"{expansion}"' for expansions in mapping.values() for expansion in expansions
+    expansion_words = " ".join(
+        expansion for expansions in mapping.values() for expansion in expansions
     )
-    return f"{query_for_keyword_match} OR {expansion_clauses}"
+    return f"{query_for_keyword_match} {expansion_words}"

@@ -174,30 +174,48 @@ class TestBuildDenseQueries:
 
 
 class TestBuildSparseQuery:
+    """build_sparse_query() appends plain expansion words — see the function's
+    docstring for why the OR/quote-wrapped format this used to produce was
+    dropped (confirmed empirically inert: the sparse encoder tokenizes it
+    identically to plain word-appending, since it has no boolean/phrase
+    syntax support at all)."""
+
     def test_no_mapping_returns_original(self):
         assert build_sparse_query("PTM", {}) == "PTM"
 
-    def test_single_acronym_matches_plan_doc_example(self):
-        assert build_sparse_query("PTM", {"PTM": ["Parent Teacher Meeting"]}) == 'PTM OR "Parent Teacher Meeting"'
+    def test_single_acronym_appends_expansion_words(self):
+        assert build_sparse_query("PTM", {"PTM": ["Parent Teacher Meeting"]}) == "PTM Parent Teacher Meeting"
 
-    def test_multi_word_query_appends_or_clause(self):
+    def test_multi_word_query_appends_expansion_words(self):
         result = build_sparse_query("next PTM schedule", {"PTM": ["Parent Teacher Meeting"]})
-        assert result == 'next PTM schedule OR "Parent Teacher Meeting"'
+        assert result == "next PTM schedule Parent Teacher Meeting"
 
-    def test_multiple_acronyms_or_together(self):
+    def test_multiple_acronyms_all_appended(self):
         result = build_sparse_query(
             "PTM and SMC",
             {"PTM": ["Parent Teacher Meeting"], "SMC": ["School Management Committee"]},
         )
-        assert result == 'PTM and SMC OR "Parent Teacher Meeting" OR "School Management Committee"'
+        assert result == "PTM and SMC Parent Teacher Meeting School Management Committee"
 
-    def test_multi_expansion_acronym_ors_in_every_expansion(self):
-        """Unlike build_dense_queries, ALL expansions get OR'd in here — BM25
-        has no dilution risk from adding more matchable phrases."""
+    def test_multi_expansion_acronym_appends_every_expansion(self):
+        """Unlike build_dense_queries, ALL expansions get appended here — BM25
+        has no dilution risk from adding more matchable words."""
         result = build_sparse_query(
             "SSC recruitment",
             {"SSC": ["Staff Selection Commission", "Sainik School Society"]},
         )
-        assert result == (
-            'SSC recruitment OR "Staff Selection Commission" OR "Sainik School Society"'
-        )
+        assert result == "SSC recruitment Staff Selection Commission Sainik School Society"
+
+    def test_wrapped_and_plain_forms_tokenize_identically(self):
+        """Regression test proving the OR/quote removal is behavior-preserving:
+        the old wrapped format and the new plain-appended format must produce
+        the exact same BM25 token set, confirming the wrapping was always
+        inert decoration, never functional."""
+        from app.core.clients.sparse_encoder import generate_sparse_vector
+
+        old_wrapped = 'PTM OR "Parent Teacher Meeting"'
+        new_plain = build_sparse_query("PTM", {"PTM": ["Parent Teacher Meeting"]})
+
+        idx_old, _ = generate_sparse_vector(old_wrapped)
+        idx_new, _ = generate_sparse_vector(new_plain)
+        assert set(idx_old) == set(idx_new)
