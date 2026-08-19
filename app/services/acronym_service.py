@@ -51,6 +51,14 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
             .filter(AcronymMapping.acronym == acronym, AcronymMapping.is_active.is_(True))
             .first()
         )
+    except Exception as e:
+        # A Postgres outage (or the acronym table not existing yet) must
+        # degrade acronym lookups, not take down search entirely — search
+        # never depended on Postgres before this feature. Treated the same
+        # as "not an acronym" rather than propagating, mirroring the Redis
+        # fallback above.
+        logger.warning(f"Acronym DB lookup failed for {acronym!r}, treating as not found: {e}")
+        return None
     finally:
         db.close()
 

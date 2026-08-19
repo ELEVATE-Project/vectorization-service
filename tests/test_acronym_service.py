@@ -118,6 +118,38 @@ class TestCacheOutageFallsBackToPostgres:
             acronym_service.invalidate_cache("MBA")  # must not raise
 
 
+@requires_infra
+class TestPostgresOutageDoesNotBreakSearch:
+    """Regression test: a Postgres outage (or the acronym table not existing
+    yet) during a lookup must degrade to 'not an acronym', not raise —
+    search never depended on Postgres before this feature, and this
+    exception previously propagated all the way to search()'s generic
+    handler, turning every search request into a 500 whenever Postgres was
+    unreachable."""
+
+    @pytest.fixture(autouse=True)
+    def flush_redis(self):
+        from app.core.clients.redis_client import redis_client
+
+        redis_client.flushdb()
+        yield
+        redis_client.flushdb()
+
+    def test_db_query_failure_returns_none_not_raise(self):
+        from unittest.mock import MagicMock
+
+        from app.services import acronym_service
+
+        mock_session = MagicMock()
+        mock_session.query.side_effect = Exception("connection refused")
+
+        with patch("app.services.acronym_service.SessionLocal", return_value=mock_session):
+            result = acronym_service.get_expansion("MBA")
+
+        assert result is None
+        mock_session.close.assert_called_once()
+
+
 class TestRedisPasswordConfiguration:
     """Regression test: the shared Redis connection must forward
     REDIS_PASSWORD, or every acronym cache operation silently fails with
