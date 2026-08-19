@@ -63,6 +63,16 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
         db.close()
 
     if row is None:
+        # Cache the negative result too (shorter TTL) — otherwise every ordinary
+        # non-acronym word in a query re-hits Postgres on every single request,
+        # since only positive hits were ever written through before this fix.
+        # json.dumps(None) -> the string "null", read back via the same
+        # `if cached is not None: return json.loads(cached)` path above, which
+        # correctly resolves to None — no separate sentinel/read-path needed.
+        try:
+            cache_client.set(_cache_key(acronym), json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL)
+        except Exception as e:
+            logger.warning(f"Acronym negative-cache write failed for {acronym!r}: {e}")
         return None
 
     try:

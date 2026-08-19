@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
     REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", 86400))  # 24 hours in seconds
+    # Shorter than REDIS_CACHE_TTL: caches "this word isn't an acronym" so ordinary
+    # non-acronym words in a query don't re-hit Postgres on every request. A newly
+    # bulk-uploaded acronym overwrites any stale negative entry immediately (warm_cache()
+    # runs after every upload), so this TTL only bounds staleness for the rare case that
+    # invariant doesn't hold — not load-bearing correctness.
+    REDIS_NEGATIVE_CACHE_TTL: int = int(os.getenv("REDIS_NEGATIVE_CACHE_TTL", 3600))  # 1 hour
     REDIS_MAX_CACHE_SIZE: int = int(os.getenv("REDIS_MAX_CACHE_SIZE", 1000))
     DATABASE_URL: str = os.getenv("POSTGRES_DATABASE_URI", "postgresql://anuj:1234@localhost:5432/ai_vector_service")
     REDIS_CACHE_ENABLED: bool = False

@@ -150,6 +150,66 @@ class TestPostgresOutageDoesNotBreakSearch:
         mock_session.close.assert_called_once()
 
 
+@requires_infra
+class TestNegativeCaching:
+    """Regression test: a miss (word is not an acronym) was never cached —
+    only positive hits were — so every non-acronym word in a query re-hit
+    Postgres on every single request. detect_acronyms() calls get_expansion()
+    for every all-caps token, so an ordinary query like "ANNUAL REPORT FOR
+    NCERT 2024" opened 4 fresh DB round-trips, forever, with zero caching
+    benefit for the non-acronym words."""
+
+    @pytest.fixture(autouse=True)
+    def flush_redis(self):
+        from app.core.clients.redis_client import redis_client
+
+        redis_client.flushdb()
+        yield
+        redis_client.flushdb()
+
+    def test_unknown_word_gets_cached_as_not_found(self):
+        from app.services import acronym_service
+        from app.core.clients.redis_client import redis_client
+
+        assert acronym_service.get_expansion("NOTREAL") is None
+        assert redis_client.exists("acronym:NOTREAL")
+
+    def test_second_lookup_of_unknown_word_does_not_hit_postgres(self):
+        from unittest.mock import MagicMock
+
+        from app.services import acronym_service
+
+        # First call: real DB miss, populates the negative cache entry.
+        assert acronym_service.get_expansion("NOTREAL") is None
+
+        # Second call: DB must not be touched at all — a fresh SessionLocal()
+        # that would raise if queried proves this via absence of a call.
+        mock_session = MagicMock()
+        mock_session.query.side_effect = AssertionError("must not hit Postgres on a cached negative")
+
+        with patch("app.services.acronym_service.SessionLocal", return_value=mock_session):
+            result = acronym_service.get_expansion("NOTREAL")
+
+        assert result is None
+        mock_session.query.assert_not_called()
+
+    def test_negative_entry_uses_the_shorter_negative_ttl(self):
+        from app.config import settings
+        from app.services import acronym_service
+        from app.core.clients.redis_client import redis_client
+
+        acronym_service.get_expansion("NOTREAL")
+        ttl = redis_client.ttl("acronym:NOTREAL")
+        assert 0 < ttl <= settings.REDIS_NEGATIVE_CACHE_TTL
+
+    def test_negative_cache_write_failure_does_not_raise(self):
+        from app.services import acronym_service
+
+        with patch("app.core.clients.cache_client.set", side_effect=Exception("Redis down")):
+            result = acronym_service.get_expansion("NOTREAL")  # must not raise
+        assert result is None
+
+
 class TestRedisPasswordConfiguration:
     """Regression test: the shared Redis connection must forward
     REDIS_PASSWORD, or every acronym cache operation silently fails with
