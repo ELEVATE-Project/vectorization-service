@@ -201,24 +201,28 @@ class TestAcronymMappingSchema:
 
 @requires_postgres
 class TestSeedData:
-    """Verifies the real acronym dataset seeds correctly. Row count is 579,
-    not the original 599 — 23 rows were removed (9 common-English-word
-    false positives like THE/SET/ACT, 4 redundant multi-word entries whose
-    parts already exist standalone, 10 entries with a hyphen/apostrophe/
+    """Verifies the real acronym dataset seeds correctly. Row count is 548,
+    not the original 599 — 54 rows were removed (9 common-English-word
+    false positives like THE/SET/ACT; 4 redundant multi-word entries whose
+    parts already exist standalone; 10 entries with a hyphen/apostrophe/
     digit that _normalize_token strips so they could never match — 1 of
-    those, DDU-GKY, was a duplicate of an already-existing DDUGKY row; the
-    other 9 including 4G/5G were just removed, not renamed, since 4G/5G
-    can't be fixed by renaming at all — digit-stripping leaves both as the
-    single letter "G", below the length-2 detection guard) and 3 added
-    (JRF, UG, BSE) during a curation pass, see acronym_query_service.py:43
-    and :12 findings."""
+    those, DDU-GKY, was a duplicate of an already-existing DDUGKY row, the
+    other 9 including 4G/5G were just removed since 4G/5G can't be fixed by
+    renaming at all — digit-stripping leaves both as the single letter "G",
+    below the length-2 detection guard; 13 entries that weren't real
+    acronyms at all, just a word/brand name re-typed with different
+    capitalization (BLUETOOTH -> Bluetooth, CLERK -> Clerk, ...); 18 more
+    common-English-word false-positive risks in the same class as THE/SET/
+    ACT but missed on the first pass (VIVA, PRACTICAL, BIOMETRIC, ...)) and
+    3 added (JRF, UG, BSE) during a curation pass, see
+    acronym_query_service.py:43 and :12 findings."""
 
     def test_row_count(self, migrated_db):
         with migrated_db.connect() as conn:
             count = conn.execute(
                 text("SELECT count(*) FROM acronym_mapping")
             ).scalar()
-        assert count == 579
+        assert count == 548
 
     def test_multi_expansion_acronym(self, migrated_db):
         with migrated_db.connect() as conn:
@@ -257,4 +261,4 @@ class TestMigrationIdempotency:
             count = conn.execute(
                 text("SELECT count(*) FROM acronym_mapping")
             ).scalar()
-        assert count == 579
+        assert count == 548

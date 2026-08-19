@@ -115,3 +115,60 @@ class TestUnreachablePunctuatedEntriesRemoved:
         # (the form the hyphenated version would normalize to anyway) must
         # still be there so the concept isn't lost entirely.
         assert "DDUGKY" in _acronyms()
+
+
+class TestNotRealAcronymsRemoved:
+    """13 rows whose 'expansion' was just the acronym itself with different
+    capitalization (BLUETOOTH -> Bluetooth, CLERK -> Clerk, ...) — not
+    acronyms at all, just words/brand names mistakenly loaded into the
+    acronym dictionary. No longer cause a functional bug (the case-only
+    dense-query fix already stops the wasted double search), but they're
+    still not legitimate entries — removed as data-quality cleanup."""
+
+    NOT_REAL_ACRONYMS = {
+        "BHUVAN", "UDAAN", "VIDYANJALI", "CLERK", "BLUETOOTH", "SAKSHAM",
+        "RECHECKING", "DIGILOCKER", "DOUBTNUT", "UNACADEMY", "VEDANTU",
+        "ENTREPRENEURSHIP", "BALVATIKA",
+    }
+
+    def test_not_real_acronyms_removed_from_seed_csv(self):
+        acronyms = _acronyms()
+        present = self.NOT_REAL_ACRONYMS & acronyms
+        assert not present, f"Non-acronym entries reintroduced into seed CSV: {present}"
+
+
+class TestSecondPassFalsePositivesRemoved:
+    """18 more common-English-word false-positive risks, same class as
+    THE/SET/ACT (see TestDangerousCommonWordAcronymsRemoved above) but
+    missed on the first pass — Devin's report only gave 9 examples, not an
+    exhaustive list. Each of these is an ordinary word whose 'expansion'
+    just tacks on an extra word (VIVA -> Viva Voce, PRACTICAL -> Practical
+    Examination, ...) — a query typed in all-caps containing one of these
+    would have been silently rewritten into a different search the user
+    never asked for."""
+
+    SECOND_PASS_DANGEROUS_WORDS = {
+        "VIVA", "PRACTICAL", "COUNSELING", "MODERATION", "SUPPLEMENTARY",
+        "COMPARTMENT", "BIOMETRIC", "ROBOTICS", "BONAFIDE", "AUDITORIUM",
+        "PLAYGROUND", "INFIRMARY", "RAMPS", "DEWORMING", "SYNCHRONOUS",
+        "ASYNCHRONOUS", "GAMIFICATION", "SCRATCH",
+    }
+
+    def test_second_pass_dangerous_words_not_in_seed_csv(self):
+        acronyms = _acronyms()
+        present = self.SECOND_PASS_DANGEROUS_WORDS & acronyms
+        assert not present, f"Second-pass false-positive words reintroduced into seed CSV: {present}"
+
+
+class TestSafeSpecificEntriesKept:
+    """These 8 entries also have the acronym appearing inside a longer
+    expansion (same surface pattern as the removed group above), but were
+    judged safe to keep — real proper nouns/institution names, not
+    ordinary words a user would type by accident in an unrelated query."""
+
+    KEPT = {"DUOLINGO", "AMITY", "MANIPAL", "SRM", "WEBOMETRICS", "CHILDLINE", "PATRACHAR", "INCINERATOR"}
+
+    def test_safe_specific_entries_still_present(self):
+        acronyms = _acronyms()
+        missing = self.KEPT - acronyms
+        assert not missing, f"Safe specific entries unexpectedly removed from seed CSV: {missing}"
