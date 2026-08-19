@@ -85,3 +85,33 @@ class TestNewSafeStandaloneEntriesAdded:
             assert acronym in rows_by_acronym, f"{acronym} missing from seed CSV"
             actual = [e.strip() for e in rows_by_acronym[acronym]["expansions"].split("|")]
             assert actual == expected_expansions
+
+
+class TestUnreachablePunctuatedEntriesRemoved:
+    """10 rows contained a hyphen, apostrophe, or digit that
+    _normalize_token strips before lookup, so they could never be detected
+    no matter what the user typed — see acronym_query_service.py:12
+    finding. Judged not worth fixing (renaming to the normalized form):
+    not valuable enough to bother. DDU-GKY was a special case — a
+    duplicate of an already-existing DDUGKY row, just removed rather than
+    renamed to avoid a collision. 4G/5G are a fundamentally different,
+    harder problem than the rest: _normalize_token strips digits entirely,
+    so both collapse to the single letter "G" — below the length-2
+    detection guard and colliding with each other — no renaming could ever
+    fix them without changing the normalization/guard logic itself."""
+
+    REMOVED = {
+        "WI-FI", "E-PATHSHALA", "DDU-GKY", "ANTI-BULLYING", "CO-SCHOLASTIC",
+        "PRE-BOARD", "RE-EVALUATION", "BYJU'S", "4G", "5G",
+    }
+
+    def test_unreachable_entries_not_in_seed_csv(self):
+        acronyms = _acronyms()
+        present = self.REMOVED & acronyms
+        assert not present, f"Unreachable punctuated entries reintroduced into seed CSV: {present}"
+
+    def test_ddugky_survivor_still_present(self):
+        # DDU-GKY was removed as a duplicate, not fixed by renaming — DDUGKY
+        # (the form the hyphenated version would normalize to anyway) must
+        # still be there so the concept isn't lost entirely.
+        assert "DDUGKY" in _acronyms()

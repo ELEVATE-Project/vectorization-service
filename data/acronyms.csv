@@ -201,19 +201,15 @@ SAT,Scholastic Assessment Test,Standardized test for college admissions in the U
 TOEFL,Test of English as a Foreign Language,Standardized test to measure English language ability
 AP,Advanced Placement,Program offering college-level curricula and examinations to high school students
 SWAYAM,Study Webs of Active-Learning for Young Aspiring Minds,National MOOC platform offering courses from school to post-graduate level
-4G,Fourth Generation,Fourth generation of mobile telecommunications
-5G,Fifth Generation,Fifth generation of mobile telecommunications
 BLUETOOTH,Bluetooth,Wireless technology for short-range communication
 LAN,Local Area Network,Network connecting computers in limited area
 MAN,Metropolitan Area Network,Network spanning a city or large campus
 WAN,Wide Area Network,Network spanning large geographical area
 WLAN,Wireless Local Area Network,Wireless computer network
-WI-FI,Wireless Fidelity,Wireless networking technology
 MOOC,Massive Open Online Course,Online course aimed at unlimited participation and open access
 SYNCHRONOUS,Synchronous Learning,Real-time online learning
 PM EVIDYA,PM eVIDYA,Initiative for multi-mode access to digital education
 ASYNCHRONOUS,Asynchronous Learning,Self-paced online learning
-E-PATHSHALA,e-Pathshala,Digital platform by NCERT for educational resources
 NIOS,National Institute of Open Schooling,Board for distance education at school level providing flexible learning opportunities
 IGNOU,Indira Gandhi National Open University,National open university for distance and open learning
 SIOU,State Open Universities,State-level open universities providing distance education
@@ -305,7 +301,6 @@ SSL,Secure Sockets Layer,Protocol for secure communication
 TLS,Transport Layer Security,Cryptographic protocol for secure communication
 VPN,Virtual Private Network,Technology for secure network connection
 NSDC,National Skill Development Corporation,Public-private partnership for skill development
-DDU-GKY,Deen Dayal Upadhyaya Grameen Kaushalya Yojana,Skill training and placement program for rural poor youth
 DDUGKY,Deen Dayal Upadhyaya Grameen Kaushalya Yojana,Skill training program for rural youth
 NAPS,National Apprenticeship Promotion Scheme,Scheme for promoting apprenticeship training
 PMKVY,Pradhan Mantri Kaushal Vikas Yojana,Flagship skill development scheme for youth
@@ -371,7 +366,6 @@ GPA,Grade Point Average,Average of grade points obtained in all subjects
 CCE,Continuous and Comprehensive Evaluation,Former evaluation system for holistic assessment of students
 FA,Formative Assessment,Ongoing assessment during the learning process under CCE
 SA,Summative Assessment,End-of-term assessment under CCE
-ANTI-BULLYING,Anti-Bullying Committee,Committee for preventing and addressing bullying in schools
 BACKGROUND CHECK,Teacher Background Verification,Mandatory police verification for school staff
 CCTV BUS,CCTV in School Buses,Surveillance cameras in school transport vehicles
 CHILDLINE,Childline India Foundation,24-hour emergency phone service for children in distress (1098)
@@ -397,16 +391,13 @@ PADHE BHARAT,Padhe Bharat Badhe Bharat,Program for improving reading and writing
 NROER,National Repository of Open Educational Resources,Digital repository of open educational resources by NCERT
 ANNUAL EXAM,Annual Examination,Year-end examination conducted by schools
 BOARD EXAM,Board Examination,Public examination conducted by education boards for classes 10 and 12
-CO-SCHOLASTIC,Co-Scholastic Activities,"Assessment of life skills, attitudes, and values"
 COMPARTMENT,Compartment Exam,Re-examination for students who failed in one or two subjects
 GRACE MARKS,Grace Marks,Additional marks given to help students pass
 HALF YEARLY,Half Yearly Examination,Mid-term examination conducted in schools
 MODERATION,Marks Moderation,Process of adjusting marks to ensure uniformity across regions
 PERIODIC TEST,Periodic Test,Regular tests conducted periodically under revised assessment patterns
 PRACTICAL,Practical Examination,"Hands-on examination for science, computer, and practical subjects"
-PRE-BOARD,Pre-Board Examination,Mock board examination conducted by schools before actual board exams
 PRIVATE CANDIDATE,Private Candidate,Student appearing for board exam without attending regular school
-RE-EVALUATION,Re-evaluation,Re-assessment of answer scripts on request
 RECHECKING,Rechecking,Checking for totaling errors and unmarked answers
 SUBJECT ENRICHMENT,Subject Enrichment Activities,Activities for deeper understanding of subjects
 SUPPLEMENTARY,Supplementary Examination,Additional chance to clear failed subjects
@@ -419,7 +410,6 @@ PRI,Panchayati Raj Institution,Local self-government bodies involved in school e
 AR EDU,Augmented Reality in Education,Using AR technology for immersive learning experiences
 ADAPTIVE LEARNING,Adaptive Learning System,Technology that adapts to individual student needs
 BIOMETRIC,Biometric Attendance,Attendance system using fingerprint or face recognition
-BYJU'S,Byju's Learning App,Popular Indian ed-tech app for school students
 DIGILOCKER,DigiLocker,Government digital locker for storing academic certificates
 DIGITAL MARKSHEET,Digital Marksheet,Online version of examination marksheet
 DOUBTNUT,Doubtnut,Indian doubt-solving app for school students

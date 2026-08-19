@@ -201,18 +201,24 @@ class TestAcronymMappingSchema:
 
 @requires_postgres
 class TestSeedData:
-    """Verifies the real acronym dataset seeds correctly. Row count is 589,
-    not the original 599 — 13 rows were removed (9 common-English-word
+    """Verifies the real acronym dataset seeds correctly. Row count is 579,
+    not the original 599 — 23 rows were removed (9 common-English-word
     false positives like THE/SET/ACT, 4 redundant multi-word entries whose
-    parts already exist standalone) and 3 added (JRF, UG, BSE) during a
-    curation pass, see acronym_query_service.py:43 and :12 findings."""
+    parts already exist standalone, 10 entries with a hyphen/apostrophe/
+    digit that _normalize_token strips so they could never match — 1 of
+    those, DDU-GKY, was a duplicate of an already-existing DDUGKY row; the
+    other 9 including 4G/5G were just removed, not renamed, since 4G/5G
+    can't be fixed by renaming at all — digit-stripping leaves both as the
+    single letter "G", below the length-2 detection guard) and 3 added
+    (JRF, UG, BSE) during a curation pass, see acronym_query_service.py:43
+    and :12 findings."""
 
     def test_row_count(self, migrated_db):
         with migrated_db.connect() as conn:
             count = conn.execute(
                 text("SELECT count(*) FROM acronym_mapping")
             ).scalar()
-        assert count == 589
+        assert count == 579
 
     def test_multi_expansion_acronym(self, migrated_db):
         with migrated_db.connect() as conn:
@@ -251,4 +257,4 @@ class TestMigrationIdempotency:
             count = conn.execute(
                 text("SELECT count(*) FROM acronym_mapping")
             ).scalar()
-        assert count == 589
+        assert count == 579
