@@ -58,6 +58,19 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
         # as "not an acronym" rather than propagating, mirroring the Redis
         # fallback above.
         logger.warning(f"Acronym DB lookup failed for {acronym!r}, treating as not found: {e}")
+        # Cache the failure too (short TTL) — otherwise every candidate token
+        # of every search re-attempts the Postgres connection for the entire
+        # outage: detect_acronyms() calls get_expansion() once per token, and
+        # without this, none of those repeated attempts would ever be
+        # remembered (unlike a genuine miss below, which already writes a
+        # negative entry). Short TTL, not REDIS_NEGATIVE_CACHE_TTL's full
+        # hour: an outage is often transient, so this should stop hammering
+        # Postgres during the outage without keeping real acronyms
+        # unresolvable for long after it recovers.
+        try:
+            cache_client.set(_cache_key(acronym), json.dumps(None), settings.REDIS_DB_ERROR_CACHE_TTL)
+        except Exception as cache_e:
+            logger.warning(f"Acronym DB-error negative-cache write failed for {acronym!r}: {cache_e}")
         return None
     finally:
         db.close()

@@ -149,6 +149,53 @@ class TestPostgresOutageDoesNotBreakSearch:
         assert result is None
         mock_session.close.assert_called_once()
 
+    def test_db_failure_is_cached_so_second_lookup_does_not_retry_postgres(self):
+        """Regression test: the DB-error branch used to return None without
+        caching anything — every candidate token of every search would
+        re-attempt the Postgres connection for the entire duration of an
+        outage. detect_acronyms() calls get_expansion() once per token, so
+        this was the exact repeated-round-trip cost the negative cache
+        (added for genuine misses) was supposed to avoid, just left open on
+        this one path."""
+        from unittest.mock import MagicMock
+
+        from app.services import acronym_service
+
+        mock_session = MagicMock()
+        mock_session.query.side_effect = Exception("connection refused")
+
+        with patch("app.services.acronym_service.SessionLocal", return_value=mock_session):
+            first = acronym_service.get_expansion("MBA")
+        assert first is None
+        assert mock_session.query.call_count == 1
+
+        # Second lookup: a fresh SessionLocal() that would raise if queried
+        # proves the DB was never touched — the cached failure served it.
+        second_mock_session = MagicMock()
+        second_mock_session.query.side_effect = AssertionError("must not hit Postgres again — should be cached")
+        with patch("app.services.acronym_service.SessionLocal", return_value=second_mock_session):
+            second = acronym_service.get_expansion("MBA")
+
+        assert second is None
+        second_mock_session.query.assert_not_called()
+
+    def test_db_error_cache_uses_the_short_ttl_not_the_full_negative_ttl(self):
+        from unittest.mock import MagicMock
+
+        from app.config import settings
+        from app.core.clients.redis_client import redis_client
+        from app.services import acronym_service
+
+        mock_session = MagicMock()
+        mock_session.query.side_effect = Exception("connection refused")
+
+        with patch("app.services.acronym_service.SessionLocal", return_value=mock_session):
+            acronym_service.get_expansion("MBA")
+
+        ttl = redis_client.ttl("acronym:MBA")
+        assert 0 < ttl <= settings.REDIS_DB_ERROR_CACHE_TTL
+        assert settings.REDIS_DB_ERROR_CACHE_TTL < settings.REDIS_NEGATIVE_CACHE_TTL
+
 
 @requires_infra
 class TestNegativeCaching:

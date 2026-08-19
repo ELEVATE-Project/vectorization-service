@@ -67,8 +67,22 @@ class Settings(BaseSettings):
     # runs after every upload), so this TTL only bounds staleness for the rare case that
     # invariant doesn't hold — not load-bearing correctness.
     REDIS_NEGATIVE_CACHE_TTL: int = int(os.getenv("REDIS_NEGATIVE_CACHE_TTL", 3600))  # 1 hour
+    # Much shorter than REDIS_NEGATIVE_CACHE_TTL — this covers a DB-error miss
+    # (Postgres unreachable), not a genuine "not an acronym" miss. Confirmed live
+    # without this: every candidate token of every search re-attempts the
+    # (now-bounded-by-POSTGRES_CONNECT_TIMEOUT, but still nonzero-cost) Postgres
+    # connection for the entire outage. But unlike a real miss, a DB outage is
+    # often transient — caching "not found" for the full hour would make real
+    # acronyms silently fail to resolve for up to an hour after Postgres recovers.
+    REDIS_DB_ERROR_CACHE_TTL: int = int(os.getenv("REDIS_DB_ERROR_CACHE_TTL", 30))
     REDIS_MAX_CACHE_SIZE: int = int(os.getenv("REDIS_MAX_CACHE_SIZE", 1000))
     DATABASE_URL: str = os.getenv("POSTGRES_DATABASE_URI", "postgresql://anuj:1234@localhost:5432/ai_vector_service")
+    # psycopg2 defaults to no connect timeout at all — a blackholed Postgres host
+    # (network silently drops packets, unlike a clean "connection refused") makes
+    # a connection attempt hang until the OS-level TCP timeout, which can be
+    # minutes. Confirmed live with a real local "black hole" TCP server: an
+    # unbounded psycopg2.connect() hung past 15s with no sign of returning.
+    POSTGRES_CONNECT_TIMEOUT: int = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", 3))
     REDIS_CACHE_ENABLED: bool = False
 
     # Shared secret for internal-only endpoints (e.g. acronym bulk upload), checked
