@@ -88,7 +88,16 @@ def build_dense_queries(query_for_embedding: str, mapping: Dict[str, List[str]])
         # return value is substituted literally, with no escape processing.
         substituted = pattern.sub(lambda _m: expansions[0], substituted)
 
-    if substituted == query_for_embedding:
+    # Case-insensitive: query_for_embedding is always lowercased upstream
+    # (preprocess_query), but expansions keep their stored casing (e.g.
+    # BLUETOOTH -> "Bluetooth"). A case-only difference is not a real second
+    # reading of the query — confirmed empirically, the embedding model is
+    # case-insensitive in practice (cosine similarity 1.0 between
+    # "bluetooth" and "Bluetooth") — so returning it as a second variant
+    # doubles the per-field Qdrant fan-out (search()'s use_acronym_multi_query
+    # gate) for zero benefit. ~49 real seeded acronyms hit this exact case
+    # (BLUETOOTH, DIGILOCKER, VEDANTU, UDAAN, ...).
+    if substituted.lower() == query_for_embedding.lower():
         return [query_for_embedding]
     return [query_for_embedding, substituted]
 

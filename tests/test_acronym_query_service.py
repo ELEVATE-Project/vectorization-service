@@ -115,6 +115,31 @@ class TestBuildDenseQueries:
         result = build_dense_queries("parent teacher meeting", {"PTM": ["Parent Teacher Meeting"]})
         assert result == ["parent teacher meeting"]
 
+    def test_case_only_expansion_does_not_produce_a_duplicate_variant(self):
+        """Regression test: ~49 real seeded acronyms have an expansion that's
+        just a re-cased version of the acronym itself (e.g. BLUETOOTH ->
+        "Bluetooth"). query_for_embedding is always lowercased upstream, so
+        a case-sensitive `==` check saw these as "different" and returned a
+        second variant — doubling the per-field Qdrant fan-out
+        (use_acronym_multi_query) for an embedding that's numerically
+        identical to the first (cosine similarity 1.0, confirmed against the
+        real embedding model)."""
+        result = build_dense_queries("bluetooth", {"BLUETOOTH": ["Bluetooth"]})
+        assert result == ["bluetooth"]
+
+    def test_case_only_expansion_with_other_words_still_no_duplicate(self):
+        result = build_dense_queries(
+            "connect via bluetooth now",
+            {"BLUETOOTH": ["Bluetooth"]},
+        )
+        assert result == ["connect via bluetooth now"]
+
+    def test_genuinely_different_expansion_still_produces_two_variants(self):
+        # Sanity check the case-insensitive comparison doesn't over-suppress —
+        # a real semantic expansion must still produce a second variant.
+        result = build_dense_queries("ptm", {"PTM": ["Parent Teacher Meeting"]})
+        assert result == ["ptm", "Parent Teacher Meeting"]
+
     def test_multiple_acronyms_all_substituted(self):
         result = build_dense_queries(
             "ptm and smc schedule",
