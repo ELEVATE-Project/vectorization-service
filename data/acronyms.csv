@@ -19,14 +19,11 @@ WES,World Education Services,Organization providing credential evaluations for i
 JSON,JavaScript Object Notation,Lightweight data interchange format
 XML,Extensible Markup Language,Markup language for encoding documents
 BA,Bachelor of Arts,Undergraduate degree in arts and humanities
-BA LLB,Bachelor of Arts and Bachelor of Laws,Integrated undergraduate degree in arts and law
 BAMS,Bachelor of Ayurvedic Medicine and Surgery,Undergraduate degree in Ayurvedic medicine
 BARCH,Bachelor of Architecture,Undergraduate degree in architecture
 BBA,Bachelor of Business Administration,Undergraduate degree in business administration
-BBA LLB,Bachelor of Business Administration and Bachelor of Laws,Integrated undergraduate degree in business administration and law
 BCA,Bachelor of Computer Applications,Undergraduate degree in computer applications
 BCOM,Bachelor of Commerce,Undergraduate degree in commerce
-BCOM LLB,Bachelor of Commerce and Bachelor of Laws,Integrated undergraduate degree in commerce and law
 BDS,Bachelor of Dental Surgery,Undergraduate professional degree in dentistry
 BDES,Bachelor of Design,Undergraduate degree in design
 BE,Bachelor of Engineering,Undergraduate professional engineering degree
@@ -49,7 +46,6 @@ BSC,Bachelor of Science,Undergraduate degree in science
 BSC AG,Bachelor of Science in Agriculture,Undergraduate degree in agriculture
 BSC FORESTRY,Bachelor of Science in Forestry,Undergraduate degree in forestry
 BSC HORTICULTURE,Bachelor of Science in Horticulture,Undergraduate degree in horticulture
-BSC LLB,Bachelor of Science and Bachelor of Laws,Integrated undergraduate degree in science and law
 BSC NURSING,Bachelor of Science in Nursing,Undergraduate degree in nursing
 BTTM,Bachelor of Travel and Tourism Management,Undergraduate degree in travel and tourism management
 BTECH,Bachelor of Technology,Undergraduate professional engineering degree
@@ -168,7 +164,6 @@ RBI ASSISTANT,Reserve Bank of India Assistant,Exam for recruitment to assistant 
 RBI GRADE B,Reserve Bank of India Grade B Officer,Exam for recruitment to Grade B officer posts in RBI
 SBI CLERK,State Bank of India Clerk,Exam for recruitment to clerk posts in State Bank of India
 SBI PO,State Bank of India Probationary Officer,Exam for recruitment to PO posts in State Bank of India
-SET,State Eligibility Test,State-level test for determining eligibility for Assistant Professor positions in state universities
 SLET,State Level Eligibility Test,State-level eligibility test for lectureship (now largely replaced by SET)
 SNAP,Symbiosis National Aptitude Test,Entrance exam for admission to MBA programs in Symbiosis International University
 SO,Specialist Officer,Bank exam for recruitment to specialist officer posts
@@ -197,7 +192,6 @@ A LEVELS,Advanced Levels,Subject-based qualifications for 16-18 year olds in UK 
 AS LEVELS,Advanced Subsidiary Levels,Standalone qualifications or first half of A Levels
 IB,International Baccalaureate,International educational foundation offering four educational programs
 IGCSE,International General Certificate of Secondary Education,International English language curriculum for 14-16 year olds
-ACT,American College Testing,Standardized test for college admissions in the United States
 DUOLINGO,Duolingo English Test,Online English proficiency test
 GMAT,Graduate Management Admission Test,Standardized test for admission to MBA programs globally
 GRE,Graduate Record Examination,Standardized test for admission to graduate schools in the United States
@@ -255,7 +249,6 @@ SRM,SRM Institute of Science and Technology,Private deemed university with campu
 VIT,Vellore Institute of Technology,"Private deemed university in Vellore, Tamil Nadu"
 ARWU,Academic Ranking of World Universities,Global university ranking by ShanghaiRanking Consultancy
 QS,Quacquarelli Symonds,Global higher education ranking organization
-THE,Times Higher Education,Global higher education ranking organization
 WEBOMETRICS,Webometrics Ranking of World Universities,Ranking system based on web presence and impact
 NIRF,National Institutional Ranking Framework,Framework by MHRD (now Ministry of Education) for ranking institutions of higher education in India
 GIC,General Insurance Corporation,Reinsurance company conducting recruitment exams
@@ -408,14 +401,11 @@ CO-SCHOLASTIC,Co-Scholastic Activities,"Assessment of life skills, attitudes, an
 COMPARTMENT,Compartment Exam,Re-examination for students who failed in one or two subjects
 GRACE MARKS,Grace Marks,Additional marks given to help students pass
 HALF YEARLY,Half Yearly Examination,Mid-term examination conducted in schools
-INTERNAL,Internal Assessment,"Assessment conducted internally by schools (projects, assignments, practicals)"
 MODERATION,Marks Moderation,Process of adjusting marks to ensure uniformity across regions
-ORAL,Oral Examination / Viva,Verbal examination testing speaking and understanding
 PERIODIC TEST,Periodic Test,Regular tests conducted periodically under revised assessment patterns
 PRACTICAL,Practical Examination,"Hands-on examination for science, computer, and practical subjects"
 PRE-BOARD,Pre-Board Examination,Mock board examination conducted by schools before actual board exams
 PRIVATE CANDIDATE,Private Candidate,Student appearing for board exam without attending regular school
-PROJECT,Project Work,Extended assignment requiring research and presentation
 RE-EVALUATION,Re-evaluation,Re-assessment of answer scripts on request
 RECHECKING,Rechecking,Checking for totaling errors and unmarked answers
 SUBJECT ENRICHMENT,Subject Enrichment Activities,Activities for deeper understanding of subjects
@@ -492,17 +482,14 @@ VEC,Village Education Committee,Village-level committee for monitoring school ed
 ATL,Atal Tinkering Lab,Workspaces in schools for students to explore STEM concepts
 AUDITORIUM,School Auditorium,"Hall for assemblies, events, and performances"
 CCTV SCHOOL,CCTV in Schools,Surveillance cameras for school security
-CANTEEN,School Canteen,Facility providing food and beverages
 COMPUTER LAB,Computer Laboratory,Room equipped with computers for student use
 DISABLED TOILET,Disabled-Friendly Toilet,Toilets accessible for students with disabilities
 DRINKING WATER,Safe Drinking Water,Provision of potable water in schools
-HOSTEL,School Hostel,Residential facility for outstation students
 ICT,Information and Communication Technology,Technology tools used in education
 ICT LAB,Information and Communication Technology Lab,Computer labs in schools under government schemes
 INCINERATOR,Sanitary Napkin Incinerator,Facility for safe disposal of sanitary napkins
 INFIRMARY,School Infirmary,Medical room for first aid and health check-ups
 LANGUAGE LAB,Language Laboratory,Room equipped for language learning with audio-visual aids
-LIBRARY,School Library,Room with collection of books and reading materials
 PLAYGROUND,School Playground,Outdoor area for sports and physical activities
 RO PLANT,Reverse Osmosis Plant,Water purification system
 RAMPS,Ramps for Differently-Abled,Accessibility ramps for students with disabilities
@@ -598,3 +585,6 @@ NCC,National Cadet Corps,Tri-services organization grooming youth into disciplin
 NSS,National Service Scheme,Public service program for higher secondary and college students
 NYKS,Nehru Yuva Kendra Sangathan,Autonomous body for youth development through various activities
 SCOUTS & GUIDES,Bharat Scouts and Guides,National scouting and guiding organization for character building
+JRF,Junior Research Fellowship,"Research fellowship offered by bodies such as CSIR, UGC, DBT, ICMR for postgraduate researchers"
+UG,Under Graduate,"Undergraduate level of study, below postgraduate"
+BSE,Board of Secondary Education,"State-level board responsible for secondary education examinations (e.g. BSE Odisha, BSE Telangana)"
