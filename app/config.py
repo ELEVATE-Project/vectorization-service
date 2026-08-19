@@ -43,6 +43,23 @@ class Settings(BaseSettings):
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+    # redis-py defaults both to None (no timeout at all) — a blackholed connection
+    # (network drops packets silently, unlike a clean "connection refused") would
+    # hang every cache read/write until the OS-level TCP timeout, which can be
+    # minutes. This runs synchronously on the search request path, so an
+    # unresponsive cache would stall search entirely instead of degrading to
+    # Postgres per get_expansion()'s existing except-and-fallback behavior.
+    # Kept small (not a generous few-seconds value): a healthy Redis responds in
+    # low single-digit milliseconds, and get_expansion() makes TWO calls on the
+    # fallback path (a read, then a write-through of the Postgres result) — each
+    # one independently pays this timeout on an outage, and detect_acronyms()
+    # calls get_expansion() once per candidate token, so the per-request cost
+    # multiplies. Confirmed live: with 3s/5s defaults, a single cache-miss
+    # lookup during a blackholed connection took just over 10s (2 x 5s) before
+    # falling back to Postgres — too slow per token for what should be a
+    # millisecond-scale cache operation.
+    REDIS_SOCKET_CONNECT_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", 1))
+    REDIS_SOCKET_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_TIMEOUT", 1))
     REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", 86400))  # 24 hours in seconds
     # Shorter than REDIS_CACHE_TTL: caches "this word isn't an acronym" so ordinary
     # non-acronym words in a query don't re-hit Postgres on every request. A newly
