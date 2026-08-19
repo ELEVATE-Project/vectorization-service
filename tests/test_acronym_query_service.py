@@ -122,6 +122,27 @@ class TestBuildDenseQueries:
         assert result == ["ssc recruitment", "Staff Selection Commission recruitment"]
         assert "Sainik School Society" not in result[1]
 
+    def test_expansion_with_backslash_does_not_raise_and_is_substituted_literally(self):
+        """Regression test: expansions come from an unvalidated admin CSV
+        upload. re.sub interprets backslashes in a *string* replacement
+        specially (\\1, \\g<name>, \\t, ...) — a pasted Windows-style path
+        like "C:\\temp\\Some Office" used to raise re.error (bad escape) or
+        silently corrupt the text. Must substitute literally instead."""
+        result = build_dense_queries(
+            "wfh policy",
+            {"WFH": [r"C:\temp\Work From Home"]},
+        )
+        assert result == ["wfh policy", "C:\\temp\\Work From Home policy"]
+
+    def test_expansion_with_backreference_like_text_is_substituted_literally(self):
+        # A string replacement would either raise ("invalid group reference")
+        # or silently splice in a capture group if the pattern had one.
+        result = build_dense_queries(
+            "smc rules",
+            {"SMC": [r"Section \1 Management Committee"]},
+        )
+        assert result == ["smc rules", r"Section \1 Management Committee rules"]
+
 
 class TestBuildSparseQuery:
     def test_no_mapping_returns_original(self):

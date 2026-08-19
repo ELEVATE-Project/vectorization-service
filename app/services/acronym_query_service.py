@@ -73,7 +73,12 @@ def build_dense_queries(query_for_embedding: str, mapping: Dict[str, List[str]])
     substituted = query_for_embedding
     for acronym, expansions in mapping.items():
         pattern = re.compile(rf"\b{re.escape(acronym)}\b", re.IGNORECASE)
-        substituted = pattern.sub(expansions[0], substituted)
+        # Function replacement, not a string one — re.sub interprets backslashes
+        # in a string replacement specially (\1, \g<name>, \t, ...), so an
+        # expansion containing a literal backslash (e.g. a pasted Windows path)
+        # would crash with re.error or silently corrupt the text. A callable's
+        # return value is substituted literally, with no escape processing.
+        substituted = pattern.sub(lambda _m: expansions[0], substituted)
 
     if substituted == query_for_embedding:
         return [query_for_embedding]
