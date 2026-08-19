@@ -82,6 +82,19 @@ class TestDetectAcronyms:
             "SSC": ["Staff Selection Commission", "Sainik School Society"]
         }
 
+    def test_empty_expansions_list_is_treated_as_not_found(self):
+        """Regression test: the expansions JSONB column defaults to '[]' and
+        only bulk_upsert() validates non-empty before insert — a row written
+        via any other path (raw SQL, a future writer) could have
+        expansions=[]. `is not None` alone would accept that; must be
+        rejected the same way as "acronym not found", or it flows into
+        build_dense_queries' expansions[0] and crashes with IndexError."""
+        with patch(
+            "app.services.acronym_query_service.get_expansion",
+            side_effect=lambda a: [] if a == "XYZQ" else _fake_get_expansion(a),
+        ):
+            assert detect_acronyms("XYZQ report") == {}
+
 
 class TestBuildDenseQueries:
     def test_no_mapping_returns_original_only(self):
@@ -133,6 +146,22 @@ class TestBuildDenseQueries:
             {"WFH": [r"C:\temp\Work From Home"]},
         )
         assert result == ["wfh policy", "C:\\temp\\Work From Home policy"]
+
+    def test_full_pipeline_never_passes_an_empty_expansions_list_through(self):
+        """End-to-end confirmation: detect_acronyms' empty-list guard means
+        build_dense_queries never actually receives {"XYZQ": []} in
+        practice — the mapping it's given only contains acronyms that
+        already have real expansions, so its own expansions[0] is safe by
+        construction, not because build_dense_queries itself guards it."""
+        with patch(
+            "app.services.acronym_query_service.get_expansion",
+            side_effect=lambda a: [] if a == "XYZQ" else None,
+        ):
+            mapping = detect_acronyms("XYZQ report")
+        assert mapping == {}
+        # No IndexError even though the underlying data is empty-expansions —
+        # because it never made it into the mapping at all.
+        assert build_dense_queries("xyzq report", mapping) == ["xyzq report"]
 
     def test_expansion_with_backreference_like_text_is_substituted_literally(self):
         # A string replacement would either raise ("invalid group reference")

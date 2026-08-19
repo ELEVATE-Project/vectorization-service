@@ -48,7 +48,15 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
             continue
 
         expansion = get_expansion(candidate)
-        if expansion is not None:
+        # `is not None` alone would accept an empty list — the expansions
+        # column defaults to '[]'::jsonb and only bulk_upsert() validates
+        # non-empty before insert, so a row written via any other path (raw
+        # SQL, a future writer) could still have expansions=[]. Guarding
+        # here (falsy, not just None) rejects that case the same way as
+        # "acronym not found," closing both downstream call sites
+        # (build_dense_queries' expansions[0], build_sparse_query's OR-join)
+        # at once — neither ever sees an empty-list acronym in its mapping.
+        if expansion:
             detected[candidate] = expansion
 
     return detected
