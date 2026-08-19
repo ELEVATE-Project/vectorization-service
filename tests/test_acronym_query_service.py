@@ -115,6 +115,28 @@ class TestBuildDenseQueries:
         result = build_dense_queries("parent teacher meeting", {"PTM": ["Parent Teacher Meeting"]})
         assert result == ["parent teacher meeting"]
 
+    def test_expansion_containing_another_detected_acronym_is_not_re_substituted(self):
+        """Regression test: sequential (looped) substitution let one
+        acronym's expansion text — which can itself contain another
+        detected acronym as a plain word, e.g. real seeded data NFST ->
+        "National Fellowship for ST" where ST is also a real acronym —
+        get re-scanned and re-substituted by a later iteration. Confirmed
+        empirically with the actual seeded data before this fix: query
+        "NFST ST fellowship" produced "National Fellowship for Scheduled
+        Tribes Scheduled Tribes fellowship" — the ST inside NFST's own
+        expansion got doubled up with the user's separate ST token. A
+        single-pass alternation regex must resolve both against the
+        ORIGINAL text only."""
+        mapping = {
+            "NFST": ["National Fellowship for ST"],
+            "ST": ["Scheduled Tribes"],
+        }
+        result = build_dense_queries("nfst st fellowship", mapping)
+        assert result == [
+            "nfst st fellowship",
+            "National Fellowship for ST Scheduled Tribes fellowship",
+        ]
+
     def test_case_only_expansion_does_not_produce_a_duplicate_variant(self):
         """Regression test: ~49 real seeded acronyms have an expansion that's
         just a re-cased version of the acronym itself (e.g. BLUETOOTH ->

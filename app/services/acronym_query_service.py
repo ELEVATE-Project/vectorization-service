@@ -78,15 +78,33 @@ def build_dense_queries(query_for_embedding: str, mapping: Dict[str, List[str]])
     if not mapping:
         return [query_for_embedding]
 
-    substituted = query_for_embedding
-    for acronym, expansions in mapping.items():
-        pattern = re.compile(rf"\b{re.escape(acronym)}\b", re.IGNORECASE)
-        # Function replacement, not a string one — re.sub interprets backslashes
-        # in a string replacement specially (\1, \g<name>, \t, ...), so an
-        # expansion containing a literal backslash (e.g. a pasted Windows path)
-        # would crash with re.error or silently corrupt the text. A callable's
-        # return value is substituted literally, with no escape processing.
-        substituted = pattern.sub(lambda _m: expansions[0], substituted)
+    # Single pass over the ORIGINAL text, not a loop of sequential
+    # substitutions — looping would let one acronym's expansion text (which
+    # can itself contain another detected acronym as a plain word, e.g.
+    # NFST -> "National Fellowship for ST" when ST is *also* detected in the
+    # same query) get re-scanned and re-substituted by a later iteration,
+    # producing garbled/duplicated text ("...Scheduled Tribes Scheduled
+    # Tribes..." for "NFST ST fellowship" — confirmed empirically). One
+    # alternation regex resolves every match against the ORIGINAL string in
+    # a single left-to-right pass, so text inserted by resolving one match
+    # is never re-scanned within this call.
+    combined_pattern = re.compile(
+        r"\b(?:" + "|".join(re.escape(acronym) for acronym in mapping) + r")\b",
+        re.IGNORECASE,
+    )
+
+    def _resolve(match: re.Match) -> str:
+        # Function replacement, not a string one — re.sub interprets
+        # backslashes in a string replacement specially (\1, \g<name>, \t,
+        # ...), so an expansion containing a literal backslash (e.g. a
+        # pasted Windows path) would crash with re.error or silently
+        # corrupt the text. A callable's return value is substituted
+        # literally, with no escape processing. .upper() to resolve back to
+        # the mapping's key regardless of the matched text's original case
+        # (matching is case-insensitive; mapping keys are always uppercase).
+        return mapping[match.group(0).upper()][0]
+
+    substituted = combined_pattern.sub(_resolve, query_for_embedding)
 
     # Case-insensitive: query_for_embedding is always lowercased upstream
     # (preprocess_query), but expansions keep their stored casing (e.g.
