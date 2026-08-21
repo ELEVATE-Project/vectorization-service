@@ -78,16 +78,18 @@ class PrioritizedSearchService:
         else:
             logger.info("No filters applied")
 
-    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None):
+    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None, is_acronym_query=False):
         """Process, rank, filter and deduplicate results.
 
         scoring_context_out: optional mutable dict forwarded to _rank_results so the
         caller can capture the per-query normalization context (min/max/pool size).
+        is_acronym_query: forwarded to _rank_results — see its docstring. Defaults to
+        False so any other caller reproduces the pre-existing fixed-blend behavior.
         """
         logger.info(f"Total documents matched: {len(all_results)}")
 
         logger.info("Calculating weighted scores and ranking results")
-        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out)
+        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out, is_acronym_query=is_acronym_query)
         logger.info(f"Ranked results: {len(ranked_results)} documents")
 
         # Apply filtering based on conditions
@@ -380,6 +382,7 @@ class PrioritizedSearchService:
                 filter_score if not use_detail_filter else 0,
                 detail_filter_score if use_detail_filter else None,
                 scoring_context_out=scoring_context,
+                is_acronym_query=bool(acronyms_detected),
             )
 
             # Apply title boost when hybrid mode is active.
@@ -402,6 +405,25 @@ class PrioritizedSearchService:
                 self._supplement_matches_from_results(
                     query_for_keyword_match, unique_source_results, "title", title_matches
                 )
+                # the boost above only catches the literal acronym text
+                # (e.g. "SST") in the title — a document titled with the acronym's
+                # actual expansion ("Social Science / Social Studies") gets no credit
+                # at all, even though that's a real, confirmed keyword match a user
+                # would expect to count. When an acronym was detected, also check
+                # each expansion against title, merging in without downgrading an
+                # existing exact match to a weaker one found via expansion.
+                if acronyms_detected:
+                    for expansions in acronyms_detected.values():
+                        for expansion in expansions:
+                            expansion_title_matches = self._get_field_match_sources(
+                                expansion, filter_conditions, "title"
+                            )
+                            self._supplement_matches_from_results(
+                                expansion, unique_source_results, "title", expansion_title_matches
+                            )
+                            for sid, mtype in expansion_title_matches.items():
+                                if title_matches.get(sid) != "exact":
+                                    title_matches[sid] = mtype
                 top_results = self._apply_field_boost(
                     top_results, title_matches, "title",
                     settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
@@ -414,6 +436,19 @@ class PrioritizedSearchService:
                 self._supplement_matches_from_results(
                     query_for_keyword_match, unique_source_results, "summary", summary_matches
                 )
+                # Same expansion-awareness as the title boost above.
+                if acronyms_detected:
+                    for expansions in acronyms_detected.values():
+                        for expansion in expansions:
+                            expansion_summary_matches = self._get_field_match_sources(
+                                expansion, filter_conditions, "summary"
+                            )
+                            self._supplement_matches_from_results(
+                                expansion, unique_source_results, "summary", expansion_summary_matches
+                            )
+                            for sid, mtype in expansion_summary_matches.items():
+                                if summary_matches.get(sid) != "exact":
+                                    summary_matches[sid] = mtype
                 top_results = self._apply_field_boost(
                     top_results, summary_matches, "summary",
                     settings.EXACT_SUMMARY_BOOST, settings.PARTIAL_SUMMARY_BOOST,
@@ -1119,6 +1154,7 @@ class PrioritizedSearchService:
         weights: Dict[str, float],
         search_fields: List[str],
         scoring_context_out: Optional[Dict[str, Any]] = None,
+        is_acronym_query: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Rank results using weighted multi-field scoring.
@@ -1158,6 +1194,12 @@ class PrioritizedSearchService:
                 under search_config.scoring_context without recomputing raw_dense/raw_sparse
                 or keeping per-request state on the (shared) service instance. Left empty
                 on the dense-only path except for candidate_pool_size.
+            is_acronym_query: When True (query had a detected acronym),
+                per-point dense/sparse weights are flipped for any point with a genuine
+                sparse hit — see the weighted-fusion branch below. False (the default,
+                and always false when ACRONYM_SEARCH_ENABLED is off or nothing detected)
+                reproduces the original fixed HYBRID_DENSE_WEIGHT/HYBRID_SPARSE_WEIGHT
+                blend for every point, unchanged.
 
         Returns:
             List of ranked results sorted by weighted score (descending)
@@ -1228,10 +1270,25 @@ class PrioritizedSearchService:
                 norm_sparse = self._min_max_normalize(raw_sparse)
                 dense_w = settings.HYBRID_DENSE_WEIGHT
                 sparse_w = settings.HYBRID_SPARSE_WEIGHT
+                # Acronym-scoped dense/sparse reweighting (not yet a dedicated setting):
+                # min-max normalizes dense/sparse independently, so a weak pool's
+                # best dense score still reaches 1.0 and gets the full dense_w regardless
+                # of absolute magnitude. This is especially visible on acronym queries —
+                # a bare 3-4 letter acronym or its expansion is a poor dense-embedding
+                # input, so a spurious dense match can outrank a document with a genuine
+                # literal/BM25 hit. When is_acronym_query is True, flip the blend
+                # per-point for any point with a genuine sparse hit (raw_sparse > 0), so
+                # confirmed keyword evidence isn't automatically outweighed by
+                # unconfirmed dense noise. Non-acronym queries (is_acronym_query=False,
+                # the default) keep the original fixed blend for every point, unchanged.
                 for point_id in raw_dense:
+                    if is_acronym_query and raw_sparse.get(point_id, 0.0) > 0.0:
+                        d_w, s_w = sparse_w, dense_w
+                    else:
+                        d_w, s_w = dense_w, sparse_w
                     hybrid_scores[point_id] = (
-                        dense_w * norm_dense.get(point_id, 0.0)
-                        + sparse_w * norm_sparse.get(point_id, 0.0)
+                        d_w * norm_dense.get(point_id, 0.0)
+                        + s_w * norm_sparse.get(point_id, 0.0)
                     )
 
             # Expose the per-query normalization reference (min/max of each modality
