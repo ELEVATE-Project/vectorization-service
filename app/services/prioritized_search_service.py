@@ -1276,20 +1276,25 @@ class PrioritizedSearchService:
                 # of absolute magnitude. This is especially visible on acronym queries —
                 # a bare 3-4 letter acronym or its expansion is a poor dense-embedding
                 # input, so a spurious dense match can outrank a document with a genuine
-                # literal/BM25 hit. When is_acronym_query is True, flip the blend
-                # per-point for any point with a genuine sparse hit (raw_sparse > 0), so
-                # confirmed keyword evidence isn't automatically outweighed by
-                # unconfirmed dense noise. Non-acronym queries (is_acronym_query=False,
-                # the default) keep the original fixed blend for every point, unchanged.
+                # literal/BM25 hit. When is_acronym_query is True, a point with a genuine
+                # sparse hit (raw_sparse > 0) gets scored both the normal way and with
+                # the blend flipped to trust sparse more — keeping whichever is higher.
+                # Taking the max (never just the flipped value) guarantees a real
+                # keyword match can only raise a point's score, never lower it: an
+                # earlier version always flipped, which could cut a strong dense score
+                # to 30% weight and land below a zero-evidence point that kept its full
+                # 70%, i.e. penalize a document for having MORE confirming evidence.
+                # Non-acronym queries (is_acronym_query=False, the default) keep the
+                # original fixed blend for every point, unchanged.
                 for point_id in raw_dense:
+                    nd = norm_dense.get(point_id, 0.0)
+                    ns = norm_sparse.get(point_id, 0.0)
+                    base_score = dense_w * nd + sparse_w * ns
                     if is_acronym_query and raw_sparse.get(point_id, 0.0) > 0.0:
-                        d_w, s_w = sparse_w, dense_w
+                        flipped_score = sparse_w * nd + dense_w * ns
+                        hybrid_scores[point_id] = max(base_score, flipped_score)
                     else:
-                        d_w, s_w = dense_w, sparse_w
-                    hybrid_scores[point_id] = (
-                        d_w * norm_dense.get(point_id, 0.0)
-                        + s_w * norm_sparse.get(point_id, 0.0)
-                    )
+                        hybrid_scores[point_id] = base_score
 
             # Expose the per-query normalization reference (min/max of each modality
             # across the candidate pool) so a debug caller can reproduce normalized_dense/
