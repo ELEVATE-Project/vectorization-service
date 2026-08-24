@@ -334,7 +334,7 @@ MU,Mumbai University,State university in Maharashtra and one of the oldest unive
 MADRAS UNIVERSITY,University of Madras,State university in Tamil Nadu and one of the oldest universities in India
 OU,Osmania University,"State university in Hyderabad, Telangana"
 SPPU,Savitribai Phule Pune University,"State university in Pune, Maharashtra formerly known as University of Pune"
-DM,Doctorate of Medicine,Super specialty degree in medicine
+DM,Doctorate of Medicine|District Magistrate,"Doctorate of Medicine is a super specialty medical degree; District Magistrate is a senior district-level administrative officer"
 MCH,Master of Chirurgiae,Super specialty degree in surgery
 CTET,Central Teacher Eligibility Test,National level test for determining eligibility for appointment as teacher for Classes 1 to 8
 TET,Teacher Eligibility Test,State-level test for determining eligibility for appointment as teacher
@@ -589,6 +589,11 @@ UTET,Uttarakhand Teacher Eligibility Test,State TET for Uttarakhand
 WBTET,West Bengal Teacher Eligibility Test,State TET for West Bengal
 BRC,Block Resource Centre,Block-level centers for academic support to teachers and schools
 CRC,Cluster Resource Centre,Cluster-level centers for academic support to schools and teachers
+DEO,District Education Officer,District-level administrative officer overseeing school education
+BEO,Block Education Officer,Block-level administrative officer overseeing school education
+SPD,State Project Director,State-level administrative officer overseeing Samagra Shiksha implementation
+CDPO,Child Development Project Officer,Officer overseeing child development and anganwadi programs at the project/block level
+DC,District Collector,District-level administrative and revenue officer
 BED SPL ED,Bachelor of Education Special Education,BEd specializing in teaching children with disabilities
 CTE,College of Teacher Education,Institutions for secondary teacher training
 DED,Diploma in Education,"Former name for DElEd, diploma for elementary teacher training"

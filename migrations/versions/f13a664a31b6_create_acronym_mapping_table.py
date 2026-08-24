@@ -23,6 +23,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 # data/acronyms.csv, relative to repo root (migrations/versions/<file> -> repo root is 2 up)
 SEED_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "acronyms.csv"
+REQUIRED_CSV_COLUMNS = {"acronym", "expansions", "description"}
 
 
 def _split_expansions(raw: str) -> list:
@@ -37,8 +38,44 @@ def _split_expansions(raw: str) -> list:
     return result
 
 
+def _load_seed_rows() -> list:
+    """Validate the seed CSV exists, has the expected columns, and isn't empty."""
+    if not SEED_CSV_PATH.exists():
+        raise FileNotFoundError(f"Acronym seed CSV not found at {SEED_CSV_PATH}")
+
+    with open(SEED_CSV_PATH, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or not REQUIRED_CSV_COLUMNS.issubset(reader.fieldnames):
+            raise ValueError(
+                f"Acronym seed CSV at {SEED_CSV_PATH} must have columns "
+                f"{sorted(REQUIRED_CSV_COLUMNS)}, found {reader.fieldnames}"
+            )
+        now = datetime.now(timezone.utc)
+        rows = [
+            {
+                'acronym': row['acronym'].strip().upper(),
+                'expansions': _split_expansions(row['expansions']),
+                'description': (row.get('description') or '').strip() or None,
+                'is_active': True,
+                'created_by': 'SYSTEM',
+                'updated_by': 'SYSTEM',
+                'created_at': now,
+                'updated_at': now,
+            }
+            for row in reader
+            if row.get('acronym', '').strip()
+        ]
+
+    if not rows:
+        raise ValueError(f"Acronym seed CSV at {SEED_CSV_PATH} contains no usable rows")
+
+    return rows
+
+
 def upgrade() -> None:
     """Upgrade schema."""
+    rows = _load_seed_rows()
+
     op.create_table(
         'acronym_mapping',
         sa.Column('id', sa.BigInteger(), primary_key=True, autoincrement=True),
@@ -49,6 +86,14 @@ def upgrade() -> None:
         sa.Column('description', sa.Text(), nullable=True),
         sa.Column(
             'is_active', sa.Boolean(), nullable=False, server_default=sa.text('true')
+        ),
+        sa.Column(
+            'created_by', sa.String(length=64), nullable=False,
+            server_default=sa.text("'SYSTEM'"),
+        ),
+        sa.Column(
+            'updated_by', sa.String(length=64), nullable=False,
+            server_default=sa.text("'SYSTEM'"),
         ),
         sa.Column(
             'created_at',
@@ -74,37 +119,25 @@ def upgrade() -> None:
         sa.column('expansions', JSONB),
         sa.column('description', sa.Text),
         sa.column('is_active', sa.Boolean),
+        sa.column('created_by', sa.String),
+        sa.column('updated_by', sa.String),
         sa.column('created_at', sa.DateTime),
         sa.column('updated_at', sa.DateTime),
     )
 
-    with open(SEED_CSV_PATH, newline='', encoding='utf-8') as f:
-        now = datetime.now(timezone.utc)
-        rows = [
-            {
-                'acronym': row['acronym'].strip().upper(),
-                'expansions': _split_expansions(row['expansions']),
-                'description': (row.get('description') or '').strip() or None,
-                'is_active': True,
-                'created_at': now,
-                'updated_at': now,
-            }
-            for row in csv.DictReader(f)
-        ]
-
-    if rows:
-        stmt = pg_insert(acronym_table).values(rows)
-        # ON CONFLICT upsert keeps this migration idempotent — safe to re-run
-        # against a DB that already has seed data (e.g. re-running on a stale env).
-        stmt = stmt.on_conflict_do_update(
-            index_elements=['acronym'],
-            set_={
-                'expansions': stmt.excluded.expansions,
-                'description': stmt.excluded.description,
-                'updated_at': stmt.excluded.updated_at,
-            },
-        )
-        op.get_bind().execute(stmt)
+    stmt = pg_insert(acronym_table).values(rows)
+    # ON CONFLICT upsert keeps this migration idempotent — safe to re-run
+    # against a DB that already has seed data (e.g. re-running on a stale env).
+    stmt = stmt.on_conflict_do_update(
+        index_elements=['acronym'],
+        set_={
+            'expansions': stmt.excluded.expansions,
+            'description': stmt.excluded.description,
+            'updated_by': stmt.excluded.updated_by,
+            'updated_at': stmt.excluded.updated_at,
+        },
+    )
+    op.get_bind().execute(stmt)
 
 
 def downgrade() -> None:
