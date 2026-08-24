@@ -83,6 +83,16 @@ class PrioritizedSearchRequest(BaseModel):
         default=None,
         description="Optional list of document types to filter (searches in 'metadata.type' field, OR condition)"
     )
+    exclude_organizations: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of company names to exclude (must_not on 'metadata.company'). "
+                    "A document matching any listed value is dropped."
+    )
+    exclude_file_type: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of document types to exclude (must_not on 'metadata.type'). "
+                    "A document matching any listed value is dropped."
+    )
     search_mode: Literal["hybrid", "semantic"] = Field(
         default="hybrid",
         description="Search mode: 'hybrid' (semantic + title/summary boost) or "
