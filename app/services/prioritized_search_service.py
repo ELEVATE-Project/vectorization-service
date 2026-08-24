@@ -398,57 +398,39 @@ class PrioritizedSearchService:
 
                 # Title boost (highest priority). Scroll retrieves prefix/partial
                 # matches; the supplement adds any mid/infix matches already present
-                # in the dense candidate pool that the scroll missed.
-                title_matches = self._get_field_match_sources(
-                    query_for_keyword_match, filter_conditions, "title"
-                )
-                self._supplement_matches_from_results(
-                    query_for_keyword_match, unique_source_results, "title", title_matches
-                )
-                # the boost above only catches the literal acronym text
-                # (e.g. "SST") in the title — a document titled with the acronym's
-                # actual expansion ("Social Science / Social Studies") gets no credit
-                # at all, even though that's a real, confirmed keyword match a user
-                # would expect to count. When an acronym was detected, also check
-                # each expansion against title, merging in without downgrading an
-                # existing exact match to a weaker one found via expansion.
+                # in the dense candidate pool that the scroll missed. Checks the
+                # literal query text plus every detected acronym's expansion(s) in
+                # one combined call — a document titled with the acronym's actual
+                # expansion ("Social Science / Social Studies") gets the same credit
+                # a literal acronym match ("SST") would, without a separate Qdrant
+                # round-trip per expansion (see _get_field_match_sources' docstring).
+                title_queries = [query_for_keyword_match]
                 if acronyms_detected:
                     for expansions in acronyms_detected.values():
-                        for expansion in expansions:
-                            expansion_title_matches = self._get_field_match_sources(
-                                expansion, filter_conditions, "title"
-                            )
-                            self._supplement_matches_from_results(
-                                expansion, unique_source_results, "title", expansion_title_matches
-                            )
-                            for sid, mtype in expansion_title_matches.items():
-                                if title_matches.get(sid) != "exact":
-                                    title_matches[sid] = mtype
+                        title_queries.extend(expansions)
+                title_matches = self._get_field_match_sources(
+                    title_queries, filter_conditions, "title"
+                )
+                self._supplement_matches_from_results(
+                    title_queries, unique_source_results, "title", title_matches
+                )
                 top_results = self._apply_field_boost(
                     top_results, title_matches, "title",
                     settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
                 )
 
-                # Summary boost (lower priority, applied after title).
-                summary_matches = self._get_field_match_sources(
-                    query_for_keyword_match, filter_conditions, "summary"
-                )
-                self._supplement_matches_from_results(
-                    query_for_keyword_match, unique_source_results, "summary", summary_matches
-                )
-                # Same expansion-awareness as the title boost above.
+                # Summary boost (lower priority, applied after title). Same
+                # expansion-awareness as the title boost above.
+                summary_queries = [query_for_keyword_match]
                 if acronyms_detected:
                     for expansions in acronyms_detected.values():
-                        for expansion in expansions:
-                            expansion_summary_matches = self._get_field_match_sources(
-                                expansion, filter_conditions, "summary"
-                            )
-                            self._supplement_matches_from_results(
-                                expansion, unique_source_results, "summary", expansion_summary_matches
-                            )
-                            for sid, mtype in expansion_summary_matches.items():
-                                if summary_matches.get(sid) != "exact":
-                                    summary_matches[sid] = mtype
+                        summary_queries.extend(expansions)
+                summary_matches = self._get_field_match_sources(
+                    summary_queries, filter_conditions, "summary"
+                )
+                self._supplement_matches_from_results(
+                    summary_queries, unique_source_results, "summary", summary_matches
+                )
                 top_results = self._apply_field_boost(
                     top_results, summary_matches, "summary",
                     settings.EXACT_SUMMARY_BOOST, settings.PARTIAL_SUMMARY_BOOST,
@@ -1524,38 +1506,51 @@ class PrioritizedSearchService:
 
     def _get_field_match_sources(
         self,
-        query: str,
+        queries: List[str],
         filter_conditions: Optional[models.Filter],
         field: str,
     ) -> Dict[str, str]:
         """Return a map of source_id → match_type ('exact'|'partial') for documents
-        whose ``field`` payload (e.g. 'title' or 'summary') contains the query string.
+        whose ``field`` payload (e.g. 'title' or 'summary') contains any of ``queries``.
 
-        Uses a MatchText payload filter against the prefix-tokenized index, then refines
-        with a Python substring check so prefix and mid/infix occurrences are classified.
-        The scroll retrieves all matching points (batched) so no relevant document is missed.
+        Takes a list — the literal query text plus every detected acronym's
+        expansion(s) — so all of them are checked in a single Qdrant round-trip
+        (one scroll with an OR/``should`` filter) instead of one scroll per text.
+        Classification is done as if each text had its own sequential scroll:
+        for each query text in order, a source_id already recorded as "exact"
+        is left alone, otherwise the first point (chunk) of that source found to
+        match is classified and recorded — reproducing the same "first match
+        wins per text, later texts can upgrade partial to exact" behavior as N
+        separate calls, since a should-filter can only return the union of what
+        N individual MatchText filters would each return on their own (never
+        fewer points), just fetched once.
+
+        Uses a MatchText payload filter against the prefix-tokenized index, then
+        refines with a Python substring check per query text so prefix and
+        mid/infix occurrences are classified. The scroll retrieves all matching
+        points (batched) so no relevant document is missed.
         """
         matches: Dict[str, str] = {}
-        query_lower = query.strip().lower()
-        if not query_lower:
+        queries_lower = list(dict.fromkeys(q.strip().lower() for q in queries if q and q.strip()))
+        if not queries_lower:
             return matches
 
-        field_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key=field,
-                    match=models.MatchText(text=query_lower),
-                )
+        text_filter = models.Filter(
+            should=[
+                models.FieldCondition(key=field, match=models.MatchText(text=q))
+                for q in queries_lower
             ]
         )
 
-        # Combine with any existing hard filters (org / category / etc.)
+        # Combine with any existing hard filters (org / category / etc.) — the
+        # hard filters stay required (must), while at least one query text has
+        # to match (nested should).
         if filter_conditions and filter_conditions.must:
-            combined_must = list(filter_conditions.must) + list(field_filter.must)
-            combined_filter = models.Filter(must=combined_must)
+            combined_filter = models.Filter(must=list(filter_conditions.must) + [text_filter])
         else:
-            combined_filter = field_filter
+            combined_filter = text_filter
 
+        all_points: List = []
         try:
             offset = None
             while True:
@@ -1570,16 +1565,7 @@ class PrioritizedSearchService:
                     scroll_kwargs["offset"] = offset
 
                 points, next_offset = qdrant_client.scroll(**scroll_kwargs)
-
-                for point in points:
-                    source_id = point.payload.get("source_id")
-                    raw_value = point.payload.get(field) or ""
-                    if not source_id or source_id in matches:
-                        continue
-
-                    match_type = self._classify_text_match(query_lower, raw_value.lower())
-                    if match_type:
-                        matches[source_id] = match_type
+                all_points.extend(points)
 
                 if not next_offset:
                     break
@@ -1587,6 +1573,20 @@ class PrioritizedSearchService:
 
         except Exception as exc:
             logger.warning(f"{field} match scroll failed (non-fatal): {exc}")
+            return matches
+
+        for q in queries_lower:
+            matched_this_query: set = set()
+            for point in all_points:
+                source_id = point.payload.get("source_id")
+                if not source_id or source_id in matched_this_query:
+                    continue
+                raw_value = point.payload.get(field) or ""
+                match_type = self._classify_text_match(q, raw_value.lower())
+                if match_type:
+                    matched_this_query.add(source_id)
+                    if matches.get(source_id) != "exact":
+                        matches[source_id] = match_type
 
         logger.info(
             f"{field} match sources found: {len(matches)} "
@@ -1597,7 +1597,7 @@ class PrioritizedSearchService:
 
     def _supplement_matches_from_results(
         self,
-        query: str,
+        queries: List[str],
         ranked_results: List[Dict[str, Any]],
         field: str,
         matches: Dict[str, str],
@@ -1607,19 +1607,25 @@ class PrioritizedSearchService:
         The prefix-tokenized index broadens MatchText recall to prefixes, but a true
         infix query (e.g. 'sur' in 'insurance') may not be retrieved by the scroll.
         This in-memory pass scans the dense candidates' ``field`` payloads with a plain
-        substring check — no extra Qdrant calls — and adds any newly found matches.
+        substring check — no extra Qdrant calls — against every query text (the literal
+        query plus any acronym expansions) and adds any newly found matches, never
+        downgrading a source_id already recorded as "exact".
         """
-        query_lower = query.strip().lower()
-        if not query_lower:
+        queries_lower = list(dict.fromkeys(q.strip().lower() for q in queries if q and q.strip()))
+        if not queries_lower:
             return
         for result in ranked_results:
             source_id = result["payload"].get("source_id")
-            if not source_id or source_id in matches:
+            if not source_id or matches.get(source_id) == "exact":
                 continue
             raw_value = (result["payload"].get(field) or "").lower()
-            match_type = self._classify_text_match(query_lower, raw_value)
-            if match_type:
-                matches[source_id] = match_type
+            for q in queries_lower:
+                match_type = self._classify_text_match(q, raw_value)
+                if match_type == "exact":
+                    matches[source_id] = "exact"
+                    break
+                if match_type == "partial" and source_id not in matches:
+                    matches[source_id] = "partial"
 
     def _apply_field_boost(
         self,
@@ -1801,7 +1807,7 @@ class PrioritizedSearchService:
         query: str,
         filter_conditions: Optional[models.Filter],
     ) -> Dict[str, str]:
-        return self._get_field_match_sources(query, filter_conditions, "title")
+        return self._get_field_match_sources([query], filter_conditions, "title")
 
     def _apply_title_boost(
         self,
