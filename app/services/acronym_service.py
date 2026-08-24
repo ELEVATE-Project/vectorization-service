@@ -8,7 +8,12 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
-from app.constants import ACRONYM_CACHE_KEY_PREFIX
+from app.constants import (
+    ACRONYM_CACHE_KEY_PREFIX,
+    ACRONYM_CSV_COLUMN_ACRONYM,
+    ACRONYM_CSV_COLUMN_DESCRIPTION,
+    ACRONYM_CSV_COLUMN_EXPANSIONS,
+)
 from app.core.clients import cache_client
 from app.core.database import SessionLocal
 from app.models.db_models import AcronymMapping
@@ -80,6 +85,30 @@ def invalidate_cache(acronym: str) -> None:
         logger.warning(f"Acronym cache invalidation failed for {acronym!r}: {e}")
 
 
+def refresh_cache(acronyms: List[str]) -> None:
+    """Re-cache expansions for exactly the given acronyms (e.g. after a bulk
+    upload), instead of re-warming the entire cache via load_acronym_cache().
+
+    Deliberately synchronous, same reasoning as load_acronym_cache() —
+    callers must run this via run_in_threadpool rather than awaiting it
+    directly."""
+    if not acronyms:
+        return
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(AcronymMapping)
+            .filter(AcronymMapping.acronym.in_(acronyms), AcronymMapping.is_active.is_(True))
+            .all()
+        )
+    finally:
+        db.close()
+
+    for row in rows:
+        cache_client.set(_cache_key(row.acronym), json.dumps(row.expansions), settings.REDIS_CACHE_TTL)
+
+
 def load_acronym_cache() -> int:
     """Pre-populate the cache-aside store with every active acronym at startup,
     so first-touch queries after boot are already cache hits rather than DB round-trips.
@@ -147,10 +176,10 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
     valid_by_acronym: dict = {}
 
     for index, row in enumerate(rows):
-        raw_acronym = (row.get("acronym") or "").strip()
+        raw_acronym = (row.get(ACRONYM_CSV_COLUMN_ACRONYM) or "").strip()
         acronym = raw_acronym.upper()
-        expansions = _split_expansions(row.get("expansions") or "")
-        description = (row.get("description") or "").strip() or None
+        expansions = _split_expansions(row.get(ACRONYM_CSV_COLUMN_EXPANSIONS) or "")
+        description = (row.get(ACRONYM_CSV_COLUMN_DESCRIPTION) or "").strip() or None
 
         if not acronym or not expansions:
             errors.append({

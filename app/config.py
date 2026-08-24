@@ -60,6 +60,9 @@ class Settings(BaseSettings):
 
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
+    # Acronym bulk-upload CSVs are small tabular text, not documents —
+    # a much lower cap than MAX_FILE_SIZE_MB.
+    ACRONYM_BULK_UPLOAD_MAX_SIZE_MB: int = int(os.getenv("ACRONYM_BULK_UPLOAD_MAX_SIZE_MB", 5))
 
 
     # Prioritized Search Configuration
