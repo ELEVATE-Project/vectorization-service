@@ -39,6 +39,8 @@ class AcronymMapping(Base):
     expansions = Column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
     description = Column(Text, nullable=True)
     is_active = Column(Boolean, nullable=False, server_default=text("true"))
+    created_by = Column(String(64), nullable=False, server_default=text("'SYSTEM'"))
+    updated_by = Column(String(64), nullable=False, server_default=text("'SYSTEM'"))
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=text("now()")
     )

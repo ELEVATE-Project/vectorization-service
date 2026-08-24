@@ -108,7 +108,7 @@ class TestCacheOutageFallsBackToPostgres:
 
     def test_invalidate_cache_failure_does_not_raise(self):
         """Regression test: invalidate_cache() is itself the degraded-mode
-        fallback the bulk-upload endpoint calls when warm_cache() has
+        fallback the bulk-upload endpoint calls when load_acronym_cache() has
         already failed — if invalidate_cache() also raises on the same
         outage, a successful, already-committed upload would surface to the
         caller as a 500."""
@@ -295,11 +295,11 @@ class TestStartupFaultTolerance:
     service — get_expansion() already has a per-lookup DB fallback, so
     warm-up is an optimization, not a hard dependency."""
 
-    def test_warm_cache_failure_does_not_prevent_startup(self):
-        # warm_cache() is sync now (run via run_in_threadpool, not awaited
-        # directly) — the mock must be a plain Mock, not AsyncMock.
+    def test_load_acronym_cache_failure_does_not_prevent_startup(self):
+        # load_acronym_cache() is sync now (run via run_in_threadpool, not
+        # awaited directly) — the mock must be a plain Mock, not AsyncMock.
         with patch(
-            "app.main.warm_acronym_cache",
+            "app.main.load_acronym_cache",
             Mock(side_effect=RuntimeError("Postgres unreachable")),
         ), patch("app.main.ensure_collections_exist", AsyncMock(return_value=None)):
             from app.main import app, lifespan
@@ -318,7 +318,7 @@ class TestStartupFaultTolerance:
         with patch(
             "app.main.ensure_collections_exist",
             AsyncMock(side_effect=RuntimeError("Qdrant unreachable")),
-        ), patch("app.main.warm_acronym_cache", Mock(return_value=0)):
+        ), patch("app.main.load_acronym_cache", Mock(return_value=0)):
             from app.main import app, lifespan
 
             async def run():

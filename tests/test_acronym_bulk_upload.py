@@ -119,21 +119,21 @@ class TestOverLengthAcronymRow:
             db.close()
 
 
-class TestWarmCacheIsSynchronous:
-    """Structural regression guard: warm_cache() must stay a plain (sync)
-    function, not async def. It's run via run_in_threadpool in both
+class TestLoadAcronymCacheIsSynchronous:
+    """Structural regression guard: load_acronym_cache() must stay a plain
+    (sync) function, not async def. It's run via run_in_threadpool in both
     app/main.py's startup and the bulk-upload endpoint specifically because
     it does ~600 sequential blocking Redis calls — if it were async def
     again, awaiting it directly would silently reintroduce the event-loop
     stall this was fixed for, since run_in_threadpool expects a sync
     callable."""
 
-    def test_warm_cache_is_not_a_coroutine_function(self):
+    def test_load_acronym_cache_is_not_a_coroutine_function(self):
         import inspect
 
-        from app.services.acronym_service import warm_cache
+        from app.services.acronym_service import load_acronym_cache
 
-        assert not inspect.iscoroutinefunction(warm_cache)
+        assert not inspect.iscoroutinefunction(load_acronym_cache)
 
     def test_bulk_upsert_is_not_a_coroutine_function(self):
         import inspect

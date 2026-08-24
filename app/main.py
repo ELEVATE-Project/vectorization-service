@@ -5,7 +5,7 @@ from starlette.concurrency import run_in_threadpool
 from app.api.v1.api import api_router
 from app.core.clients.qdrant import ensure_collections_exist
 from app.core.clients.embedding import EmbeddingError
-from app.services.acronym_service import warm_cache as warm_acronym_cache
+from app.services.acronym_service import load_acronym_cache
 from app.utils.json_handler import CustomJSONResponse
 from app.config import settings
 import logging
@@ -23,10 +23,10 @@ async def lifespan(app: FastAPI):
         raise
 
     try:
-        # warm_cache() is synchronous (blocking Postgres + Redis I/O) — must
-        # run in a thread, not be awaited directly, or it stalls the event
+        # load_acronym_cache() is synchronous (blocking Postgres + Redis I/O) —
+        # must run in a thread, not be awaited directly, or it stalls the event
         # loop (and every other in-flight request) for its full duration.
-        await run_in_threadpool(warm_acronym_cache)
+        await run_in_threadpool(load_acronym_cache)
     except Exception as e:
         # Not fatal: get_expansion() already falls back to Postgres per lookup,
         # so a failed warm-up only costs a few extra DB round-trips on first

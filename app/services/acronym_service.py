@@ -8,17 +8,21 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
+from app.constants import (
+    ACRONYM_CACHE_KEY_PREFIX,
+    ACRONYM_CSV_COLUMN_ACRONYM,
+    ACRONYM_CSV_COLUMN_DESCRIPTION,
+    ACRONYM_CSV_COLUMN_EXPANSIONS,
+)
 from app.core.clients import cache_client
 from app.core.database import SessionLocal
 from app.models.db_models import AcronymMapping
 
 logger = logging.getLogger(__name__)
 
-_CACHE_KEY_PREFIX = "acronym"
-
 
 def _cache_key(acronym: str) -> str:
-    return f"{_CACHE_KEY_PREFIX}:{acronym}"
+    return f"{ACRONYM_CACHE_KEY_PREFIX}:{acronym}"
 
 
 def get_expansion(acronym: str) -> Optional[List[str]]:
@@ -46,7 +50,7 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
 
     db = SessionLocal()
     try:
-        row = (
+        mapping = (
             db.query(AcronymMapping)
             .filter(AcronymMapping.acronym == acronym, AcronymMapping.is_active.is_(True))
             .first()
@@ -75,7 +79,7 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
     finally:
         db.close()
 
-    if row is None:
+    if mapping is None:
         # Cache the negative result too (shorter TTL) — otherwise every ordinary
         # non-acronym word in a query re-hits Postgres on every single request,
         # since only positive hits were ever written through before this fix.
@@ -89,11 +93,11 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
         return None
 
     try:
-        cache_client.set(_cache_key(acronym), json.dumps(row.expansions), settings.REDIS_CACHE_TTL)
+        cache_client.set(_cache_key(acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
     except Exception as e:
         logger.warning(f"Acronym cache write-through failed for {acronym!r}: {e}")
 
-    return row.expansions
+    return mapping.expansions
 
 
 def invalidate_cache(acronym: str) -> None:
@@ -102,7 +106,7 @@ def invalidate_cache(acronym: str) -> None:
 
     Swallows Redis errors (logged) rather than raising — this is already the
     degraded-mode fallback when the cache is having problems (e.g. the bulk
-    upload endpoint calls this when warm_cache() itself failed), so letting
+    upload endpoint calls this when load_acronym_cache() itself failed), so letting
     it raise would turn an already-committed, successful write into a 500
     for the caller."""
     acronym = acronym.strip().upper()
@@ -112,7 +116,31 @@ def invalidate_cache(acronym: str) -> None:
         logger.warning(f"Acronym cache invalidation failed for {acronym!r}: {e}")
 
 
-def warm_cache() -> int:
+def refresh_cache(acronyms: List[str]) -> None:
+    """Re-cache expansions for exactly the given acronyms (e.g. after a bulk
+    upload), instead of re-warming the entire cache via load_acronym_cache().
+
+    Deliberately synchronous, same reasoning as load_acronym_cache() —
+    callers must run this via run_in_threadpool rather than awaiting it
+    directly."""
+    if not acronyms:
+        return
+
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(AcronymMapping)
+            .filter(AcronymMapping.acronym.in_(acronyms), AcronymMapping.is_active.is_(True))
+            .all()
+        )
+    finally:
+        db.close()
+
+    for row in rows:
+        cache_client.set(_cache_key(row.acronym), json.dumps(row.expansions), settings.REDIS_CACHE_TTL)
+
+
+def load_acronym_cache() -> int:
     """Pre-populate the cache-aside store with every active acronym at startup,
     so first-touch queries after boot are already cache hits rather than DB round-trips.
     Not a substitute for get_expansion()'s per-lookup DB fallback — acronyms added
@@ -179,10 +207,10 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
     valid_by_acronym: dict = {}
 
     for index, row in enumerate(rows):
-        raw_acronym = (row.get("acronym") or "").strip()
+        raw_acronym = (row.get(ACRONYM_CSV_COLUMN_ACRONYM) or "").strip()
         acronym = raw_acronym.upper()
-        expansions = _split_expansions(row.get("expansions") or "")
-        description = (row.get("description") or "").strip() or None
+        expansions = _split_expansions(row.get(ACRONYM_CSV_COLUMN_EXPANSIONS) or "")
+        description = (row.get(ACRONYM_CSV_COLUMN_DESCRIPTION) or "").strip() or None
 
         if not acronym or not expansions:
             errors.append({

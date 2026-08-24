@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     MAX_CACHE_RESULTS: int = 1
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
+    REDIS_DB: int = int(os.getenv("REDIS_DB", 0))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
     # redis-py defaults both to None (no timeout at all) — a blackholed connection
     # (network drops packets silently, unlike a clean "connection refused") would
@@ -96,6 +97,9 @@ class Settings(BaseSettings):
 
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
+    # Acronym bulk-upload CSVs are small tabular text, not documents —
+    # a much lower cap than MAX_FILE_SIZE_MB.
+    ACRONYM_BULK_UPLOAD_MAX_SIZE_MB: int = int(os.getenv("ACRONYM_BULK_UPLOAD_MAX_SIZE_MB", 5))
 
 
     # Prioritized Search Configuration

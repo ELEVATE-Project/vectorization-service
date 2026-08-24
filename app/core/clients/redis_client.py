@@ -12,7 +12,7 @@ redis_client = redis.Redis(
     host=settings.REDIS_HOST,
     port=settings.REDIS_PORT,
     password=settings.REDIS_PASSWORD or None,
-    db=0,
+    db=settings.REDIS_DB,
     decode_responses=True,
     # Without these, redis-py defaults to no timeout at all — a blackholed
     # connection would hang every read/write (and everything downstream on the
