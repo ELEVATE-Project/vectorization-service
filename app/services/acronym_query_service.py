@@ -1,7 +1,7 @@
 import re
 from typing import Dict, List
 
-from app.services.acronym_service import get_expansion
+from app.services.acronym_service import get_expansions_batch
 
 # Letters only — strips internal dots ("D.I.E.T." -> "DIET"), digits, and any
 # surrounding punctuation in one pass. Known simplification: a token like
@@ -15,9 +15,12 @@ def _normalize_token(raw_token: str) -> str:
 
 def detect_acronyms(query: str) -> Dict[str, List[str]]:
     """Detect acronyms in `query`, returning {acronym: expansions} for every match
-    found in the acronym dictionary (via acronym_service.get_expansion's cache-aside
-    lookup). Must be called with the case-preserving query (query_for_keyword_match),
-    not a lowercased/preprocessed one — these rules depend on case.
+    found in the acronym dictionary (via acronym_service.get_expansions_batch's
+    batched cache-aside lookup — one Redis round-trip and, for whatever's still
+    missing, one Postgres round-trip for every candidate token in the query,
+    instead of one of each per token). Must be called with the case-preserving
+    query (query_for_keyword_match), not a lowercased/preprocessed one — these
+    rules depend on case.
 
     Case rules:
       - A fully-uppercase token (letters-only length > 1) is always checked.
@@ -34,7 +37,12 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
     raw_tokens = query.strip().split()
     is_single_word_query = len(raw_tokens) == 1
 
-    detected: Dict[str, str] = {}
+    # Collect every case/length-filtered candidate first, deduped, before any
+    # lookup — as opposed to deduping only successfully-resolved acronyms
+    # (which would mean two occurrences of the same non-acronym uppercase
+    # word each triggered their own lookup).
+    candidates: List[str] = []
+    seen = set()
     for raw_token in raw_tokens:
         normalized = _normalize_token(raw_token)
         if len(normalized) < 2:
@@ -44,22 +52,27 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
             continue
 
         candidate = normalized.upper()
-        if candidate in detected:
+        if candidate in seen:
             continue
+        seen.add(candidate)
+        candidates.append(candidate)
 
-        expansion = get_expansion(candidate)
-        # `is not None` alone would accept an empty list — the expansions
-        # column defaults to '[]'::jsonb and only bulk_upsert() validates
-        # non-empty before insert, so a row written via any other path (raw
-        # SQL, a future writer) could still have expansions=[]. Guarding
-        # here (falsy, not just None) rejects that case the same way as
-        # "acronym not found," closing both downstream call sites
-        # (build_dense_queries' expansions[0], build_sparse_query's OR-join)
-        # at once — neither ever sees an empty-list acronym in its mapping.
-        if expansion:
-            detected[candidate] = expansion
+    if not candidates:
+        return {}
 
-    return detected
+    expansions_by_acronym = get_expansions_batch(candidates)
+    # `if expansions` (falsy, not just "in the dict") rejects an empty-list
+    # expansions value — the expansions column defaults to '[]'::jsonb and
+    # only bulk_upsert() validates non-empty before insert, so a row written
+    # via any other path (raw SQL, a future writer) could still have
+    # expansions=[]. Guarding here closes both downstream call sites
+    # (build_dense_queries' expansions[0], build_sparse_query's OR-join) at
+    # once — neither ever sees an empty-list acronym in its mapping.
+    return {
+        acronym: expansions
+        for acronym, expansions in expansions_by_acronym.items()
+        if expansions
+    }
 
 
 def build_dense_queries(query_for_embedding: str, mapping: Dict[str, List[str]]) -> List[str]:

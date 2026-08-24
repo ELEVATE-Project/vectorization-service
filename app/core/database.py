@@ -8,8 +8,9 @@ engine = create_engine(
     # Without connect_timeout, a blackholed Postgres host hangs a connection
     # attempt until the OS-level TCP timeout (minutes) — confirmed live. Every
     # caller of SessionLocal()/get_db() benefits from this, not just acronym
-    # lookups (acronym_service.get_expansion() also caches the resulting
-    # failure so it doesn't repeat this — now-bounded — cost per token).
+    # lookups (acronym_service.get_expansions_batch() also caches the
+    # resulting failure so it doesn't repeat this — now-bounded — cost for
+    # every candidate token in the query).
     connect_args={"connect_timeout": settings.POSTGRES_CONNECT_TIMEOUT},
 )
 SessionLocal = sessionmaker(bind=engine)

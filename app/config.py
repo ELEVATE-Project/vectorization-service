@@ -49,16 +49,18 @@ class Settings(BaseSettings):
     # hang every cache read/write until the OS-level TCP timeout, which can be
     # minutes. This runs synchronously on the search request path, so an
     # unresponsive cache would stall search entirely instead of degrading to
-    # Postgres per get_expansion()'s existing except-and-fallback behavior.
+    # Postgres per get_expansions_batch()'s existing except-and-fallback behavior.
     # Kept small (not a generous few-seconds value): a healthy Redis responds in
-    # low single-digit milliseconds, and get_expansion() makes TWO calls on the
-    # fallback path (a read, then a write-through of the Postgres result) — each
-    # one independently pays this timeout on an outage, and detect_acronyms()
-    # calls get_expansion() once per candidate token, so the per-request cost
-    # multiplies. Confirmed live: with 3s/5s defaults, a single cache-miss
+    # low single-digit milliseconds, and get_expansions_batch() makes TWO calls
+    # on the fallback path (a read, then a write-through of the Postgres result)
+    # — each one independently pays this timeout on an outage. Confirmed live
+    # (before batching, when detect_acronyms() called this once per candidate
+    # token instead of once per query): with 3s/5s defaults, a single cache-miss
     # lookup during a blackholed connection took just over 10s (2 x 5s) before
     # falling back to Postgres — too slow per token for what should be a
-    # millisecond-scale cache operation.
+    # millisecond-scale cache operation. Batching now pays this once per query
+    # instead of once per token, but the timeout still guards against that one
+    # round-trip hanging indefinitely.
     REDIS_SOCKET_CONNECT_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", 1))
     REDIS_SOCKET_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_TIMEOUT", 1))
     REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", 86400))  # 24 hours in seconds

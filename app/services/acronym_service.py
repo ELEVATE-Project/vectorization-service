@@ -1,7 +1,7 @@
 import json
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
@@ -25,79 +25,103 @@ def _cache_key(acronym: str) -> str:
     return f"{ACRONYM_CACHE_KEY_PREFIX}:{acronym}"
 
 
-def get_expansion(acronym: str) -> Optional[List[str]]:
-    """Cache-aside lookup: Redis hit returns immediately, miss falls back to
-    Postgres and writes the result through to the cache for next time.
+def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
+    """Cache-aside lookup for a list of acronyms in one call — Redis hits
+    return immediately, whatever's still missing falls back to Postgres and
+    gets written through to the cache for next time. cache_client only
+    stores strings (Redis primitive), so expansions are JSON-encoded on
+    write and decoded on read here rather than in cache_client itself,
+    which stays acronym-agnostic.
 
-    cache_client only stores strings (Redis primitive), so the expansions
-    list is JSON-encoded on write and decoded on read here rather than in
-    cache_client itself, which stays acronym-agnostic.
+    Every Redis read, the Postgres fallback, and every Redis write happens
+    as a single batched round-trip covering the whole input list, not one
+    round-trip per acronym — detect_acronyms() calls this once per query
+    with every candidate token, instead of looping a per-acronym lookup.
+    That also collapses N independent connection-timeout exposures into
+    one: per REDIS_SOCKET_CONNECT_TIMEOUT's docstring in config.py, a
+    blackholed Redis during an outage previously cost each candidate token
+    its own timeout (confirmed empirically at 2x5s per token) — one
+    batched read pays that timeout once for the whole query.
 
-    Normalizes to uppercase (matching how rows are stored, per spec §3/§8)
-    so this is correct regardless of the caller's input case.
+    Input is deduped internally (case-normalized), so callers don't need
+    to pre-dedupe. Acronyms not found (or with empty expansions) are
+    simply absent from the returned dict."""
+    normalized = list(dict.fromkeys(a.strip().upper() for a in acronyms if a and a.strip()))
+    if not normalized:
+        return {}
 
-    Redis errors (not just misses) fall through to Postgres — a cache
-    outage must degrade lookups, not break them."""
-    acronym = acronym.strip().upper()
+    keys = [_cache_key(a) for a in normalized]
     try:
-        cached = cache_client.get(_cache_key(acronym))
+        cached_values = cache_client.mget(keys)
     except Exception as e:
-        logger.warning(f"Acronym cache read failed for {acronym!r}, falling back to Postgres: {e}")
-        cached = None
+        logger.warning(
+            f"Acronym batch cache read failed for {len(normalized)} acronym(s), "
+            f"falling back to Postgres: {e}"
+        )
+        cached_values = [None] * len(normalized)
 
-    if cached is not None:
-        return json.loads(cached)
+    result: Dict[str, List[str]] = {}
+    missing: List[str] = []
+    for acronym, cached in zip(normalized, cached_values):
+        if cached is None:
+            missing.append(acronym)
+            continue
+        decoded = json.loads(cached)
+        if decoded is not None:
+            result[acronym] = decoded
+
+    if not missing:
+        return result
 
     db = SessionLocal()
     try:
-        mapping = (
+        mappings = (
             db.query(AcronymMapping)
-            .filter(AcronymMapping.acronym == acronym, AcronymMapping.is_active.is_(True))
-            .first()
+            .filter(AcronymMapping.acronym.in_(missing), AcronymMapping.is_active.is_(True))
+            .all()
         )
     except Exception as e:
         # A Postgres outage (or the acronym table not existing yet) must
-        # degrade acronym lookups, not take down search entirely — search
-        # never depended on Postgres before this feature. Treated the same
-        # as "not an acronym" rather than propagating, mirroring the Redis
-        # fallback above.
-        logger.warning(f"Acronym DB lookup failed for {acronym!r}, treating as not found: {e}")
-        # Cache the failure too (short TTL) — otherwise every candidate token
-        # of every search re-attempts the Postgres connection for the entire
-        # outage: detect_acronyms() calls get_expansion() once per token, and
-        # without this, none of those repeated attempts would ever be
-        # remembered (unlike a genuine miss below, which already writes a
-        # negative entry). Short TTL, not REDIS_NEGATIVE_CACHE_TTL's full
-        # hour: an outage is often transient, so this should stop hammering
-        # Postgres during the outage without keeping real acronyms
-        # unresolvable for long after it recovers.
+        # degrade to "not found" rather than propagating — search never
+        # depended on Postgres before this feature. Negative-cache with the
+        # short DB-error TTL so a Postgres outage doesn't get re-attempted
+        # on every request for its full duration.
+        logger.warning(
+            f"Acronym batch DB lookup failed for {len(missing)} acronym(s), "
+            f"treating as not found: {e}"
+        )
         try:
-            cache_client.set(_cache_key(acronym), json.dumps(None), settings.REDIS_DB_ERROR_CACHE_TTL)
+            cache_client.set_many({
+                _cache_key(a): (json.dumps(None), settings.REDIS_DB_ERROR_CACHE_TTL)
+                for a in missing
+            })
         except Exception as cache_e:
-            logger.warning(f"Acronym DB-error negative-cache write failed for {acronym!r}: {cache_e}")
-        return None
+            logger.warning(f"Acronym batch DB-error negative-cache write failed: {cache_e}")
+        return result
     finally:
         db.close()
 
-    if mapping is None:
-        # Cache the negative result too (shorter TTL) — otherwise every ordinary
-        # non-acronym word in a query re-hits Postgres on every single request,
-        # since only positive hits were ever written through before this fix.
-        # json.dumps(None) -> the string "null", read back via the same
-        # `if cached is not None: return json.loads(cached)` path above, which
-        # correctly resolves to None — no separate sentinel/read-path needed.
-        try:
-            cache_client.set(_cache_key(acronym), json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL)
-        except Exception as e:
-            logger.warning(f"Acronym negative-cache write failed for {acronym!r}: {e}")
-        return None
+    found_by_acronym = {mapping.acronym: mapping.expansions for mapping in mappings}
+    cache_writes: Dict[str, Tuple[str, int]] = {}
+    for acronym in missing:
+        if acronym in found_by_acronym:
+            result[acronym] = found_by_acronym[acronym]
+            cache_writes[_cache_key(acronym)] = (
+                json.dumps(found_by_acronym[acronym]), settings.REDIS_CACHE_TTL
+            )
+        else:
+            cache_writes[_cache_key(acronym)] = (
+                json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL
+            )
 
     try:
-        cache_client.set(_cache_key(acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
+        cache_client.set_many(cache_writes)
     except Exception as e:
-        logger.warning(f"Acronym cache write-through failed for {acronym!r}: {e}")
+        logger.warning(
+            f"Acronym batch cache write-through failed for {len(cache_writes)} acronym(s): {e}"
+        )
 
-    return mapping.expansions
+    return result
 
 
 def invalidate_cache(acronym: str) -> None:
@@ -128,7 +152,7 @@ def refresh_cache(acronyms: List[str]) -> None:
 
     db = SessionLocal()
     try:
-        rows = (
+        mappings = (
             db.query(AcronymMapping)
             .filter(AcronymMapping.acronym.in_(acronyms), AcronymMapping.is_active.is_(True))
             .all()
@@ -136,15 +160,16 @@ def refresh_cache(acronyms: List[str]) -> None:
     finally:
         db.close()
 
-    for row in rows:
-        cache_client.set(_cache_key(row.acronym), json.dumps(row.expansions), settings.REDIS_CACHE_TTL)
+    for mapping in mappings:
+        cache_client.set(_cache_key(mapping.acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
 
 
 def load_acronym_cache() -> int:
     """Pre-populate the cache-aside store with every active acronym at startup,
     so first-touch queries after boot are already cache hits rather than DB round-trips.
-    Not a substitute for get_expansion()'s per-lookup DB fallback — acronyms added
-    after startup, or evicted via TTL, are still served by that path.
+    Not a substitute for get_expansions_batch()'s per-lookup DB fallback —
+    acronyms added after startup, or evicted via TTL, are still served by
+    that path.
 
     Deliberately synchronous, not async def — every operation inside is a
     blocking call (SQLAlchemy's sync Session, cache_client's sync Redis
@@ -155,15 +180,15 @@ def load_acronym_cache() -> int:
     duration."""
     db = SessionLocal()
     try:
-        rows = db.query(AcronymMapping).filter(AcronymMapping.is_active.is_(True)).all()
+        mappings = db.query(AcronymMapping).filter(AcronymMapping.is_active.is_(True)).all()
     finally:
         db.close()
 
-    for row in rows:
-        cache_client.set(_cache_key(row.acronym), json.dumps(row.expansions), settings.REDIS_CACHE_TTL)
+    for mapping in mappings:
+        cache_client.set(_cache_key(mapping.acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
 
-    logger.info(f"Acronym cache warmed: {len(rows)} active acronym(s)")
-    return len(rows)
+    logger.info(f"Acronym cache warmed: {len(mappings)} active acronym(s)")
+    return len(mappings)
 
 
 def _split_expansions(raw: str) -> List[str]:
