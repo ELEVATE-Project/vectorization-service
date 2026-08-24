@@ -296,7 +296,8 @@ class PrioritizedSearchService:
                 resource_types=request.resource_type,
                 file_types=request.file_type,
                 exclude_organizations=request.exclude_organizations,
-                exclude_file_types=request.exclude_file_type
+                exclude_file_types=request.exclude_file_type,
+                any_of=request.any_of
             )
             
             self._log_search_request(request, top_k, filter_conditions)
@@ -735,7 +736,8 @@ class PrioritizedSearchService:
         resource_types: Optional[List[str]] = None,
         file_types: Optional[List[str]] = None,
         exclude_organizations: Optional[List[str]] = None,
-        exclude_file_types: Optional[List[str]] = None
+        exclude_file_types: Optional[List[str]] = None,
+        any_of: Optional[List[Any]] = None
     ) -> Optional[models.Filter]:
         """
         Build Qdrant filter conditions with intelligent AND/OR logic.
@@ -745,6 +747,10 @@ class PrioritizedSearchService:
         - Between filter types: AND condition
         - exclude_* values become a must_not clause: matching any of them drops
           the document. A request may carry exclusions and no positive filters.
+        - any_of holds FilterBlocks that are OR'ed with each other and AND'ed
+          with everything above: keep if TOP-LEVEL AND (block0 OR block1 OR ...).
+          The arguments above keep their meaning either way and are never
+          ignored when any_of is present.
 
         Field Mappings:
         - categories → tags (list)
@@ -763,6 +769,7 @@ class PrioritizedSearchService:
             file_types: Document types to filter by
             exclude_organizations: Company names to exclude (must_not)
             exclude_file_types: Document types to exclude (must_not)
+            any_of: FilterBlocks to OR together and AND with the filters above
 
         Returns:
             Qdrant Filter object or None if no filters provided
@@ -824,6 +831,29 @@ class PrioritizedSearchService:
             must_not_conditions.append(condition)
             filter_summary.append(f"NOT {label}: ({' OR '.join(condition.match.any)})")
             logger.info(f"Filter - exclude_{label}: {condition.match.any}")
+
+        # Alternatives (should). Each block is itself a filter block, so it is
+        # built by this same function — the branch is compiled by the identical
+        # code that compiles a flat request, and each recursive call logs its own
+        # per-field lines. Depth is exactly one: FilterBlock forbids extra fields,
+        # so a block cannot carry its own any_of and the recursion cannot go deeper.
+        if any_of:
+            logger.info(f"Filter - any_of: {len(any_of)} alternatives")
+            branch_filters = []
+            for block in any_of:
+                branch = self._build_filters(
+                    categories=block.categories,
+                    organizations=block.organizations,
+                    resource_types=block.resource_type,
+                    file_types=block.file_type,
+                    exclude_organizations=block.exclude_organizations,
+                    exclude_file_types=block.exclude_file_type,
+                )
+                if branch is not None:
+                    branch_filters.append(branch)
+            if branch_filters:
+                must_conditions.append(models.Filter(should=branch_filters))
+                filter_summary.append(f"ANY OF ({len(branch_filters)} alternatives)")
 
         if must_conditions or must_not_conditions:
             logger.info(
@@ -1539,7 +1569,8 @@ class PrioritizedSearchService:
                 resource_types=request.resource_type,
                 file_types=request.file_type,
                 exclude_organizations=request.exclude_organizations,
-                exclude_file_types=request.exclude_file_type
+                exclude_file_types=request.exclude_file_type,
+                any_of=request.any_of
             )
             
             if filter_conditions:
