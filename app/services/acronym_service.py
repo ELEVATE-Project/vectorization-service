@@ -40,7 +40,7 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
 
     db = SessionLocal()
     try:
-        row = (
+        mapping = (
             db.query(AcronymMapping)
             .filter(AcronymMapping.acronym == acronym, AcronymMapping.is_active.is_(True))
             .first()
@@ -48,15 +48,15 @@ def get_expansion(acronym: str) -> Optional[List[str]]:
     finally:
         db.close()
 
-    if row is None:
+    if mapping is None:
         return None
 
     try:
-        cache_client.set(_cache_key(acronym), json.dumps(row.expansions), settings.REDIS_CACHE_TTL)
+        cache_client.set(_cache_key(acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
     except Exception as e:
         logger.warning(f"Acronym cache write-through failed for {acronym!r}: {e}")
 
-    return row.expansions
+    return mapping.expansions
 
 
 def invalidate_cache(acronym: str) -> None:
