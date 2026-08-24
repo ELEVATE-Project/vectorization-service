@@ -3,17 +3,16 @@ import logging
 from typing import List, Optional
 
 from app.config import settings
+from app.constants import ACRONYM_CACHE_KEY_PREFIX
 from app.core.clients import cache_client
 from app.core.database import SessionLocal
 from app.models.db_models import AcronymMapping
 
 logger = logging.getLogger(__name__)
 
-_CACHE_KEY_PREFIX = "acronym"
-
 
 def _cache_key(acronym: str) -> str:
-    return f"{_CACHE_KEY_PREFIX}:{acronym}"
+    return f"{ACRONYM_CACHE_KEY_PREFIX}:{acronym}"
 
 
 def get_expansion(acronym: str) -> Optional[List[str]]:
@@ -66,7 +65,7 @@ def invalidate_cache(acronym: str) -> None:
     cache_client.delete(_cache_key(acronym.strip().upper()))
 
 
-async def warm_cache() -> int:
+async def load_acronym_cache() -> int:
     """Pre-populate the cache-aside store with every active acronym at startup,
     so first-touch queries after boot are already cache hits rather than DB round-trips.
     Not a substitute for get_expansion()'s per-lookup DB fallback — acronyms added
