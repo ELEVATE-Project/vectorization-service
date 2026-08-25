@@ -18,7 +18,8 @@ logger = logging.getLogger(__name__)
 @router.post("/bulk", response_model=AcronymBulkUploadResponse, dependencies=[Depends(verify_internal_token)])
 async def bulk_upload_acronyms(file: UploadFile = File(...)):
     """Internal-only: upsert acronym -> expansions rows from a CSV upload (spec
-    §7). Columns: acronym, expansions (pipe-separated), description (optional).
+    §7). Columns: acronym, expansions (pipe-separated), description (optional),
+    is_active (optional, "true"/"false" — defaults to active if omitted).
     A bad row is reported in `errors`, not a batch failure — the rest commits.
     """
     raw = await file.read()
@@ -52,15 +53,22 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
 
     # bulk_upsert/refresh_cache/invalidate_cache are all synchronous, blocking
     # Postgres/Redis I/O — run_in_threadpool keeps them off the event loop.
-    created, updated, errors = await run_in_threadpool(bulk_upsert, rows)
+    created, updated, deactivated, errors = await run_in_threadpool(bulk_upsert, rows)
 
-    # Spec §7: commit first (bulk_upsert already did), then refresh the
-    # cache; if the refresh itself fails, invalidate the upserted keys
-    # instead so the next lookup reloads from Postgres rather than serving
-    # stale data.
+    # Spec §7: commit first (bulk_upsert already did), then refresh the cache.
+    # deactivated rows go straight to invalidate_cache (no DB round-trip needed,
+    # bulk_upsert already knows their status) — refresh_cache's own query filters
+    # to is_active=true, so it would silently skip them and leave their old
+    # cached expansion in place. If anything in this block fails, invalidate the
+    # whole batch instead so the next lookup reloads from Postgres rather than
+    # serving stale data.
     if created or updated:
+        active_batch = [a for a in (created + updated) if a not in deactivated]
         try:
-            await run_in_threadpool(refresh_cache, created + updated)
+            if active_batch:
+                await run_in_threadpool(refresh_cache, active_batch)
+            if deactivated:
+                await run_in_threadpool(invalidate_cache, deactivated)
         except Exception as e:
             logger.warning(f"Cache refresh failed after bulk upload, invalidating instead: {e}")
             await run_in_threadpool(invalidate_cache, created + updated)

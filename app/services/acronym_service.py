@@ -13,6 +13,7 @@ from app.constants import (
     ACRONYM_CSV_COLUMN_ACRONYM,
     ACRONYM_CSV_COLUMN_DESCRIPTION,
     ACRONYM_CSV_COLUMN_EXPANSIONS,
+    ACRONYM_CSV_COLUMN_IS_ACTIVE,
 )
 from app.core.clients import cache_client
 from app.core.database import SessionLocal
@@ -238,13 +239,15 @@ def _split_expansions(raw: str) -> List[str]:
 _ACRONYM_MAX_LENGTH = AcronymMapping.__table__.c.acronym.type.length
 
 
-def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
+def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List[dict]]:
     """Validate and upsert a batch of CSV rows (spec §7) in a single
     transaction. A row missing acronym/expansions, or an in-batch duplicate
     (Postgres' ON CONFLICT can't affect the same row twice), is recorded as
     an error and skipped rather than aborting the batch — last occurrence
     wins. Does not touch the cache — the caller owns refresh-vs-invalidate.
-    Returns (created_acronyms, updated_acronyms, errors).
+    Returns (created_acronyms, updated_acronyms, deactivated_acronyms, errors).
+    deactivated_acronyms is a subset of created+updated (whichever rows had
+    is_active=false in this batch), not a separate category.
     """
     errors: List[dict] = []
     valid_by_acronym: dict = {}
@@ -254,12 +257,30 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
         acronym = raw_acronym.upper()
         expansions = _split_expansions(row.get(ACRONYM_CSV_COLUMN_EXPANSIONS) or "")
         description = (row.get(ACRONYM_CSV_COLUMN_DESCRIPTION) or "").strip() or None
+        status = (row.get(ACRONYM_CSV_COLUMN_IS_ACTIVE) or "").strip().lower()
 
         if not acronym or not expansions:
             errors.append({
                 "index": index,
                 "acronym": raw_acronym or None,
                 "reason": "acronym and expansions must be non-empty after trimming whitespace",
+            })
+            continue
+
+        # Optional column — missing/empty defaults to active (backward-compatible
+        # with every CSV that predates this column). Only "true"/"false" are
+        # accepted; anything else is a per-row error rather than a silent guess.
+        if not status:
+            is_active = True
+        elif status == "true":
+            is_active = True
+        elif status == "false":
+            is_active = False
+        else:
+            errors.append({
+                "index": index,
+                "acronym": acronym,
+                "reason": f"is_active must be 'true' or 'false' if present, got {status!r}",
             })
             continue
 
@@ -286,10 +307,11 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
             "index": index,
             "expansions": expansions,
             "description": description,
+            "is_active": is_active,
         }
 
     if not valid_by_acronym:
-        return [], [], errors
+        return [], [], [], errors
 
     acronym_table = sa.table(
         "acronym_mapping",
@@ -316,13 +338,14 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
         }
         created = [a for a in incoming_acronyms if a not in existing]
         updated = [a for a in incoming_acronyms if a in existing]
+        deactivated = [a for a in incoming_acronyms if not valid_by_acronym[a]["is_active"]]
 
         values = [
             {
                 "acronym": acronym,
                 "expansions": v["expansions"],
                 "description": v["description"],
-                "is_active": True,
+                "is_active": v["is_active"],
                 "created_at": now,
                 "updated_at": now,
             }
@@ -346,4 +369,4 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
     finally:
         db.close()
 
-    return created, updated, errors
+    return created, updated, deactivated, errors
