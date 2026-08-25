@@ -263,15 +263,16 @@ class PrioritizedSearchService:
             # content words (e.g. "ministry of education" → "ministry education"). See CLAUDE.md §15.
             query_for_keyword_match = request.query
 
-            # Detection only, not wired into retrieval/ranking yet (that's PR5/PR6 of
-            # the acronym-search rollout) — this computes the mapping and logs it so the
-            # detection module gets exercised on real traffic, but nothing branches on
-            # it, so output is unchanged regardless of ACRONYM_SEARCH_ENABLED.
             acronyms_detected = {}
             if settings.ACRONYM_SEARCH_ENABLED:
                 acronyms_detected = detect_acronyms(query_for_keyword_match)
                 if acronyms_detected:
                     logger.info(f"Acronyms detected in query: {list(acronyms_detected.keys())}")
+
+            # Surfaced in the response as acronym_info so callers can see what was
+            # detected/expanded, independent of ACRONYM_SEARCH_ENABLED — null when
+            # nothing was detected (or the flag is off).
+            acronym_info = {"detected": True, "mapping": acronyms_detected} if acronyms_detected else None
 
             # Acronym path: 2 separate dense query strings (never concatenated —
             # embedding "PTM meeting" + "Parent Teacher Meeting" together would
@@ -386,9 +387,10 @@ class PrioritizedSearchService:
                         "priority_order": self.priority_order,
                         "filters_applied": filter_conditions is not None,
                         "filter_mode": "detail_filter_score" if use_detail_filter else "filter_score"
-                    }
+                    },
+                    acronym_info=acronym_info
                 )
-            
+
             # Pass detail_filter_score if using field-level filtering.
             # scoring_context captures the per-query normalization reference (min/max/pool)
             # computed inside _rank_results; surfaced under search_config.scoring_context
@@ -563,7 +565,8 @@ class PrioritizedSearchService:
                 total_results=total_results,
                 top_k=top_k,
                 results=result_items,
-                search_config=search_config
+                search_config=search_config,
+                acronym_info=acronym_info
             )
             
         except ValueError as e:
