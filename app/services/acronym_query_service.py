@@ -1,6 +1,8 @@
 import re
 from typing import Dict, List
 
+from spacy.lang.en.stop_words import STOP_WORDS
+
 from app.services.acronym_service import get_expansions_batch
 
 # Letters only — strips internal dots ("D.I.E.T." -> "DIET"), digits, and any
@@ -30,6 +32,12 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
       - A lowercase/mixed-case word inside a longer, multi-word query is skipped.
         This is the precision guard: "the diet chart for kids" must not match
         the DIET acronym just because one word happens to collide with it.
+      - Within a multi-word query, an uppercase token that's also an English
+        stopword (THE, AND, ON, ...) is dropped before the lookup — cuts
+        Redis/DB load from all-caps filler words. Only applied when
+        is_single_word_query is False: a single-word query bypasses this, since
+        a bare "BE" is exactly the kind of word-shaped acronym users are meant
+        to be able to look up (see acronym_service collision handling).
     """
     if not query or not query.strip():
         return {}
@@ -49,6 +57,9 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
             continue
 
         if not (normalized.isupper() or is_single_word_query):
+            continue
+
+        if not is_single_word_query and normalized.lower() in STOP_WORDS:
             continue
 
         candidate = normalized.upper()
