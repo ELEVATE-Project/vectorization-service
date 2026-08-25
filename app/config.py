@@ -44,23 +44,9 @@ class Settings(BaseSettings):
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
     REDIS_DB: int = int(os.getenv("REDIS_DB", 0))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
-    # redis-py defaults both to None (no timeout at all) — a blackholed connection
-    # (network drops packets silently, unlike a clean "connection refused") would
-    # hang every cache read/write until the OS-level TCP timeout, which can be
-    # minutes. This runs synchronously on the search request path, so an
-    # unresponsive cache would stall search entirely instead of degrading to
-    # Postgres per get_expansions_batch()'s existing except-and-fallback behavior.
-    # Kept small (not a generous few-seconds value): a healthy Redis responds in
-    # low single-digit milliseconds, and get_expansions_batch() makes TWO calls
-    # on the fallback path (a read, then a write-through of the Postgres result)
-    # — each one independently pays this timeout on an outage. Confirmed live
-    # (before batching, when detect_acronyms() called this once per candidate
-    # token instead of once per query): with 3s/5s defaults, a single cache-miss
-    # lookup during a blackholed connection took just over 10s (2 x 5s) before
-    # falling back to Postgres — too slow per token for what should be a
-    # millisecond-scale cache operation. Batching now pays this once per query
-    # instead of once per token, but the timeout still guards against that one
-    # round-trip hanging indefinitely.
+    # Small on purpose: redis-py has no default timeout, and a blackholed
+    # connection (packets silently dropped) would hang cache reads for minutes,
+    # stalling search instead of falling back to Postgres.
     REDIS_SOCKET_CONNECT_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", 1))
     REDIS_SOCKET_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_TIMEOUT", 1))
     REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", 86400))  # 24 hours in seconds
@@ -70,13 +56,9 @@ class Settings(BaseSettings):
     # runs after every upload), so this TTL only bounds staleness for the rare case that
     # invariant doesn't hold — not load-bearing correctness.
     REDIS_NEGATIVE_CACHE_TTL: int = int(os.getenv("REDIS_NEGATIVE_CACHE_TTL", 3600))  # 1 hour
-    # Much shorter than REDIS_NEGATIVE_CACHE_TTL — this covers a DB-error miss
-    # (Postgres unreachable), not a genuine "not an acronym" miss. Confirmed live
-    # without this: every candidate token of every search re-attempts the
-    # (now-bounded-by-POSTGRES_CONNECT_TIMEOUT, but still nonzero-cost) Postgres
-    # connection for the entire outage. But unlike a real miss, a DB outage is
-    # often transient — caching "not found" for the full hour would make real
-    # acronyms silently fail to resolve for up to an hour after Postgres recovers.
+    # Shorter than REDIS_NEGATIVE_CACHE_TTL: this caches a DB-error miss, not a
+    # genuine "not an acronym" miss. DB outages are often transient — caching
+    # "not found" for a full hour would hide real acronyms after Postgres recovers.
     REDIS_DB_ERROR_CACHE_TTL: int = int(os.getenv("REDIS_DB_ERROR_CACHE_TTL", 30))
     REDIS_MAX_CACHE_SIZE: int = int(os.getenv("REDIS_MAX_CACHE_SIZE", 1000))
     DATABASE_URL: str = os.getenv("POSTGRES_DATABASE_URI", "postgresql://anuj:1234@localhost:5432/ai_vector_service")

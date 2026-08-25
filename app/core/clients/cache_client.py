@@ -11,11 +11,15 @@ def set(key: str, value: str, ttl: int) -> None:
     redis_client.setex(key, ttl, value)
 
 
-def delete(key: str) -> None:
-    redis_client.delete(key)
+def delete_many(keys: List[str]) -> None:
+    """Batched delete: DEL takes multiple keys natively, so this is one
+    round-trip for N keys instead of N. Empty list is a no-op."""
+    if not keys:
+        return
+    redis_client.delete(*keys)
 
 
-def mget(keys: List[str]) -> List[Optional[str]]:
+def get_many(keys: List[str]) -> List[Optional[str]]:
     """Batched read: one round-trip for N keys instead of N. Empty list is a
     no-op — redis-py's MGET requires at least one key argument."""
     if not keys:

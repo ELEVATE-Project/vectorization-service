@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from typing import List, Dict, Optional, Any, Set
 from qdrant_client import models
@@ -10,7 +11,7 @@ from app.core.clients.qdrant import qdrant_client
 from app.core.clients import embedding
 from app.core.clients.embedding import EmbeddingError
 from app.config import settings
-from app.services.acronym_query_service import build_dense_queries, build_sparse_query, detect_acronyms
+from app.services.acronym_query_service import detect_acronyms
 from app.models.api_models import (
     PrioritizedSearchRequest,
     PrioritizedSearchResponse,
@@ -272,14 +273,51 @@ class PrioritizedSearchService:
                 if acronyms_detected:
                     logger.info(f"Acronyms detected in query: {list(acronyms_detected.keys())}")
 
-            # Acronym path: 2 separate dense query strings (never concatenated — see
-            # acronym_query_service.build_dense_queries) + 1 combined sparse OR string.
-            # Non-acronym queries (or nothing detected) fall through unchanged below.
+            # Acronym path: 2 separate dense query strings (never concatenated —
+            # embedding "PTM meeting" + "Parent Teacher Meeting" together would
+            # average two concepts into one point in vector space, close to
+            # neither) + 1 combined sparse OR string. Non-acronym queries (or
+            # nothing detected) fall through unchanged below.
             dense_query_texts = [query_for_embedding]
             sparse_query_text = query_for_embedding
             if acronyms_detected:
-                dense_query_texts = build_dense_queries(query_for_embedding, acronyms_detected)
-                sparse_query_text = build_sparse_query(query_for_keyword_match, acronyms_detected)
+                # Single regex pass over the ORIGINAL text, not sequential
+                # substitutions — looping could re-scan an expansion that itself
+                # contains another acronym (e.g. NFST -> "...for ST" when ST is
+                # also detected), producing garbled, duplicated text.
+                combined_pattern = re.compile(
+                    r"\b(?:" + "|".join(re.escape(a) for a in acronyms_detected) + r")\b",
+                    re.IGNORECASE,
+                )
+
+                def _resolve_acronym(match: re.Match) -> str:
+                    # A callable, not a string replacement — re.sub treats
+                    # backslashes in a string replacement specially, so an
+                    # expansion containing one (e.g. a Windows path) would crash
+                    # or corrupt the text. .upper() maps back to the mapping's
+                    # uppercase key regardless of the matched text's case.
+                    return acronyms_detected[match.group(0).upper()][0]
+
+                substituted = combined_pattern.sub(_resolve_acronym, query_for_embedding)
+                # A case-only diff isn't a real second reading — embeddings are
+                # case-insensitive in practice (cosine sim 1.0) — so only add the
+                # substituted variant as a second dense query when it's a genuine
+                # semantic change (spec §9: first expansion only, for one
+                # coherent embeddable sentence).
+                if substituted.lower() != query_for_embedding.lower():
+                    dense_query_texts = [query_for_embedding, substituted]
+
+                # Sparse: append every expansion word (not just the first, unlike
+                # the dense pick above) — more ways to match, no dilution risk
+                # for a bag-of-words BM25 search. Plain word-appending, not
+                # boolean/phrase syntax — the BM25 tokenizer has no notion of
+                # OR or quoted phrases.
+                expansion_words = " ".join(
+                    expansion
+                    for expansions in acronyms_detected.values()
+                    for expansion in expansions
+                )
+                sparse_query_text = f"{query_for_keyword_match} {expansion_words}"
 
             logger.info(f"Generating {len(dense_query_texts)} dense embedding(s) for query: {dense_query_texts}")
             # embed_query rejects empty/whitespace input and validates the produced
@@ -308,7 +346,7 @@ class PrioritizedSearchService:
             
             logger.info("========== EXECUTING SEARCH ==========" )
             # query_embeddings is a single-element list unless acronym detection
-            # produced a substituted variant (see build_dense_queries) — either way,
+            # produced a substituted variant (built above) — either way,
             # _hybrid_batch_search/_parallel_batch_search fan out per field per
             # embedding and merge same-field hits with max(), which is a no-op for
             # the single-embedding case.
@@ -1017,22 +1055,12 @@ class PrioritizedSearchService:
                 norm_sparse = self._min_max_normalize(raw_sparse)
                 dense_w = settings.HYBRID_DENSE_WEIGHT
                 sparse_w = settings.HYBRID_SPARSE_WEIGHT
-                # Acronym-scoped dense/sparse reweighting (not yet a dedicated setting):
-                # min-max normalizes dense/sparse independently, so a weak pool's
-                # best dense score still reaches 1.0 and gets the full dense_w regardless
-                # of absolute magnitude. This is especially visible on acronym queries —
-                # a bare 3-4 letter acronym or its expansion is a poor dense-embedding
-                # input, so a spurious dense match can outrank a document with a genuine
-                # literal/BM25 hit. When is_acronym_query is True, a point with a genuine
-                # sparse hit (raw_sparse > 0) gets scored both the normal way and with
-                # the blend flipped to trust sparse more — keeping whichever is higher.
-                # Taking the max (never just the flipped value) guarantees a real
-                # keyword match can only raise a point's score, never lower it: an
-                # earlier version always flipped, which could cut a strong dense score
-                # to 30% weight and land below a zero-evidence point that kept its full
-                # 70%, i.e. penalize a document for having MORE confirming evidence.
-                # Non-acronym queries (is_acronym_query=False, the default) keep the
-                # original fixed blend for every point, unchanged.
+                # Acronym-scoped reweighting: min-max normalizes dense/sparse
+                # independently, so a weak dense pool can still hit 1.0 and outrank
+                # a genuine keyword match — especially for short acronym queries.
+                # When is_acronym_query and a point has a real sparse hit, score it
+                # both ways and take the max (never just the flipped value) — a
+                # keyword match can only raise a score, never lower it.
                 for point_id in raw_dense:
                     nd = norm_dense.get(point_id, 0.0)
                     ns = norm_sparse.get(point_id, 0.0)

@@ -20,15 +20,9 @@ redis_client = redis.Redis(
     # exception acronym_service.get_expansions_batch()'s try/except is built to catch.
     socket_connect_timeout=settings.REDIS_SOCKET_CONNECT_TIMEOUT,
     socket_timeout=settings.REDIS_SOCKET_TIMEOUT,
-    # redis-py's own default retry policy is 10 attempts with exponential
-    # backoff on ConnectionError/TimeoutError — confirmed empirically that
-    # combined with the timeouts above, a single blackholed lookup could
-    # still take the better part of a minute before finally raising. That
-    # defeats the point: acronym_service.get_expansions_batch() already has its
-    # own except/fallback-to-Postgres logic, so the client itself should
-    # fail on the FIRST timeout and let that fallback run, not retry
-    # internally for many seconds first. (retry_on_timeout/retry_on_error
-    # are deprecated in this redis-py version — zero retries here already
-    # covers both ConnectionError and TimeoutError.)
+    # Zero retries: redis-py's default (10 attempts, backoff) can take most of
+    # a minute to raise on a blackholed connection. get_expansions_batch()
+    # already falls back to Postgres on the first error, so retrying here
+    # would only delay that fallback.
     retry=Retry(NoBackoff(), 0),
 )

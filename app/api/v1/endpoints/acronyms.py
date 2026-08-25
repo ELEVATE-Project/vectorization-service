@@ -15,19 +15,11 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _invalidate_all(acronyms):
-    for acronym in acronyms:
-        invalidate_cache(acronym)
-
-
 @router.post("/bulk", response_model=AcronymBulkUploadResponse, dependencies=[Depends(verify_internal_token)])
 async def bulk_upload_acronyms(file: UploadFile = File(...)):
-    """Internal-only: upsert a batch of acronym -> expansions rows from a CSV
-    upload (spec §7). Columns: acronym, expansions (pipe-separated if more
-    than one), description (optional).
-
-    One invalid or duplicate row doesn't fail the batch — it's reported in
-    `errors` while the rest of the batch still commits.
+    """Internal-only: upsert acronym -> expansions rows from a CSV upload (spec
+    §7). Columns: acronym, expansions (pipe-separated), description (optional).
+    A bad row is reported in `errors`, not a batch failure — the rest commits.
     """
     raw = await file.read()
     max_bytes = settings.ACRONYM_BULK_UPLOAD_MAX_SIZE_MB * 1024 * 1024
@@ -71,7 +63,7 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
             await run_in_threadpool(refresh_cache, created + updated)
         except Exception as e:
             logger.warning(f"Cache refresh failed after bulk upload, invalidating instead: {e}")
-            await run_in_threadpool(_invalidate_all, created + updated)
+            await run_in_threadpool(invalidate_cache, created + updated)
 
     logger.info(
         f"Acronym bulk upload: {len(created)} created, {len(updated)} updated, "

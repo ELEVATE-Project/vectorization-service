@@ -25,34 +25,35 @@ def _cache_key(acronym: str) -> str:
     return f"{ACRONYM_CACHE_KEY_PREFIX}:{acronym}"
 
 
+def _valid_expansions(expansions) -> bool:
+    """A DB/cache expansions value must be a non-empty list of non-empty
+    strings. Guards against a malformed row (null, wrong type, empty
+    strings) written outside bulk_upsert's validation — e.g. raw SQL —
+    from being cached and crashing the acronym query-building code in
+    prioritized_search_service.search() downstream."""
+    return isinstance(expansions, list) and bool(expansions) and all(
+        isinstance(e, str) and e.strip() for e in expansions
+    )
+
+
 def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
     """Cache-aside lookup for a list of acronyms in one call — Redis hits
-    return immediately, whatever's still missing falls back to Postgres and
-    gets written through to the cache for next time. cache_client only
-    stores strings (Redis primitive), so expansions are JSON-encoded on
-    write and decoded on read here rather than in cache_client itself,
-    which stays acronym-agnostic.
+    return immediately, misses fall back to Postgres and write through to
+    the cache.
 
-    Every Redis read, the Postgres fallback, and every Redis write happens
-    as a single batched round-trip covering the whole input list, not one
-    round-trip per acronym — detect_acronyms() calls this once per query
-    with every candidate token, instead of looping a per-acronym lookup.
-    That also collapses N independent connection-timeout exposures into
-    one: per REDIS_SOCKET_CONNECT_TIMEOUT's docstring in config.py, a
-    blackholed Redis during an outage previously cost each candidate token
-    its own timeout (confirmed empirically at 2x5s per token) — one
-    batched read pays that timeout once for the whole query.
+    Batched, not one round-trip per acronym: detect_acronyms() calls this
+    once per query with every candidate token, which also collapses N
+    independent connection-timeout exposures into one on a Redis outage.
 
-    Input is deduped internally (case-normalized), so callers don't need
-    to pre-dedupe. Acronyms not found (or with empty expansions) are
-    simply absent from the returned dict."""
+    Input is deduped internally; acronyms not found (or empty) are simply
+    absent from the returned dict."""
     normalized = list(dict.fromkeys(a.strip().upper() for a in acronyms if a and a.strip()))
     if not normalized:
         return {}
 
     keys = [_cache_key(a) for a in normalized]
     try:
-        cached_values = cache_client.mget(keys)
+        cached_values = cache_client.get_many(keys)
     except Exception as e:
         logger.warning(
             f"Acronym batch cache read failed for {len(normalized)} acronym(s), "
@@ -101,7 +102,15 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
     finally:
         db.close()
 
-    found_by_acronym = {mapping.acronym: mapping.expansions for mapping in mappings}
+    found_by_acronym = {}
+    for mapping in mappings:
+        if _valid_expansions(mapping.expansions):
+            found_by_acronym[mapping.acronym] = mapping.expansions
+        else:
+            logger.warning(
+                f"Acronym {mapping.acronym!r} has malformed expansions in DB "
+                f"({mapping.expansions!r}), treating as not found"
+            )
     cache_writes: Dict[str, Tuple[str, int]] = {}
     for acronym in missing:
         if acronym in found_by_acronym:
@@ -124,20 +133,22 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
     return result
 
 
-def invalidate_cache(acronym: str) -> None:
-    """Drop a single acronym's cached entry. Call after any write to that row
-    (e.g. the bulk upload endpoint) so stale expansions aren't served until TTL expiry.
+def invalidate_cache(acronyms: List[str]) -> None:
+    """Drop cached entries for the given acronyms in one batched round-trip.
+    Call after any write to those rows so stale expansions aren't served
+    until TTL expiry.
 
     Swallows Redis errors (logged) rather than raising — this is already the
     degraded-mode fallback when the cache is having problems (e.g. the bulk
-    upload endpoint calls this when load_acronym_cache() itself failed), so letting
-    it raise would turn an already-committed, successful write into a 500
-    for the caller."""
-    acronym = acronym.strip().upper()
+    upload endpoint calls this when refresh_cache() itself failed), so letting
+    it raise would turn an already-committed, successful write into a 500."""
+    if not acronyms:
+        return
+    keys = [_cache_key(a.strip().upper()) for a in acronyms]
     try:
-        cache_client.delete(_cache_key(acronym))
+        cache_client.delete_many(keys)
     except Exception as e:
-        logger.warning(f"Acronym cache invalidation failed for {acronym!r}: {e}")
+        logger.warning(f"Acronym cache invalidation failed for {len(keys)} key(s): {e}")
 
 
 def refresh_cache(acronyms: List[str]) -> None:
@@ -161,34 +172,47 @@ def refresh_cache(acronyms: List[str]) -> None:
         db.close()
 
     for mapping in mappings:
+        if not _valid_expansions(mapping.expansions):
+            logger.warning(
+                f"Skipping cache refresh for {mapping.acronym!r}: malformed "
+                f"expansions ({mapping.expansions!r})"
+            )
+            continue
         cache_client.set(_cache_key(mapping.acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
 
 
 def load_acronym_cache() -> int:
-    """Pre-populate the cache-aside store with every active acronym at startup,
-    so first-touch queries after boot are already cache hits rather than DB round-trips.
-    Not a substitute for get_expansions_batch()'s per-lookup DB fallback —
-    acronyms added after startup, or evicted via TTL, are still served by
-    that path.
+    """Pre-populate the cache-aside store with every active acronym at
+    startup, so first-touch queries after boot are already cache hits.
+    Not a substitute for get_expansions_batch()'s DB fallback — acronyms
+    added after startup, or evicted via TTL, are still served by that path.
 
-    Deliberately synchronous, not async def — every operation inside is a
-    blocking call (SQLAlchemy's sync Session, cache_client's sync Redis
-    client), so there was never any actual async work here. Async callers
-    must run this via starlette.concurrency.run_in_threadpool rather than
-    awaiting it directly, or these ~600 sequential blocking Redis round-trips
-    stall the whole event loop — every other in-flight request — for the
-    duration."""
+    Deliberately synchronous — every call inside is blocking, so async
+    callers must run this via run_in_threadpool or the ~600 sequential
+    Redis round-trips stall the whole event loop."""
     db = SessionLocal()
     try:
         mappings = db.query(AcronymMapping).filter(AcronymMapping.is_active.is_(True)).all()
     finally:
         db.close()
 
+    warmed = 0
     for mapping in mappings:
-        cache_client.set(_cache_key(mapping.acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
+        if not _valid_expansions(mapping.expansions):
+            logger.warning(
+                f"Skipping cache warm for {mapping.acronym!r}: malformed "
+                f"expansions ({mapping.expansions!r})"
+            )
+            continue
+        try:
+            cache_client.set(_cache_key(mapping.acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
+        except Exception as e:
+            logger.warning(f"Cache warm failed for {mapping.acronym!r}, skipping: {e}")
+            continue
+        warmed += 1
 
-    logger.info(f"Acronym cache warmed: {len(mappings)} active acronym(s)")
-    return len(mappings)
+    logger.info(f"Acronym cache warmed: {warmed} active acronym(s)")
+    return warmed
 
 
 def _split_expansions(raw: str) -> List[str]:
@@ -215,18 +239,12 @@ _ACRONYM_MAX_LENGTH = AcronymMapping.__table__.c.acronym.type.length
 
 
 def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[dict]]:
-    """Validate and upsert a batch of CSV rows (spec §7) in a single transaction.
-
-    Each row is a dict with 'acronym', 'expansions' (pipe-separated string),
-    and optionally 'description'. A row missing acronym/expansions after
-    trimming, or an in-batch duplicate acronym (Postgres' ON CONFLICT can't
-    affect the same row twice in one statement), is recorded as an error and
-    skipped rather than aborting the rest of the batch — last occurrence wins
-    for a repeated acronym. is_active is always forced true on upsert, per
-    spec (the CSV has no is_active column). Does not touch the cache itself —
-    the caller (the endpoint) owns refresh-vs-invalidate per spec's own
-    ordering ("commit, then refresh cache"). Returns
-    (created_acronyms, updated_acronyms, errors).
+    """Validate and upsert a batch of CSV rows (spec §7) in a single
+    transaction. A row missing acronym/expansions, or an in-batch duplicate
+    (Postgres' ON CONFLICT can't affect the same row twice), is recorded as
+    an error and skipped rather than aborting the batch — last occurrence
+    wins. Does not touch the cache — the caller owns refresh-vs-invalidate.
+    Returns (created_acronyms, updated_acronyms, errors).
     """
     errors: List[dict] = []
     valid_by_acronym: dict = {}

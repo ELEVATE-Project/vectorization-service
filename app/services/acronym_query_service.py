@@ -16,28 +16,17 @@ def _normalize_token(raw_token: str) -> str:
 
 
 def detect_acronyms(query: str) -> Dict[str, List[str]]:
-    """Detect acronyms in `query`, returning {acronym: expansions} for every match
-    found in the acronym dictionary (via acronym_service.get_expansions_batch's
-    batched cache-aside lookup — one Redis round-trip and, for whatever's still
-    missing, one Postgres round-trip for every candidate token in the query,
-    instead of one of each per token). Must be called with the case-preserving
-    query (query_for_keyword_match), not a lowercased/preprocessed one — these
-    rules depend on case.
+    """Detect acronyms in `query` via one batched Redis/Postgres lookup covering
+    every candidate token. Must be called with the case-preserving query, not
+    the lowercased/preprocessed one — these rules depend on case.
 
     Case rules:
-      - A fully-uppercase token (letters-only length > 1) is always checked.
-      - If the WHOLE query is a single word, it's checked regardless of case — a
-        user typing just "diet" with no shift key is still plausibly searching
-        for the acronym.
-      - A lowercase/mixed-case word inside a longer, multi-word query is skipped.
-        This is the precision guard: "the diet chart for kids" must not match
-        the DIET acronym just because one word happens to collide with it.
-      - Within a multi-word query, an uppercase token that's also an English
-        stopword (THE, AND, ON, ...) is dropped before the lookup — cuts
-        Redis/DB load from all-caps filler words. Only applied when
-        is_single_word_query is False: a single-word query bypasses this, since
-        a bare "BE" is exactly the kind of word-shaped acronym users are meant
-        to be able to look up (see acronym_service collision handling).
+      - A fully-uppercase token (length > 1) is always checked.
+      - A single-word query is checked regardless of case.
+      - A lowercase/mixed-case word inside a multi-word query is skipped (e.g.
+        "diet" in "the diet chart" must not match the DIET acronym).
+      - An uppercase stopword (THE, AND, ON) in a multi-word query is dropped
+        before lookup; single-word queries are exempt so "BE" stays searchable.
     """
     if not query or not query.strip():
         return {}
@@ -76,96 +65,11 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
     # expansions value — the expansions column defaults to '[]'::jsonb and
     # only bulk_upsert() validates non-empty before insert, so a row written
     # via any other path (raw SQL, a future writer) could still have
-    # expansions=[]. Guarding here closes both downstream call sites
-    # (build_dense_queries' expansions[0], build_sparse_query's OR-join) at
-    # once — neither ever sees an empty-list acronym in its mapping.
+    # expansions=[]. Guarding here closes both downstream call sites in
+    # search() (the acronym-substitution regex, the sparse OR-join) at once —
+    # neither ever sees an empty-list acronym in its mapping.
     return {
         acronym: expansions
         for acronym, expansions in expansions_by_acronym.items()
         if expansions
     }
-
-
-def build_dense_queries(query_for_embedding: str, mapping: Dict[str, List[str]]) -> List[str]:
-    """Build the dense query variant(s) for an acronym-detected query: the original
-    (embedding-ready) query, plus — only if substitution actually changes anything —
-    a fully-substituted version with every detected acronym replaced by its primary
-    (first) expansion, per spec §9. Only the first expansion is used here even when
-    an acronym has several — the point of this variant is one coherent embeddable
-    sentence, not every possible reading of the query.
-
-    Never concatenated into one blended string: embedding "PTM meeting" + "Parent
-    Teacher Meeting" together would average two concepts into one point in vector
-    space, close to neither. Two separate query vectors instead (see
-    ACRONYM_SEARCH_PLAN.md's Technical Design Notes).
-    """
-    if not mapping:
-        return [query_for_embedding]
-
-    # Single pass over the ORIGINAL text, not a loop of sequential
-    # substitutions — looping would let one acronym's expansion text (which
-    # can itself contain another detected acronym as a plain word, e.g.
-    # NFST -> "National Fellowship for ST" when ST is *also* detected in the
-    # same query) get re-scanned and re-substituted by a later iteration,
-    # producing garbled/duplicated text ("...Scheduled Tribes Scheduled
-    # Tribes..." for "NFST ST fellowship" — confirmed empirically). One
-    # alternation regex resolves every match against the ORIGINAL string in
-    # a single left-to-right pass, so text inserted by resolving one match
-    # is never re-scanned within this call.
-    combined_pattern = re.compile(
-        r"\b(?:" + "|".join(re.escape(acronym) for acronym in mapping) + r")\b",
-        re.IGNORECASE,
-    )
-
-    def _resolve(match: re.Match) -> str:
-        # Function replacement, not a string one — re.sub interprets
-        # backslashes in a string replacement specially (\1, \g<name>, \t,
-        # ...), so an expansion containing a literal backslash (e.g. a
-        # pasted Windows path) would crash with re.error or silently
-        # corrupt the text. A callable's return value is substituted
-        # literally, with no escape processing. .upper() to resolve back to
-        # the mapping's key regardless of the matched text's original case
-        # (matching is case-insensitive; mapping keys are always uppercase).
-        return mapping[match.group(0).upper()][0]
-
-    substituted = combined_pattern.sub(_resolve, query_for_embedding)
-
-    # Case-insensitive: query_for_embedding is always lowercased upstream
-    # (preprocess_query), but expansions keep their stored casing (e.g.
-    # BLUETOOTH -> "Bluetooth"). A case-only difference is not a real second
-    # reading of the query — confirmed empirically, the embedding model is
-    # case-insensitive in practice (cosine similarity 1.0 between
-    # "bluetooth" and "Bluetooth") — so returning it as a second variant
-    # doubles the per-field Qdrant fan-out (search()'s use_acronym_multi_query
-    # gate) for zero benefit. ~49 real seeded acronyms hit this exact case
-    # (BLUETOOTH, DIGILOCKER, VEDANTU, UDAAN, ...).
-    if substituted.lower() == query_for_embedding.lower():
-        return [query_for_embedding]
-    return [query_for_embedding, substituted]
-
-
-def build_sparse_query(query_for_keyword_match: str, mapping: Dict[str, List[str]]) -> str:
-    """Build the combined sparse (BM25) query string: original query text plus
-    the words of every detected acronym's expansion(s) — all of them, not just
-    the first, unlike build_dense_queries. Appending every known phrasing's
-    words only adds more ways to match, with no dilution risk (the opposite
-    rule from build_dense_queries, which must pick one expansion to stay a
-    coherent embedding).
-
-    Plain word-appending, NOT structured boolean/phrase syntax: the sparse
-    encoder (fastembed's Qdrant/bm25) is a bag-of-words tokenizer with no
-    notion of `OR` or quoted phrases — confirmed empirically, a wrapped
-    query like `PTM OR "Parent Teacher Meeting"` and the plain
-    `PTM Parent Teacher Meeting` produce byte-identical token sets ("or" is
-    stripped as a stopword either way). An earlier version of this docstring
-    claimed boolean syntax worked here; it doesn't, and the OR/quote
-    wrapping was purely decorative — this appends the words directly instead
-    of writing text that looks structured but isn't.
-    """
-    if not mapping:
-        return query_for_keyword_match
-
-    expansion_words = " ".join(
-        expansion for expansions in mapping.values() for expansion in expansions
-    )
-    return f"{query_for_keyword_match} {expansion_words}"
