@@ -21,6 +21,19 @@ from app.models.api_models import (
 logger = logging.getLogger(__name__)
 
 
+def _match_any_condition(key: str, values: Optional[List[str]]) -> Optional[models.FieldCondition]:
+    """One MatchAny FieldCondition over the non-blank values, or None.
+
+    Generic over the payload key, so any exact-match field can be filtered the
+    same way. Values are stripped and blanks dropped, matching the positive
+    filter blocks in _build_filters.
+    """
+    valid = [value.strip() for value in (values or []) if value and value.strip()]
+    if not valid:
+        return None
+    return models.FieldCondition(key=key, match=models.MatchAny(any=valid))
+
+
 class PrioritizedSearchService:
     """
     Service for prioritized multi-field vector search with intelligent filtering.
@@ -76,6 +89,10 @@ class PrioritizedSearchService:
                 logger.info(f"  - Resource Types: {request.resource_type}")
             if request.file_type:
                 logger.info(f"  - File Types: {request.file_type}")
+            if request.exclude_organizations:
+                logger.info(f"  - Excluded Organizations: {request.exclude_organizations}")
+            if request.exclude_file_type:
+                logger.info(f"  - Excluded File Types: {request.exclude_file_type}")
         else:
             logger.info("No filters applied")
 
@@ -340,7 +357,10 @@ class PrioritizedSearchService:
                 categories=request.categories,
                 organizations=request.organizations,
                 resource_types=request.resource_type,
-                file_types=request.file_type
+                file_types=request.file_type,
+                exclude_organizations=request.exclude_organizations,
+                exclude_file_types=request.exclude_file_type,
+                any_of=request.any_of
             )
 
             self._log_search_request(request, top_k, filter_conditions)
@@ -826,7 +846,10 @@ class PrioritizedSearchService:
         categories: Optional[List[str]] = None,
         organizations: Optional[List[str]] = None,
         resource_types: Optional[List[str]] = None,
-        file_types: Optional[List[str]] = None
+        file_types: Optional[List[str]] = None,
+        exclude_organizations: Optional[List[str]] = None,
+        exclude_file_types: Optional[List[str]] = None,
+        any_of: Optional[List[Any]] = None
     ) -> Optional[models.Filter]:
         """
         Build Qdrant filter conditions with intelligent AND/OR logic.
@@ -834,7 +857,13 @@ class PrioritizedSearchService:
         Filter Logic:
         - Within each filter type: OR condition
         - Between filter types: AND condition
-        
+        - exclude_* values become a must_not clause: matching any of them drops
+          the document. A request may carry exclusions and no positive filters.
+        - any_of holds FilterBlocks that are OR'ed with each other and AND'ed
+          with everything above: keep if TOP-LEVEL AND (block0 OR block1 OR ...).
+          The arguments above keep their meaning either way and are never
+          ignored when any_of is present.
+
         Field Mappings:
         - categories → tags (list)
         - organizations → metadata.company (string)
@@ -850,11 +879,15 @@ class PrioritizedSearchService:
             organizations: Company names to filter by
             resource_types: Key entities to filter by (uses text matching)
             file_types: Document types to filter by
-            
+            exclude_organizations: Company names to exclude (must_not)
+            exclude_file_types: Document types to exclude (must_not)
+            any_of: FilterBlocks to OR together and AND with the filters above
+
         Returns:
             Qdrant Filter object or None if no filters provided
         """
         must_conditions = []
+        must_not_conditions = []
         filter_summary = []
         
         # Categories filter (tags field)
@@ -898,12 +931,53 @@ class PrioritizedSearchService:
             must_conditions.append(condition)
             filter_summary.append(f"file_types: ({' OR '.join(valid_file_types)})")
             logger.info(f"Filter - file_types: {valid_file_types}")
-        
-        if must_conditions:
-            logger.info(f"Total filters: {len(must_conditions)} (AND logic between types)")
+
+        # Exclusions (must_not). Matching any listed value drops the document.
+        for label, key, values in (
+            ("organizations", "metadata.company", exclude_organizations),
+            ("file_types", "metadata.type", exclude_file_types),
+        ):
+            condition = _match_any_condition(key, values)
+            if condition is None:
+                continue
+            must_not_conditions.append(condition)
+            filter_summary.append(f"NOT {label}: ({' OR '.join(condition.match.any)})")
+            logger.info(f"Filter - exclude_{label}: {condition.match.any}")
+
+        # Alternatives (should). Each block is itself a filter block, so it is
+        # built by this same function — the branch is compiled by the identical
+        # code that compiles a flat request, and each recursive call logs its own
+        # per-field lines. Depth is exactly one: FilterBlock forbids extra fields,
+        # so a block cannot carry its own any_of and the recursion cannot go deeper.
+        if any_of:
+            logger.info(f"Filter - any_of: {len(any_of)} alternatives")
+            branch_filters = []
+            for block in any_of:
+                branch = self._build_filters(
+                    categories=block.categories,
+                    organizations=block.organizations,
+                    resource_types=block.resource_type,
+                    file_types=block.file_type,
+                    exclude_organizations=block.exclude_organizations,
+                    exclude_file_types=block.exclude_file_type,
+                )
+                if branch is not None:
+                    branch_filters.append(branch)
+            if branch_filters:
+                must_conditions.append(models.Filter(should=branch_filters))
+                filter_summary.append(f"ANY OF ({len(branch_filters)} alternatives)")
+
+        if must_conditions or must_not_conditions:
+            logger.info(
+                f"Total filters: {len(must_conditions)} must, "
+                f"{len(must_not_conditions)} must_not (AND logic between types)"
+            )
             logger.info(f"Filter summary: {' AND '.join(filter_summary)}")
-            return models.Filter(must=must_conditions)
-        
+            return models.Filter(
+                must=must_conditions or None,
+                must_not=must_not_conditions or None,
+            )
+
         logger.info("No filters applied")
         return None
     
@@ -1340,9 +1414,13 @@ class PrioritizedSearchService:
 
         # Combine with any existing hard filters (org / category / etc.) — the
         # hard filters stay required (must), while at least one query text has
-        # to match (nested should).
-        if filter_conditions and filter_conditions.must:
-            combined_filter = models.Filter(must=list(filter_conditions.must) + [text_filter])
+        # to match (nested should). must_not has to carry through too, or this
+        # scroll re-admits documents the caller asked to exclude.
+        if filter_conditions:
+            combined_filter = models.Filter(
+                must=list(filter_conditions.must or []) + [text_filter],
+                must_not=list(filter_conditions.must_not or []) or None,
+            )
         else:
             combined_filter = text_filter
 
@@ -1643,7 +1721,10 @@ class PrioritizedSearchService:
                 categories=request.categories,
                 organizations=request.organizations,
                 resource_types=request.resource_type,
-                file_types=request.file_type
+                file_types=request.file_type,
+                exclude_organizations=request.exclude_organizations,
+                exclude_file_types=request.exclude_file_type,
+                any_of=request.any_of
             )
             
             if filter_conditions:

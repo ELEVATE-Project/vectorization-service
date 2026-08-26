@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Optional, List, Dict, Any, Literal
 from app.config import settings
 
@@ -53,6 +53,47 @@ class DetailFilterScore(BaseModel):
     summary: float = Field(default=0.14, ge=0.0, le=1.0, description="Minimum score threshold for summary field")
     metadata: float = Field(default=0.09, ge=0.0, le=1.0, description="Minimum score threshold for metadata field")
 
+class FilterBlock(BaseModel):
+    """
+    One alternative inside ``any_of`` — the same filter fields as the request.
+
+    A block is read exactly like the request's own flat filter fields: OR within
+    a field's list, AND between fields, ``exclude_*`` dropping matches. What
+    differs is only how blocks combine with each other — see
+    PrioritizedSearchRequest.any_of.
+
+    extra="forbid" so a misspelled field is a 422 instead of a silently ignored
+    filter. That is also what keeps blocks un-nestable: a block carrying its own
+    "any_of" is rejected.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    categories: Optional[List[str]] = Field(default=None, description="Tag values (searches 'tags')")
+    organizations: Optional[List[str]] = Field(default=None, description="Company names (searches 'metadata.company')")
+    resource_type: Optional[List[str]] = Field(default=None, description="Key entities (searches 'metadata.DOCUMENT_TYPE')")
+    file_type: Optional[List[str]] = Field(default=None, description="Document types (searches 'metadata.type')")
+    exclude_organizations: Optional[List[str]] = Field(default=None, description="Company names to exclude (must_not)")
+    exclude_file_type: Optional[List[str]] = Field(default=None, description="Document types to exclude (must_not)")
+
+    @model_validator(mode="after")
+    def _reject_empty_block(self):
+        """An empty block matches every document, which would disable the whole
+        any_of without any sign that it happened. Say so instead of guessing."""
+        has_value = any(
+            value and any(str(item).strip() for item in value)
+            for value in (
+                self.categories, self.organizations, self.resource_type,
+                self.file_type, self.exclude_organizations, self.exclude_file_type,
+            )
+        )
+        if not has_value:
+            raise ValueError(
+                "an any_of alternative needs at least one filter value; "
+                "an empty alternative matches every document"
+            )
+        return self
+
+
 class PrioritizedSearchRequest(BaseModel):
     query: Optional[str] = Field(default=None, description="Search query text (optional - if not provided, returns all documents with unique source_id)")
     top_k: int = Field(default=1000000, description="Number of top results to return")
@@ -83,6 +124,27 @@ class PrioritizedSearchRequest(BaseModel):
         default=None,
         description="Optional list of document types to filter (searches in 'metadata.type' field, OR condition)"
     )
+    exclude_organizations: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of company names to exclude (must_not on 'metadata.company'). "
+                    "A document matching any listed value is dropped."
+    )
+    exclude_file_type: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of document types to exclude (must_not on 'metadata.type'). "
+                    "A document matching any listed value is dropped."
+    )
+    any_of: Optional[List[FilterBlock]] = Field(
+        default=None,
+        description="Optional list of alternatives, at least one of which must match "
+                    "(OR between the entries). The result is AND'ed with the filter "
+                    "fields above, which keep their meaning and are never ignored: "
+                    "keep if TOP-LEVEL AND (any_of[0] OR any_of[1] OR ...). "
+                    "Use it only for an OR that joins two different fields, e.g. "
+                    "'PDFs from shikshalokam, or DOCX from csf'. An OR between values "
+                    "of one field is just a longer list on that field, and an exclusion "
+                    "is exclude_organizations/exclude_file_type — neither needs any_of."
+    )
     search_mode: Literal["hybrid", "semantic"] = Field(
         default="hybrid",
         description="Search mode: 'hybrid' (semantic + title/summary boost) or "
@@ -97,6 +159,22 @@ class PrioritizedSearchRequest(BaseModel):
                     "env setting; a request may override it per call. Off by default to keep "
                     "responses lean."
     )
+
+    @field_validator("any_of")
+    @classmethod
+    def _reject_lone_alternative(cls, value):
+        """
+        A list of one alternative is not a choice — it is an AND, and the
+        top-level filter fields already express that. Rejecting it keeps exactly
+        one way to write any given condition, so two payloads that look
+        different never mean the same search.
+        """
+        if value is not None and len(value) < 2:
+            raise ValueError(
+                "any_of needs at least 2 alternatives; for a single condition "
+                "use the top-level filter fields"
+            )
+        return value
 
 class SearchResultItem(BaseModel):
     id: str

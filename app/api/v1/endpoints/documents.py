@@ -195,6 +195,7 @@ async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSe
     - **Multi-field scoring**: Combines scores from all fields with configured weights
     - **Dual filtering modes**: Choose between field-level or weighted score filtering
     - **Optional filters**: Filter by categories, organizations, resource types, and file types
+    - **Exclusions**: exclude_organizations / exclude_file_type drop matching documents (must_not)
     - **Top-K results**: Get top N recommendations
     - **Unique source results**: Returns only the highest scoring document per source_id
     - **Unique source mode**: When query is empty, returns one document per unique source_id
@@ -210,6 +211,11 @@ async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSe
             - organizations: Optional list of company names to filter (searches in 'metadata.company' field, OR condition)
             - resource_type: Optional list of document types to filter (searches in 'metadata.DOCUMENT_TYPE' field, OR condition)
             - file_type: Optional list of document types to filter (searches in 'metadata.type' field, OR condition)
+            - exclude_organizations: Optional list of company names to exclude (must_not on 'metadata.company').
+                                     A document matching any listed value is dropped. Combines with the
+                                     positive filters as AND, and may be sent without any of them.
+            - exclude_file_type: Optional list of document types to exclude (must_not on 'metadata.type').
+                                 Same semantics as exclude_organizations.
             - include_scoring_debug: When true, each result includes the hybrid fusion breakdown
                                      (keyword_score, rrf_score, dense_rank, sparse_rank). Off by default.
 
@@ -290,6 +296,7 @@ async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSe
     
     Note: Search configuration (priority order and weights) is set in app/config.py
     """
+    logger.info(f"[/documents/search] request body: {request.model_dump_json()}")
     return prioritized_search_service.search(request)
 
 
