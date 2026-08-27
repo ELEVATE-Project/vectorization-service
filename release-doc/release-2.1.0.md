@@ -1,4 +1,4 @@
-# Release 2.1.0 — Acronym-Aware Search
+# Release 2.1.0 — Acronym-Aware Search & Advanced Search Filtering
 
 **Service:** vectorization-service
 
@@ -10,6 +10,7 @@
 
 - [What's New](#whats-new)
 - [Acronym Search Architecture](#acronym-search-architecture)
+- [Advanced Search Filtering](#advanced-search-filtering)
 - [Dependencies](#dependencies)
 - [Deployment](#deployment)
 - [Rollback](#rollback)
@@ -23,6 +24,9 @@
 - **Bulk upload endpoint** — `POST /api/acronyms/bulk`, internal-only (`X-Internal-Token` header), CSV upload to create/update/**enable or disable** acronyms in batch. See [CSV format](#bulk-upload-csv-format) below.
 - **Stopword filtering on the detection path** — a multi-word query's all-caps filler tokens (`THE`, `AND`, `ON`, …) are dropped before the Redis/DB lookup, cutting wasted round-trips. Reuses spaCy's built-in stopword list — no new dependency, no extra model download.
 - **`acronym_info` in the search response** — when an acronym is detected, the response now includes `{"detected": true, "mapping": {"SSC": ["Staff Selection Commission", "Sainik School Society"]}}`; `null` when nothing was detected.
+- **Exclusion filters** — `exclude_organizations` / `exclude_file_type` on `POST /documents/search` drop any document matching the listed values (Qdrant `must_not`), AND'ed with the existing positive filters. Unrelated to acronym search — merged in from the same `release-2.1.0` branch via PR #8.
+- **`any_of` advanced filtering** — a list of OR'd filter alternatives (`FilterBlock`), AND'ed against the top-level filters, for conditions like "PDFs from shikshalokam, or DOCX from csf" that a single flat filter list can't express. See [Advanced Search Filtering](#advanced-search-filtering).
+- **Request-body logging** — `POST /documents/search` and text-embedding search now log the incoming query/request body.
 
 ---
 
@@ -65,6 +69,42 @@ For an acronym-detected query, a document with a genuine sparse/keyword hit is s
 | `is_active` | No | `true`/`false`, case-insensitive. Missing/empty defaults to active (backward-compatible with CSVs from before this column existed). Any other value is rejected as a per-row error. |
 
 One invalid or duplicate-in-batch row doesn't fail the whole upload — it's reported in the response's `errors` list while the rest of the batch still commits.
+
+</details>
+
+---
+
+## Advanced Search Filtering
+
+<details>
+<summary>Exclusion filters</summary>
+
+`exclude_organizations` / `exclude_file_type` on `PrioritizedSearchRequest` mirror the existing `organizations` / `file_type` fields but drop matches instead of requiring them (Qdrant `must_not` on `metadata.company` / `metadata.type`). They combine with every other filter as AND — e.g. `organizations: ["shikshalokam"], exclude_file_type: ["pdf"]` returns shikshalokam documents that are **not** PDFs.
+
+</details>
+
+<details>
+<summary><code>any_of</code> — OR across fields</summary>
+
+`any_of` takes a list of `FilterBlock` alternatives, at least one of which must match: `TOP-LEVEL AND (any_of[0] OR any_of[1] OR ...)`. Each block accepts the same fields as the top-level request (`categories`, `organizations`, `resource_type`, `file_type`, `exclude_organizations`, `exclude_file_type`).
+
+Use it only for an OR that spans *different* fields, e.g. "PDFs from shikshalokam, or DOCX from csf":
+
+```json
+{
+  "query": "teacher training",
+  "any_of": [
+    {"organizations": ["shikshalokam"], "file_type": ["pdf"]},
+    {"organizations": ["csf"], "file_type": ["docx"]}
+  ]
+}
+```
+
+An OR between values of a single field is just a longer list on that field (no `any_of` needed); an exclusion is `exclude_organizations`/`exclude_file_type` directly. Two validation rules keep the payload unambiguous — one way to write any given condition:
+
+- An `any_of` list needs **2+** alternatives; a single block is rejected (422) — that's just the top-level filter fields.
+- An empty block (no filter values set) is rejected (422) instead of silently matching every document.
+- Blocks don't nest — a block containing its own `any_of` is rejected (`extra="forbid"`).
 
 </details>
 
