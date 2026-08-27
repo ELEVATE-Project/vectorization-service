@@ -73,6 +73,8 @@ class Settings(BaseSettings):
     # Shared secret for internal-only endpoints (e.g. acronym bulk upload), checked
     # against the X-Internal-Token request header. No default — must be set explicitly.
     INTERNAL_API_TOKEN: str = os.getenv("INTERNAL_API_TOKEN", "")
+    # some api endpoints are more sensitive than others (e.g. acronym bulk upload) — require a second, stricter shared secret for those. No default — must be set explicitly.
+    ADMIN_API_TOKEN: str = os.getenv("ADMIN_API_TOKEN", "")
 
     # URL extraction settings
     URL_EXTRACTION_CHUNK_SIZE: int = 1500
@@ -116,6 +118,8 @@ class Settings(BaseSettings):
     # Acronym Search — default false until the full detect -> expand -> tiered-rank
     # path lands and passes validation (see ACRONYM_SEARCH_PLAN.md).
     ACRONYM_SEARCH_ENABLED: bool = os.getenv("ACRONYM_SEARCH_ENABLED", "false").lower() == "true"
+    # explicitly enable/disable caching of redis results (default true)
+    CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").lower() == "true"
 
     # Sparse Vector Configuration (Phase 2 — requires qdrant-client>=1.9.0)
     SPARSE_VECTOR_NAME: str = os.getenv("SPARSE_VECTOR_NAME", "bm25")

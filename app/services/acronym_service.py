@@ -52,15 +52,18 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
     if not normalized:
         return {}
 
-    keys = [_cache_key(a) for a in normalized]
-    try:
-        cached_values = cache_client.get_many(keys)
-    except Exception as e:
-        logger.warning(
-            f"Acronym batch cache read failed for {len(normalized)} acronym(s), "
-            f"falling back to Postgres: {e}"
-        )
+    if not settings.CACHE_ENABLED:
         cached_values = [None] * len(normalized)
+    else:
+        keys = [_cache_key(a) for a in normalized]
+        try:
+            cached_values = cache_client.get_many(keys)
+        except Exception as e:
+            logger.warning(
+                f"Acronym batch cache read failed for {len(normalized)} acronym(s), "
+                f"falling back to Postgres: {e}"
+            )
+            cached_values = [None] * len(normalized)
 
     result: Dict[str, List[str]] = {}
     missing: List[str] = []
@@ -92,13 +95,14 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
             f"Acronym batch DB lookup failed for {len(missing)} acronym(s), "
             f"treating as not found: {e}"
         )
-        try:
-            cache_client.set_many({
-                _cache_key(a): (json.dumps(None), settings.REDIS_DB_ERROR_CACHE_TTL)
-                for a in missing
-            })
-        except Exception as cache_e:
-            logger.warning(f"Acronym batch DB-error negative-cache write failed: {cache_e}")
+        if settings.CACHE_ENABLED:
+            try:
+                cache_client.set_many({
+                    _cache_key(a): (json.dumps(None), settings.REDIS_DB_ERROR_CACHE_TTL)
+                    for a in missing
+                })
+            except Exception as cache_e:
+                logger.warning(f"Acronym batch DB-error negative-cache write failed: {cache_e}")
         return result
     finally:
         db.close()
@@ -124,12 +128,13 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
                 json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL
             )
 
-    try:
-        cache_client.set_many(cache_writes)
-    except Exception as e:
-        logger.warning(
-            f"Acronym batch cache write-through failed for {len(cache_writes)} acronym(s): {e}"
-        )
+    if settings.CACHE_ENABLED:
+        try:
+            cache_client.set_many(cache_writes)
+        except Exception as e:
+            logger.warning(
+                f"Acronym batch cache write-through failed for {len(cache_writes)} acronym(s): {e}"
+            )
 
     return result
 
@@ -143,7 +148,7 @@ def invalidate_cache(acronyms: List[str]) -> None:
     degraded-mode fallback when the cache is having problems (e.g. the bulk
     upload endpoint calls this when refresh_cache() itself failed), so letting
     it raise would turn an already-committed, successful write into a 500."""
-    if not acronyms:
+    if not acronyms or not settings.CACHE_ENABLED:
         return
     keys = [_cache_key(a.strip().upper()) for a in acronyms]
     try:
@@ -159,7 +164,7 @@ def refresh_cache(acronyms: List[str]) -> None:
     Deliberately synchronous, same reasoning as load_acronym_cache() —
     callers must run this via run_in_threadpool rather than awaiting it
     directly."""
-    if not acronyms:
+    if not acronyms or not settings.CACHE_ENABLED:
         return
 
     db = SessionLocal()
@@ -191,6 +196,10 @@ def load_acronym_cache() -> int:
     Deliberately synchronous — every call inside is blocking, so async
     callers must run this via run_in_threadpool or the ~600 sequential
     Redis round-trips stall the whole event loop."""
+    if not settings.CACHE_ENABLED:
+        logger.info("Acronym cache warm-up skipped (CACHE_ENABLED=false)")
+        return 0
+
     db = SessionLocal()
     try:
         mappings = db.query(AcronymMapping).filter(AcronymMapping.is_active.is_(True)).all()

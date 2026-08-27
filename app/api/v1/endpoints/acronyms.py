@@ -5,7 +5,7 @@ import logging
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import verify_internal_token
+from app.api.deps import verify_admin_token, verify_internal_token
 from app.config import settings
 from app.constants import ACRONYM_CSV_COLUMN_ACRONYM, ACRONYM_CSV_COLUMN_EXPANSIONS
 from app.models.api_models import AcronymBulkUploadResponse
@@ -15,7 +15,11 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-@router.post("/bulk", response_model=AcronymBulkUploadResponse, dependencies=[Depends(verify_internal_token)])
+@router.post(
+    "/bulk",
+    response_model=AcronymBulkUploadResponse,
+    dependencies=[Depends(verify_internal_token), Depends(verify_admin_token)],
+)
 async def bulk_upload_acronyms(file: UploadFile = File(...)):
     """Internal-only: upsert acronym -> expansions rows from a CSV upload (spec
     §7). Columns: acronym, expansions (pipe-separated), description (optional),
