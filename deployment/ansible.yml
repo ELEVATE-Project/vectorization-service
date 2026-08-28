@@ -73,7 +73,7 @@
         creates: "{{ current_path }}/.venv"
 
     - name: Install dependencies
-      shell: uv sync
+      shell: uv pip install -r requirements.txt
       args:
         chdir: "{{ current_path }}"
 
