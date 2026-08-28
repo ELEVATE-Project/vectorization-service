@@ -268,6 +268,10 @@ class PrioritizedSearchResponse(BaseModel):
         default_factory=dict,
         description="Configuration used for this search"
     )
+    acronym_info: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Detected acronym(s) and their expansions, if any were found in the query"
+    )
 
 class TextSearchRequest(BaseModel):
     query: str = Field(..., min_length=1, description="Search query text")
@@ -294,3 +298,14 @@ class SourceVerificationResponse(BaseModel):
     not_found: List[str] = Field(..., description="List of source IDs that don't exist in Qdrant")
     found_count: int = Field(..., description="Count of found source IDs")
     not_found_count: int = Field(..., description="Count of not found source IDs")
+
+class AcronymUploadError(BaseModel):
+    index: int = Field(..., description="0-based index of the row in the CSV (0 = first data row, header excluded)")
+    acronym: Optional[str] = Field(None, description="Acronym value, if present on the row")
+    reason: str
+
+class AcronymBulkUploadResponse(BaseModel):
+    received: int
+    created: int
+    updated: int
+    errors: List[AcronymUploadError]
