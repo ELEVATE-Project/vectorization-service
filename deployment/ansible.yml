@@ -1,0 +1,132 @@
+---
+- hosts: elevate
+  become: yes
+
+  vars:
+    project_path: /opt/deployment
+    current_path: /opt/deployment/vectorization-service
+    uvicorn_port: 9000
+    uvicorn_workers: 4
+
+  tasks:
+    - name: Read Vault token
+      slurp:
+        src: "{{ project_path }}/.token"
+      register: slurpfile
+
+    - name: Create release path
+      set_fact:
+        release_path: "{{ project_path }}/releases/{{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
+
+    - name: Create release directory
+      file:
+        path: "{{ release_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: Clone repository
+      git:
+        repo: https://github.com/ELEVATE-Project/vectorization-service.git
+        dest: "{{ release_path }}"
+        version: "{{ gitBranch }}"
+        clone: yes
+        update: yes
+
+    - name: Download application secrets
+      shell: >
+        curl --silent --insecure
+        --location
+        --request GET "{{ vaultAddress }}vectorization-service"
+        --header "X-Vault-Token: {{ slurpfile.content | b64decode | trim }}"
+        | jq '.data.data'
+        > "{{ release_path }}/data2.json"
+
+    - name: Remove current deployment
+      file:
+        path: "{{ current_path }}"
+        state: absent
+
+    - name: Create deployment directory
+      file:
+        path: "{{ current_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: Move release into deployment directory
+      shell: mv {{ release_path }}/* {{ current_path }}/
+
+    - name: Make json2env executable
+      file:
+        path: "{{ current_path }}/deployment/json2env.sh"
+        mode: "0744"
+
+    - name: Generate .env
+      shell: >
+        cat {{ current_path }}/data2.json |
+        {{ current_path }}/deployment/json2env.sh
+        > {{ current_path }}/.env
+
+    - name: Create Python virtual environment
+      command: uv venv
+      args:
+        chdir: "{{ current_path }}"
+        creates: "{{ current_path }}/.venv"
+
+    - name: Install dependencies
+      shell: uv sync
+      args:
+        chdir: "{{ current_path }}"
+
+    - name: Create logs directory
+      file:
+        path: "{{ current_path }}/logs"
+        state: directory
+        mode: "0755"
+
+    - name: Run Django migrations
+      shell: |
+        export $(cat .env | xargs)
+        .venv/bin/python manage.py migrate
+      args:
+        executable: /bin/bash
+        chdir: "{{ current_path }}"
+      register: migrate_result
+      retries: 5
+      delay: 10
+      until: migrate_result.rc == 0
+
+    - name: Install Uvicorn service
+      template:
+        src: templates/vectorization-service-uvicorn.service.j2
+        dest: /etc/systemd/system/vectorization-service-uvicorn.service
+        mode: "0644"
+      notify:
+        - Reload systemd
+
+    - meta: flush_handlers
+
+    - name: Enable Uvicorn
+      systemd:
+        name: vectorization-service
+        enabled: yes
+
+    - name: Restart Uvicorn
+      systemd:
+        name: vectorization-service
+        state: restarted
+
+    - name: Dump recent Uvicorn logs if not active
+      command: journalctl -u vectorization-service -n 50 --no-pager
+      register: uvicorn_logs
+      changed_when: false
+      when: uvicorn_status.stdout != "active"
+
+    - debug:
+        var: uvicorn_logs.stdout_lines
+      when: uvicorn_status.stdout != "active"
+
+
+  handlers:
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
