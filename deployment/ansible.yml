@@ -76,7 +76,12 @@
       shell: uv pip install -r requirements.txt
       args:
         chdir: "{{ current_path }}"
-
+        
+    - name: Download spaCy model (en_core_web_sm)
+      command: .venv/bin/python -m spacy download en_core_web_sm
+      args:
+        chdir: "{{ current_path }}"
+        
     - name: Create logs directory
       file:
         path: "{{ current_path }}/logs"
