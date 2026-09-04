@@ -4,6 +4,9 @@ import time
 from typing import List, Dict, Optional, Any, Set
 from qdrant_client import models
 from qdrant_client.models import QueryRequest
+# Same stopword list acronym detection uses, so the two agree on what counts as
+# a content word (see _content_words / acronym_query_service.detect_acronyms).
+from spacy.lang.en.stop_words import STOP_WORDS
 from app.core.clients.qdrant import qdrant_client
 # Imported as a module (not `from ... import embed_query`) so a single patch point
 # `app.core.clients.embedding.embed_query` works in tests, and so the validated query
@@ -96,19 +99,39 @@ class PrioritizedSearchService:
         else:
             logger.info("No filters applied")
 
-    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None, is_acronym_query=False):
+    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None, acronyms_detected=None, prefilter_scores_out=None):
         """Process, rank, filter and deduplicate results.
 
         scoring_context_out: optional mutable dict forwarded to _rank_results so the
         caller can capture the per-query normalization context (min/max/pool size).
-        is_acronym_query: forwarded to _rank_results — see its docstring. Defaults to
-        False so any other caller reproduces the pre-existing fixed-blend behavior.
+        acronyms_detected: optional {acronym: [expansions]} map. When truthy, every
+        ranked candidate gets a lexical `tier` (see _assign_acronym_tier) and the
+        pool is re-sorted by (tier, weighted_score) before dedup/filtering — this is
+        what guarantees a real acronym/expansion match outranks a pure-semantic
+        guess. None (the default) skips tiering entirely for non-acronym callers.
+        prefilter_scores_out: optional mutable dict filled with source_id -> best
+        ranked entry, captured BEFORE the threshold filter runs. The caller uses
+        this so a title/summary match later re-injected by _fetch_field_match_docs
+        (because the semantic threshold dropped it) can carry its real
+        weighted_score/field_scores/tier instead of the synthetic floor.
         """
         logger.info(f"Total documents matched: {len(all_results)}")
 
         logger.info("Calculating weighted scores and ranking results")
-        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out, is_acronym_query=is_acronym_query)
+        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out)
         logger.info(f"Ranked results: {len(ranked_results)} documents")
+
+        if acronyms_detected:
+            for r in ranked_results:
+                r['tier'] = self._assign_acronym_tier(
+                    r['payload'].get('title'), r['payload'].get('summary'), acronyms_detected)
+            ranked_results.sort(key=lambda r: (r['tier'], r['weighted_score']), reverse=True)
+
+        if prefilter_scores_out is not None:
+            for entry in self._filter_best_per_source(ranked_results):
+                source_id = entry['payload'].get('source_id')
+                if source_id:
+                    prefilter_scores_out[source_id] = entry
 
         # Apply filtering based on conditions
         if detail_filter_score is not None:
@@ -338,20 +361,19 @@ class PrioritizedSearchService:
                 sparse_query_text = f"{query_for_keyword_match} {expansion_words}"
 
             logger.info(f"Generating {len(dense_query_texts)} dense embedding(s) for query: {dense_query_texts}")
-            # embed_query rejects empty/whitespace input and validates the produced
-            # vector (length == EMBEDDING_DIM, finite values) so a malformed vector can
-            # never reach Qdrant. Returns a validated list[float].
-            query_embeddings = []
-            for dense_query_text in dense_query_texts:
-                try:
-                    query_embeddings.append(embedding.embed_query(dense_query_text))
-                except EmbeddingError as e:
-                    logger.error(
-                        "Query embedding invalid: service=prioritized_search "
-                        f"query='{dense_query_text[:80]}' expected_dim={embedding.EMBEDDING_DIM} "
-                        f"error={e}"
-                    )
-                    raise
+            # embed_queries batches all dense query texts into a single model call
+            # (one encode() instead of len(dense_query_texts) sequential ones) and
+            # validates each produced vector (length == EMBEDDING_DIM, finite
+            # values) so a malformed vector can never reach Qdrant.
+            try:
+                query_embeddings = embedding.embed_queries(dense_query_texts)
+            except EmbeddingError as e:
+                logger.error(
+                    "Query embedding invalid: service=prioritized_search "
+                    f"queries={[q[:80] for q in dense_query_texts]} "
+                    f"expected_dim={embedding.EMBEDDING_DIM} error={e}"
+                )
+                raise
 
             filter_conditions = self._build_filters(
                 categories=request.categories,
@@ -416,12 +438,14 @@ class PrioritizedSearchService:
             # computed inside _rank_results; surfaced under search_config.scoring_context
             # when include_scoring_debug is set (see below).
             scoring_context: Dict[str, Any] = {}
+            prefilter_scores_by_source: Dict[str, Dict[str, Any]] = {}
             top_results, unique_source_results = self._process_and_filter_results(
                 all_results, field_scores, weights, search_fields, top_k,
                 filter_score if not use_detail_filter else 0,
                 detail_filter_score if use_detail_filter else None,
                 scoring_context_out=scoring_context,
-                is_acronym_query=bool(acronyms_detected),
+                acronyms_detected=acronyms_detected,
+                prefilter_scores_out=prefilter_scores_by_source,
             )
 
             # Apply title boost when hybrid mode is active.
@@ -484,6 +508,8 @@ class PrioritizedSearchService:
                     injected = self._fetch_field_match_docs(
                         missing_title, title_matches, "title",
                         settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
+                        prefilter_scores=prefilter_scores_by_source,
+                        acronyms_detected=acronyms_detected,
                     )
                     top_results = top_results + injected
                     present_ids.update(missing_title)
@@ -498,11 +524,24 @@ class PrioritizedSearchService:
                     injected = self._fetch_field_match_docs(
                         missing_summary, summary_matches, "summary",
                         settings.EXACT_SUMMARY_BOOST, settings.PARTIAL_SUMMARY_BOOST,
+                        prefilter_scores=prefilter_scores_by_source,
+                        acronyms_detected=acronyms_detected,
                     )
                     top_results = top_results + injected
                     injected_source_ids.update(d["payload"].get("source_id") for d in injected)
                     logger.info(f"Injected {len(injected)} summary-match docs missing from semantic results")
 
+                if acronyms_detected:
+                    # Bake tier into the exposed score itself: partition [0, 1] into
+                    # 5 equal per-tier bands (tiers 0-4, see _assign_acronym_tier)
+                    # so a plain score-only sort downstream (e.g. a caller that
+                    # re-sorts our response by "score" alone, oblivious to tier)
+                    # still reproduces tier-correct order. Must run last — after
+                    # filter_score/boost/injection — so it never affects threshold
+                    # filtering upstream, which needs the real weighted_score, not
+                    # the tier-compressed one.
+                    for r in top_results:
+                        r["weighted_score"] = (r.get("tier", 0) + r["weighted_score"]) / 5.0
                 top_results.sort(key=lambda x: x["weighted_score"], reverse=True)
 
                 # Re-cap top_k after re-sorting
@@ -1016,7 +1055,6 @@ class PrioritizedSearchService:
         weights: Dict[str, float],
         search_fields: List[str],
         scoring_context_out: Optional[Dict[str, Any]] = None,
-        is_acronym_query: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Rank results using weighted multi-field scoring.
@@ -1056,12 +1094,6 @@ class PrioritizedSearchService:
                 under search_config.scoring_context without recomputing raw_dense/raw_sparse
                 or keeping per-request state on the (shared) service instance. Left empty
                 on the dense-only path except for candidate_pool_size.
-            is_acronym_query: When True (query had a detected acronym),
-                per-point dense/sparse weights are flipped for any point with a genuine
-                sparse hit — see the weighted-fusion branch below. False (the default,
-                and always false when ACRONYM_SEARCH_ENABLED is off or nothing detected)
-                reproduces the original fixed HYBRID_DENSE_WEIGHT/HYBRID_SPARSE_WEIGHT
-                blend for every point, unchanged.
 
         Returns:
             List of ranked results sorted by weighted score (descending)
@@ -1132,21 +1164,11 @@ class PrioritizedSearchService:
                 norm_sparse = self._min_max_normalize(raw_sparse)
                 dense_w = settings.HYBRID_DENSE_WEIGHT
                 sparse_w = settings.HYBRID_SPARSE_WEIGHT
-                # Acronym-scoped reweighting: min-max normalizes dense/sparse
-                # independently, so a weak dense pool can still hit 1.0 and outrank
-                # a genuine keyword match — especially for short acronym queries.
-                # When is_acronym_query and a point has a real sparse hit, score it
-                # both ways and take the max (never just the flipped value) — a
-                # keyword match can only raise a score, never lower it.
                 for point_id in raw_dense:
-                    nd = norm_dense.get(point_id, 0.0)
-                    ns = norm_sparse.get(point_id, 0.0)
-                    base_score = dense_w * nd + sparse_w * ns
-                    if is_acronym_query and raw_sparse.get(point_id, 0.0) > 0.0:
-                        flipped_score = sparse_w * nd + dense_w * ns
-                        hybrid_scores[point_id] = max(base_score, flipped_score)
-                    else:
-                        hybrid_scores[point_id] = base_score
+                    hybrid_scores[point_id] = (
+                        dense_w * norm_dense.get(point_id, 0.0)
+                        + sparse_w * norm_sparse.get(point_id, 0.0)
+                    )
 
             # Expose the per-query normalization reference (min/max of each modality
             # across the candidate pool) so a debug caller can reproduce normalized_dense/
@@ -1374,6 +1396,114 @@ class PrioritizedSearchService:
             return None
         return "exact" if field_lower == query_lower else "partial"
 
+    @staticmethod
+    def _term_in_text(term: str, text: Optional[str]) -> bool:
+        """Whole-word (not substring) match — 'DIET' must not match inside 'dietary'.
+
+        Uses letter/digit lookarounds rather than \\b: \\b treats underscore as a
+        word character, so it would miss 'DIET' in filename-style titles like
+        '..._DIET Empowerment...' where underscores are used as word separators
+        (verified live — several real titles were silently excluded this way).
+        """
+        if not term or not text:
+            return False
+        pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
+        return re.search(pattern, text, re.IGNORECASE) is not None
+
+    @staticmethod
+    def _content_words(phrase: str) -> List[str]:
+        """Alphanumeric words of `phrase`, lowercased, minus English stopwords.
+
+        Stopwords come from the same spacy list acronym detection already uses,
+        so "of"/"and"/"for"/"the" never decide whether an expansion matches.
+        """
+        words = re.findall(r"[A-Za-z0-9]+", phrase.lower())
+        return [w for w in words if w not in STOP_WORDS]
+
+    def _phrase_in_text(self, phrase: str, text: Optional[str]) -> bool:
+        """True when every content word of `phrase` appears in `text`.
+
+        Used for the multi-word acronym EXPANSION tiers, where _term_in_text's
+        exact-substring rule is far too rigid: a real title never reproduces an
+        expansion verbatim. "District Institute of Education and Training" has
+        to match "Strengthening of District Institutes of Education and
+        Training" (plural) and "District Institute for Education & Training"
+        (different connectives) — both of which the literal matcher rejects,
+        which is why the expansion tiers previously never fired at all.
+
+        Word order and connectives are ignored; inflections are tolerated by
+        accepting a prefix relationship in either direction ("institute" ~
+        "institutes", "education" ~ "educational").
+
+        ALL content words are required, deliberately. A partial threshold (say
+        70%) would promote near-misses that merely share common words —
+        "District Primary Education Programme" shares district+education with
+        the DIET expansion but is a different programme entirely. That is the
+        same false-positive failure mode documented in _assign_acronym_tier for
+        the BM25 signal, so this errs strictly toward under-promoting.
+
+        The single-token acronym itself still goes through _term_in_text: 'DIET'
+        must not match 'dietary', and prefix tolerance would allow exactly that.
+        """
+        if not phrase or not text:
+            return False
+        terms = self._content_words(phrase)
+        if not terms:
+            return False
+        words = re.findall(r"[A-Za-z0-9]+", text.lower())
+        if not words:
+            return False
+        return all(
+            any(word == term or word.startswith(term) or term.startswith(word)
+                for word in words)
+            for term in terms
+        )
+
+    def _assign_acronym_tier(
+        self,
+        title: Optional[str],
+        summary: Optional[str],
+        acronyms_detected: Dict[str, List[str]],
+    ) -> int:
+        """Lexical tier for acronym-detected queries: 4 = acronym itself in
+        title, 3 = acronym itself in summary, 2 = an expansion phrase in title,
+        1 = an expansion phrase in summary, 0 = none of the above (ranked by
+        weighted_score alone, same as any ordinary query). Checklist evaluated
+        top-to-bottom per acronym (first match wins); multiple detected
+        acronyms take the max tier across all of them.
+
+        The acronym itself (tiers 4/3) is matched literally by _term_in_text;
+        the multi-word expansions (tiers 2/1) go through _phrase_in_text, which
+        matches on content words instead. Matching expansions literally made
+        tiers 2 and 1 unreachable in practice — verified live on q=DIET, where
+        every one of 74 results landed in tier 4 or tier 0 and a title reading
+        "Strengthening of District Institutes of Education and Training" scored
+        tier 0 purely because of the plural.
+
+        Deliberately does NOT use the BM25 keyword_score as a body-text tier
+        signal (an earlier version did, as tier 1): the sparse query is a
+        bag-of-words OR of the literal acronym plus every expansion word (e.g.
+        "DIET" + "District" + "Institute" + "Education" + "Training"), so any
+        document containing common expansion words like "Education"/"Training"
+        anywhere gets a nonzero score with no real connection to the acronym.
+        Verified live: this promoted clearly unrelated documents (e.g.
+        "Establishing Discipline Through Clear School Rules") into a hard tier
+        above genuinely relevant semantic-only matches. Title/summary matching
+        doesn't have this problem since it checks the whole acronym/phrase, not
+        an OR-bag of individual words.
+        """
+        tier = 0
+        for acronym, expansions in acronyms_detected.items():
+            if self._term_in_text(acronym, title):
+                tier = max(tier, 4)
+            elif self._term_in_text(acronym, summary):
+                tier = max(tier, 3)
+            elif any(self._phrase_in_text(exp, title) for exp in expansions):
+                tier = max(tier, 2)
+            elif any(self._phrase_in_text(exp, summary) for exp in expansions):
+                tier = max(tier, 1)
+        return tier
+
     def _get_field_match_sources(
         self,
         queries: List[str],
@@ -1551,6 +1681,8 @@ class PrioritizedSearchService:
         field: str,
         exact_boost: float,
         partial_boost: float,
+        prefilter_scores: Optional[Dict[str, Dict[str, Any]]] = None,
+        acronyms_detected: Optional[Dict[str, List[str]]] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch one representative chunk per source_id for documents that matched
         by ``field`` but were absent from semantic search results (e.g. short
@@ -1559,6 +1691,20 @@ class PrioritizedSearchService:
         Each injected document receives a score derived from the boost multiplier
         applied to a small floor value so it ranks below semantically strong results
         but above no-result.
+
+        prefilter_scores: optional source_id -> ranked entry map (see
+        _process_and_filter_results' prefilter_scores_out) for documents the normal
+        pipeline DID score but that filter_score then dropped. For those, the real
+        weighted_score/field_scores/tier are boosted instead of the synthetic floor —
+        a document the pipeline actually measured should not be re-added as if
+        nothing were known about it. Sources genuinely absent from the candidate
+        pool still take the floor path unchanged.
+
+        acronyms_detected: same map _process_and_filter_results uses to gate
+        tiering. Only when truthy does a genuinely-never-retrieved document get a
+        proxy tier (2 for a title match, 1 for summary) instead of 0 — tiering must
+        stay a no-op for non-acronym queries, where every other document defaults
+        to tier 0 and an unconditional nonzero proxy would corrupt the final sort.
 
         Optimized to fetch all missing documents in a single MatchAny query.
         """
@@ -1643,13 +1789,31 @@ class PrioritizedSearchService:
             # and multiplied with the floor score.
             match_type = matches.get(source_id, "partial")
             boost = exact_boost if match_type == "exact" else partial_boost
-            score = min(FLOOR_SCORE * boost, 1.0)
 
-            # Injected docs were fetched via keyword/payload scroll — no vector query
-            # was run against them so no per-field cosine similarity exists.
-            # Use None (not 0.0) so the API consumer can distinguish
-            # "field was not scored" from "field scored exactly zero".
-            field_scores: Dict[str, Any] = {f: None for f in self.priority_order}
+            fallback = (prefilter_scores or {}).get(source_id)
+            if fallback is not None:
+                # Scored by the normal pipeline, then dropped by filter_score. Keep
+                # the real score/field_scores/tier so the boost multiplies an actual
+                # relevance score rather than a constant.
+                base = fallback["weighted_score"]
+                field_scores: Dict[str, Any] = dict(fallback.get("field_scores") or {})
+                entry_raw_dense = fallback.get("raw_dense")
+                entry_keyword = fallback.get("keyword_score")
+                tier = fallback.get("tier", 0)
+            else:
+                # Genuinely absent from the candidate pool — no vector query was ever
+                # run against this document, so no per-field cosine similarity (or
+                # real tier) exists. Use None (not 0.0) so the API consumer can
+                # distinguish "field was not scored" from "field scored exactly zero".
+                # Approximate the tier from which lookup found it (title/summary
+                # scroll), since there's no title/body text here to compute a real one.
+                base = FLOOR_SCORE
+                field_scores = {f: None for f in self.priority_order}
+                entry_raw_dense = None
+                entry_keyword = None
+                tier = (2 if field == "title" else 1) if acronyms_detected else 0
+
+            score = min(base * boost, 1.0)
             field_scores[match_key] = match_type
 
             injected.append({
@@ -1657,13 +1821,17 @@ class PrioritizedSearchService:
                 "payload": point.payload,
                 "weighted_score": score,
                 "field_scores": field_scores,
-                # raw_dense is undefined for keyword-injected docs (no vector query ran);
-                # None distinguishes it from a genuine 0.0. The matched field's multiplier
-                # is the boost that produced the floor score.
-                "raw_dense": None,
+                # raw_dense/keyword_score stay None for floor-path docs (no vector
+                # query ran); None distinguishes that from a genuine 0.0.
+                "raw_dense": entry_raw_dense,
+                "keyword_score": entry_keyword,
+                "tier": tier,
                 mult_key: boost,
             })
-            logger.debug(f"Injected {field}-match doc {source_id} ({match_type}) with floor score {score:.4f}")
+            logger.debug(
+                f"Injected {field}-match doc {source_id} ({match_type}) with score "
+                f"{score:.4f} ({'real' if fallback is not None else 'floor'} base {base:.4f} x {boost})"
+            )
 
         missing_after = len(source_ids) - len(seen_sources)
         logger.info(

@@ -88,3 +88,23 @@ def embed_query(text: str) -> List[float]:
     # EmbeddingError (mapped to 422). validate_vector guards the output.
     raw = generate_embeddings([text])[0]
     return validate_vector(raw)
+
+
+def embed_queries(texts: List[str]) -> List[List[float]]:
+    """Embed multiple query strings in a single batched model call.
+
+    Equivalent to calling embed_query() once per text, but issues ONE encode()
+    call instead of len(texts) separate ones — a real batching benefit for
+    local sentence-transformers inference (reduced per-call overhead), not
+    just fewer Python-level round trips. Order is preserved.
+
+    Raises:
+        EmbeddingError: if any text is empty/whitespace, or any produced
+            vector is empty/malformed.
+    """
+    for text in texts:
+        if not text or not text.strip():
+            raise EmbeddingError("Cannot embed an empty or whitespace-only query")
+
+    raw_vectors = generate_embeddings(texts)
+    return [validate_vector(vec) for vec in raw_vectors]
