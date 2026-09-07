@@ -362,12 +362,13 @@ class PrioritizedSearchService:
                 sparse_query_text = f"{query_for_keyword_match} {expansion_words}"
 
             logger.info(f"Generating {len(dense_query_texts)} dense embedding(s) for query: {dense_query_texts}")
-            # embed_queries batches all dense query texts into a single model call
-            # (one encode() instead of len(dense_query_texts) sequential ones) and
-            # validates each produced vector (length == EMBEDDING_DIM, finite
-            # values) so a malformed vector can never reach Qdrant.
+            # Passing the list (not one text at a time) batches every dense query
+            # text into a single model call — one encode() instead of
+            # len(dense_query_texts) sequential ones — and validates each produced
+            # vector (length == EMBEDDING_DIM, finite values) so a malformed vector
+            # can never reach Qdrant.
             try:
-                query_embeddings = embedding.embed_queries(dense_query_texts)
+                query_embeddings = embedding.embed_query(dense_query_texts)
             except EmbeddingError as e:
                 logger.error(
                     "Query embedding invalid: service=prioritized_search "
