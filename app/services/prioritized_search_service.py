@@ -14,6 +14,7 @@ from app.core.clients.qdrant import qdrant_client
 from app.core.clients import embedding
 from app.core.clients.embedding import EmbeddingError
 from app.config import settings
+from app.constants import ACRONYM_MIN_PREFIX_MATCH_LEN
 from app.services.acronym_query_service import detect_acronyms
 from app.models.api_models import (
     PrioritizedSearchRequest,
@@ -1454,10 +1455,25 @@ class PrioritizedSearchService:
         if not words:
             return False
         return all(
-            any(word == term or word.startswith(term) or term.startswith(word)
-                for word in words)
+            any(self._words_match(word, term) for word in words)
             for term in terms
         )
+
+    @staticmethod
+    def _words_match(word: str, term: str) -> bool:
+        """One document word against one expansion content word.
+
+        Exact match always counts. A prefix relationship in either direction
+        counts only when the shorter string clears ACRONYM_MIN_PREFIX_MATCH_LEN,
+        which is what stops initialisms and stray characters matching the words
+        they appear to abbreviate.
+        """
+        if word == term:
+            return True
+        shorter, longer = (word, term) if len(word) < len(term) else (term, word)
+        if len(shorter) < ACRONYM_MIN_PREFIX_MATCH_LEN:
+            return False
+        return longer.startswith(shorter)
 
     def _assign_acronym_tier(
         self,
