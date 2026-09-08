@@ -42,11 +42,39 @@ class Settings(BaseSettings):
     MAX_CACHE_RESULTS: int = 1
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
+    REDIS_DB: int = int(os.getenv("REDIS_DB", 0))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+    # Small on purpose: redis-py has no default timeout, and a blackholed
+    # connection (packets silently dropped) would hang cache reads for minutes,
+    # stalling search instead of falling back to Postgres.
+    REDIS_SOCKET_CONNECT_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", 1))
+    REDIS_SOCKET_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_TIMEOUT", 1))
     REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", 86400))  # 24 hours in seconds
+    # Shorter than REDIS_CACHE_TTL: caches "this word isn't an acronym" so ordinary
+    # non-acronym words in a query don't re-hit Postgres on every request. A newly
+    # bulk-uploaded acronym overwrites any stale negative entry immediately (warm_cache()
+    # runs after every upload), so this TTL only bounds staleness for the rare case that
+    # invariant doesn't hold — not load-bearing correctness.
+    REDIS_NEGATIVE_CACHE_TTL: int = int(os.getenv("REDIS_NEGATIVE_CACHE_TTL", 3600))  # 1 hour
+    # Shorter than REDIS_NEGATIVE_CACHE_TTL: this caches a DB-error miss, not a
+    # genuine "not an acronym" miss. DB outages are often transient — caching
+    # "not found" for a full hour would hide real acronyms after Postgres recovers.
+    REDIS_DB_ERROR_CACHE_TTL: int = int(os.getenv("REDIS_DB_ERROR_CACHE_TTL", 30))
     REDIS_MAX_CACHE_SIZE: int = int(os.getenv("REDIS_MAX_CACHE_SIZE", 1000))
     DATABASE_URL: str = os.getenv("POSTGRES_DATABASE_URI", "postgresql://anuj:1234@localhost:5432/ai_vector_service")
+    # psycopg2 defaults to no connect timeout at all — a blackholed Postgres host
+    # (network silently drops packets, unlike a clean "connection refused") makes
+    # a connection attempt hang until the OS-level TCP timeout, which can be
+    # minutes. Confirmed live with a real local "black hole" TCP server: an
+    # unbounded psycopg2.connect() hung past 15s with no sign of returning.
+    POSTGRES_CONNECT_TIMEOUT: int = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", 3))
     REDIS_CACHE_ENABLED: bool = False
+
+    # Shared secret for internal-only endpoints (e.g. acronym bulk upload), checked
+    # against the X-Internal-Token request header. No default — must be set explicitly.
+    INTERNAL_API_TOKEN: str = os.getenv("INTERNAL_API_TOKEN", "")
+    # some api endpoints are more sensitive than others (e.g. acronym bulk upload) — require a second, stricter shared secret for those. No default — must be set explicitly.
+    ADMIN_API_TOKEN: str = os.getenv("ADMIN_API_TOKEN", "")
 
     # URL extraction settings
     URL_EXTRACTION_CHUNK_SIZE: int = 1500
@@ -55,6 +83,9 @@ class Settings(BaseSettings):
 
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
+    # Acronym bulk-upload CSVs are small tabular text, not documents —
+    # a much lower cap than MAX_FILE_SIZE_MB.
+    ACRONYM_BULK_UPLOAD_MAX_SIZE_MB: int = int(os.getenv("ACRONYM_BULK_UPLOAD_MAX_SIZE_MB", 5))
 
 
     # Prioritized Search Configuration
@@ -83,6 +114,12 @@ class Settings(BaseSettings):
     # Queries shorter than this word count skip spaCy stop-word removal
     SHORT_QUERY_THRESHOLD: int = int(os.getenv("SHORT_QUERY_THRESHOLD", "3"))
     RRF_K: int = int(os.getenv("RRF_K", "60"))  # standard Reciprocal Rank Fusion constant
+
+    # Acronym Search — default false until the full detect -> expand -> tiered-rank
+    # path lands and passes validation (see ACRONYM_SEARCH_PLAN.md).
+    ACRONYM_SEARCH_ENABLED: bool = os.getenv("ACRONYM_SEARCH_ENABLED", "false").lower() == "true"
+    # explicitly enable/disable caching of redis results (default true)
+    CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").lower() == "true"
 
     # Sparse Vector Configuration (Phase 2 — requires qdrant-client>=1.9.0)
     SPARSE_VECTOR_NAME: str = os.getenv("SPARSE_VECTOR_NAME", "bm25")
