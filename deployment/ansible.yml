@@ -102,7 +102,7 @@
 
     - name: Install Uvicorn service
       template:
-        src: templates/vectorization-service-uvicorn.service.j2
+        src: templates/vectorization-service-uvicorn.j2
         dest: /etc/systemd/system/vectorization-service-uvicorn.service
         mode: "0644"
       notify:
