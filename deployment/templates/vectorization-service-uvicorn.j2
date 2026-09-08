@@ -12,7 +12,7 @@ WorkingDirectory=/opt/deployment/vectorization-service
 Environment="PYTHONPATH=/opt/deployment/vectorization-service"
 
 ExecStart=/opt/deployment/vectorization-service/.venv/bin/uvicorn \
-    main:app \
+    app.main:app \
     --host 0.0.0.0 \
     --port 8000 \
     --workers 4
