@@ -112,12 +112,12 @@
 
     - name: Enable Uvicorn
       systemd:
-        name: vectorization-service
+        name: vectorization-service-uvicorn
         enabled: yes
 
     - name: Restart Uvicorn
       systemd:
-        name: vectorization-service
+        name: vectorization-service-uvicorn
         state: restarted
 
     - name: Dump recent Uvicorn logs if not active
