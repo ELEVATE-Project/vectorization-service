@@ -90,7 +90,9 @@
 
     - name: Run Django migrations
       shell: |
-        export $(cat .env | xargs)
+        set -a
+        source .env
+        set +a
         alembic upgrade head
       args:
         executable: /bin/bash
