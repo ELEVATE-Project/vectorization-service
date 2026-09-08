@@ -120,15 +120,15 @@
         name: vectorization-service-uvicorn
         state: restarted
 
-    - name: Dump recent Uvicorn logs if not active
-      command: journalctl -u vectorization-service -n 50 --no-pager
-      register: uvicorn_logs
+    - name: Check Uvicorn status
+      command: systemctl is-active vectorization-service-uvicorn
+      register: uvicorn_status
+      ignore_errors: true
       changed_when: false
-      when: uvicorn_status.stdout != "active"
-
-    - debug:
-        var: uvicorn_logs.stdout_lines
-      when: uvicorn_status.stdout != "active"
+    
+    - name: Dump recent Uvicorn logs if not active
+      command: journalctl -u vectorization-service-uvicorn -n 50 --no-pager
+      when: uvicorn_status is defined and uvicorn_status.stdout != "active"
 
 
   handlers:
