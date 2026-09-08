@@ -26,6 +26,8 @@ class TextEmbeddingSearchService:
             TextSearchResponse with all matching chunks sorted by score
         """
         try:
+            logger.info(f"Text embedding search query: '{request.query}'")
+
             # Generate + validate the query embedding (rejects empty/malformed before Qdrant)
             query_vector = embedding.embed_query(request.query)
 
