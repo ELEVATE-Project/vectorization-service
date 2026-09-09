@@ -91,7 +91,7 @@
     - name: Run Django migrations
       shell: |
         export $(cat .env | xargs)
-        alembic upgrade head
+        # alembic upgrade head
       args:
         executable: /bin/bash
         chdir: "{{ current_path }}"
