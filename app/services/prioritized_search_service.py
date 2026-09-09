@@ -110,6 +110,11 @@ class PrioritizedSearchService:
         pool is re-sorted by (tier, weighted_score) before dedup/filtering — this is
         what guarantees a real acronym/expansion match outranks a pure-semantic
         guess. None (the default) skips tiering entirely for non-acronym callers.
+        search() also passes None when lexical ranking is off (search_mode
+        "semantic", or HYBRID_SEARCH_ENABLED false): tiering is a lexical signal
+        like the title/summary boost, and the score rewrite that keeps tier order
+        legible to callers only runs alongside that boost — so tiering here without
+        it would order results by a tier the response never justifies.
         prefilter_scores_out: optional mutable dict filled with source_id -> best
         ranked entry, captured BEFORE the threshold filter runs. The caller uses
         this so a title/summary match later re-injected by _fetch_field_match_docs
@@ -441,24 +446,45 @@ class PrioritizedSearchService:
             # when include_scoring_debug is set (see below).
             scoring_context: Dict[str, Any] = {}
             prefilter_scores_by_source: Dict[str, Dict[str, Any]] = {}
+
+            # Only two modes exist: "semantic" opts out of boosts; "hybrid" (the
+            # default) opts in. search_mode is validated to that set by Pydantic.
+            search_mode = getattr(request, "search_mode", "hybrid")
+            # Acronym tiering is a LEXICAL ranking signal — _assign_acronym_tier
+            # matches the acronym and its expansions literally against title/summary
+            # — so it belongs to the same family as the title/summary boost below,
+            # and rides the same switch. "semantic" means rank by vector similarity
+            # alone, and a hard tier partition is a heavier lexical thumb on the
+            # scale than any boost multiplier.
+            #
+            # It also has to ride that switch for the response to stay coherent: the
+            # rewrite that folds tier into the exposed score lives inside the boost
+            # block, so tiering outside it produced results ordered by a tier the
+            # caller never sees, carrying scores that contradict that order. Any
+            # caller re-sorting by score (commons-backend does, via `ordering`) then
+            # silently undid the ranking.
+            #
+            # Retrieval is deliberately NOT gated: the expanded dense/sparse queries
+            # built above still run, so an acronym keeps widening WHICH documents are
+            # found in semantic mode. Only their ORDER falls back to pure similarity.
+            lexical_ranking_enabled = (
+                settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic"
+            )
+
             top_results, unique_source_results = self._process_and_filter_results(
                 all_results, field_scores, weights, search_fields, top_k,
                 filter_score if not use_detail_filter else 0,
                 detail_filter_score if use_detail_filter else None,
                 scoring_context_out=scoring_context,
-                acronyms_detected=acronyms_detected,
+                acronyms_detected=acronyms_detected if lexical_ranking_enabled else None,
                 prefilter_scores_out=prefilter_scores_by_source,
             )
 
-            # Apply title boost when hybrid mode is active.
-            # Only two modes exist: "semantic" opts out of boosts; "hybrid" (the
-            # default) opts in. search_mode is validated to that set by Pydantic.
-            search_mode = getattr(request, "search_mode", "hybrid")
             # Source_ids injected by the title/summary boost below (filtered out of the
             # semantic pool). Tracked so total_results counts them — otherwise the
             # response could report fewer total than it returns.
             injected_source_ids: set = set()
-            if settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic":
+            if lexical_ranking_enabled:
                 logger.info("Applying hybrid title + summary boost")
 
                 # Title boost (highest priority). Scroll retrieves prefix/partial
@@ -1718,10 +1744,11 @@ class PrioritizedSearchService:
         pool still take the floor path unchanged.
 
         acronyms_detected: same map _process_and_filter_results uses to gate
-        tiering. Only when truthy does a genuinely-never-retrieved document get a
-        proxy tier (2 for a title match, 1 for summary) instead of 0 — tiering must
-        stay a no-op for non-acronym queries, where every other document defaults
-        to tier 0 and an unconditional nonzero proxy would corrupt the final sort.
+        tiering. Only when truthy is a tier assigned at all — tiering must stay a
+        no-op for non-acronym queries, where every other document defaults to tier
+        0 and an unconditional nonzero tier here would corrupt the final sort.
+        A never-retrieved document is tiered by _assign_acronym_tier against the
+        scrolled payload's own title/summary, exactly like every scored document.
 
         Optimized to fetch all missing documents in a single MatchAny query.
         """
@@ -1817,25 +1844,51 @@ class PrioritizedSearchService:
                 entry_raw_dense = fallback.get("raw_dense")
                 entry_keyword = fallback.get("keyword_score")
                 tier = fallback.get("tier", 0)
+                # Identify the entry by the chunk that EARNED these scores, not by
+                # whichever chunk the scroll happened to return first. Those are
+                # different points for any multi-chunk source (prefilter_scores holds
+                # the best chunk per source, see _filter_best_per_source), and the id
+                # also drives the late payload retrieval in search() — so taking it
+                # from the scroll pairs one chunk's text with another chunk's score.
+                point_id = fallback.get("id", point.id)
+                payload = fallback.get("payload") or point.payload
             else:
                 # Genuinely absent from the candidate pool — no vector query was ever
-                # run against this document, so no per-field cosine similarity (or
-                # real tier) exists. Use None (not 0.0) so the API consumer can
-                # distinguish "field was not scored" from "field scored exactly zero".
-                # Approximate the tier from which lookup found it (title/summary
-                # scroll), since there's no title/body text here to compute a real one.
+                # run against this document, so no per-field cosine similarity exists.
+                # Use None (not 0.0) so the API consumer can distinguish "field was
+                # not scored" from "field scored exactly zero".
                 base = FLOOR_SCORE
                 field_scores = {f: None for f in self.priority_order}
                 entry_raw_dense = None
                 entry_keyword = None
-                tier = (2 if field == "title" else 1) if acronyms_detected else 0
+                # The tier, unlike the scores, IS computable here: the scroll ran with
+                # with_payload=True, so this point carries the document's own title and
+                # summary. Deriving it from which scroll found the doc instead conflates
+                # "matched by the title lookup" with "deserves the title tier" — a doc
+                # titled with the literal acronym scored 2 when the shared rule says 4,
+                # ranking it under a mere summary mention (3), while a doc that only
+                # matched an ordinary query word also took 2 with no acronym signal at
+                # all. Same function every scored candidate goes through, same result.
+                tier = (
+                    self._assign_acronym_tier(
+                        point.payload.get("title"),
+                        point.payload.get("summary"),
+                        acronyms_detected,
+                    )
+                    if acronyms_detected
+                    else 0
+                )
+                # No scores to be consistent with, so any chunk represents the
+                # source equally well — keep the scrolled one.
+                point_id = point.id
+                payload = point.payload
 
             score = min(base * boost, 1.0)
             field_scores[match_key] = match_type
 
             injected.append({
-                "id": point.id,
-                "payload": point.payload,
+                "id": point_id,
+                "payload": payload,
                 "weighted_score": score,
                 "field_scores": field_scores,
                 # raw_dense/keyword_score stay None for floor-path docs (no vector
