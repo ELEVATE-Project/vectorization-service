@@ -61,11 +61,11 @@ class Settings(BaseSettings):
     # Order determines search priority: Title > Chunk > Tags > Summary > Metadata
     SEARCH_PRIORITY_ORDER: list = ["title", "text", "tags", "summary", "metadata"]
     SEARCH_PRIORITY_WEIGHTS: dict = {
-        "title": 0.36,      # 36% weight for title matches
-        "text": 0.27,       # 27% weight for chunk/content matches
-        "tags": 0.14,       # 14% weight for tag matches
-        "summary": 0.14,    # 14% weight for summary matches
-        "metadata": 0.09    # 9% weight for metadata matches
+        "title": 0.34,      # 34% weight for title matches
+        "text": 0.26,       # 26% weight for chunk/content matches
+        "tags": 0.20,       # 20% weight for tag/category matches (up from 14%)
+        "summary": 0.12,    # 12% weight for summary matches
+        "metadata": 0.08    # 8% weight for metadata matches
     }
     DEFAULT_SEARCH_TOP_K: int = 10
     MAX_SEARCH_TOP_K: int = 100
