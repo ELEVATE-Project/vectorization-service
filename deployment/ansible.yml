@@ -90,9 +90,7 @@
 
     - name: Run Django migrations
       shell: |
-        set -a
-        source .env
-        set +a
+        export $(cat .env | xargs)
         alembic upgrade head
       args:
         executable: /bin/bash
@@ -105,7 +103,7 @@
     - name: Install Uvicorn service
       template:
         src: templates/vectorization-service-uvicorn.j2
-        dest: /etc/systemd/system/vectorization-service-uvicorn
+        dest: /etc/systemd/system/vectorization-service-uvicorn.service
         mode: "0644"
       notify:
         - Reload systemd
@@ -114,23 +112,23 @@
 
     - name: Enable Uvicorn
       systemd:
-        name: vectorization-service
+        name: vectorization-service-uvicorn
         enabled: yes
 
     - name: Restart Uvicorn
       systemd:
-        name: vectorization-service
+        name: vectorization-service-uvicorn
         state: restarted
 
-    - name: Dump recent Uvicorn logs if not active
-      command: journalctl -u vectorization-service -n 50 --no-pager
-      register: uvicorn_logs
+    - name: Check Uvicorn status
+      command: systemctl is-active vectorization-service-uvicorn
+      register: uvicorn_status
+      ignore_errors: true
       changed_when: false
-      when: uvicorn_status.stdout != "active"
-
-    - debug:
-        var: uvicorn_logs.stdout_lines
-      when: uvicorn_status.stdout != "active"
+    
+    - name: Dump recent Uvicorn logs if not active
+      command: journalctl -u vectorization-service-uvicorn -n 50 --no-pager
+      when: uvicorn_status is defined and uvicorn_status.stdout != "active"
 
 
   handlers:
