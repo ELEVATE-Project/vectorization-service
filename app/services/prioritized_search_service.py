@@ -129,8 +129,16 @@ class PrioritizedSearchService:
 
         if acronyms_detected:
             for r in ranked_results:
-                r['tier'] = self._assign_acronym_tier(
+                tier = self._assign_acronym_tier(
                     r['payload'].get('title'), r['payload'].get('summary'), acronyms_detected)
+                # An acronym in a title is a claim about the topic, not evidence
+                # of it, and the bands make it unappealable (tier 4 owns
+                # [0.8, 1.0] after the score rewrite in search()), so require the
+                # body to have matched too. Demotion is to 0, never removal:
+                # filter_score reads weighted_score, never the tier.
+                if tier >= 3 and not self._body_matched(r.get('field_scores')):
+                    tier = 0
+                r['tier'] = tier
             ranked_results.sort(key=lambda r: (r['tier'], r['weighted_score']), reverse=True)
 
         if prefilter_scores_out is not None:
@@ -1502,6 +1510,23 @@ class PrioritizedSearchService:
             return False
         return longer.startswith(shorter)
 
+    @staticmethod
+    def _body_matched(field_scores: Optional[Dict[str, Any]]) -> bool:
+        """True when the document's BODY was itself near the query.
+
+        Reads the dense `text` similarity, which the per-field vector fan-out
+        produces on every query. None means the field never matched at all,
+        which is the signal wanted.
+
+        That is pool membership, so on a corpus much larger than the per-field
+        candidate limit (see _candidate_limit) a relevant document could read as
+        unmatched for a retrieval reason rather than a relevance one.
+        """
+        if not field_scores:
+            return False
+        score = field_scores.get("text")
+        return score is not None and score > 0
+
     def _assign_acronym_tier(
         self,
         title: Optional[str],
@@ -1534,6 +1559,10 @@ class PrioritizedSearchService:
         above genuinely relevant semantic-only matches. Title/summary matching
         doesn't have this problem since it checks the whole acronym/phrase, not
         an OR-bag of individual words.
+
+        Tiers 4/3 are a claim about the topic, not evidence of it. The caller in
+        _process_and_filter_results drops them to 0 when the document's own body
+        never matched (see _body_matched).
         """
         tier = 0
         for acronym, expansions in acronyms_detected.items():
