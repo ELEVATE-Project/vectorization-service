@@ -1907,6 +1907,16 @@ class PrioritizedSearchService:
                     if acronyms_detected
                     else 0
                 )
+                # Same body gate the scored path applies, for the same reason: an
+                # acronym in a title is a claim about the topic, not evidence of
+                # it. No vector query ever reached this document, so there is no
+                # body score that could satisfy the gate — and "never measured"
+                # must not outrank "measured and found unrelated", which is what
+                # leaving this ungated did (floor 0.15 x 1.5 boost, tier 4, an
+                # exposed 0.845 against a scored document's 0.14). The expansion
+                # tiers 2/1 are left alone, matching _process_and_filter_results.
+                if tier >= 3:
+                    tier = 0
                 # No scores to be consistent with, so any chunk represents the
                 # source equally well — keep the scrolled one.
                 point_id = point.id

@@ -445,18 +445,21 @@ class TestFieldMatchInjection:
             acronyms_detected=ACR,
         )[0]
 
-    def test_injected_tier_comes_from_the_shared_rule_not_the_lookup(
+    def test_injected_title_acronym_gets_no_tier_without_body_evidence(
             self, service, monkeypatch):
-        """A never-retrieved doc must be tiered like every scored doc.
+        """A never-retrieved doc cannot claim an acronym tier.
 
-        Deriving the tier from which scroll found the document gave a title
-        carrying the literal acronym tier 2, ranking it below a doc that merely
-        mentions the acronym in its summary (tier 3). _assign_acronym_tier says 4.
+        The tier still comes from the shared rule rather than from which scroll
+        found the document (see the expansion-tier test below, which is what now
+        protects that). But nothing was ever measured about this document's
+        body, and "never measured" must not outrank "measured and found
+        unrelated" — ungated it took floor 0.15 x the 1.5 title boost at tier 4,
+        an exposed 0.845 against a scored document's 0.14.
         """
         self._patch_scroll_with(monkeypatch, [
             _point("pt-a", "A", title="DIET Handbook 2024", summary="Annual guidance"),
         ])
-        assert self._inject_one(service, "A")["tier"] == 4
+        assert self._inject_one(service, "A")["tier"] == 0
 
     def test_injected_tier_zero_when_the_doc_has_no_acronym_signal(
             self, service, monkeypatch):
@@ -471,12 +474,12 @@ class TestFieldMatchInjection:
         ])
         assert self._inject_one(service, "B")["tier"] == 0
 
-    def test_injected_summary_match_gets_the_summary_tier(self, service, monkeypatch):
-        """Acronym in the summary but not the title is tier 3, not the guessed 1."""
+    def test_injected_summary_acronym_also_gets_no_tier(self, service, monkeypatch):
+        """Tier 3 is gated on the body for the same reason tier 4 is."""
         self._patch_scroll_with(monkeypatch, [
             _point("pt-c", "C", title="Annual Report", summary="The DIET met quarterly"),
         ])
-        assert self._inject_one(service, "C", field="summary")["tier"] == 3
+        assert self._inject_one(service, "C", field="summary")["tier"] == 0
 
     def test_injected_expansion_in_title_is_tier_two(self, service, monkeypatch):
         """The expansion tiers still fire through the injection path."""
@@ -679,6 +682,35 @@ class TestTieringFollowsLexicalRanking:
             service, monkeypatch, "hybrid",
             field_scores={"pt-A": {"title": 0.30}, "pt-B": {"title": 0.90}})
         assert "A" in [r.source_id for r in response.results]
+
+    def test_injected_never_scored_doc_gets_no_acronym_tier(self, service, monkeypatch):
+        """A document no vector query reached must not take an acronym tier.
+
+        _fetch_field_match_docs injects title/summary matches the threshold
+        dropped. On the floor branch nothing was ever measured about the
+        document, so "never measured" would otherwise outrank "measured and
+        found unrelated": floor 0.15 x the 1.5 title boost, tier 4, an exposed
+        0.845 against the scored document's 0.14.
+        """
+        chunk = _point("pt-Z", "Z", title="DIET Handbook", summary="", text="unrelated")
+        monkeypatch.setattr(
+            "app.services.prioritized_search_service.qdrant_client.scroll",
+            lambda **kwargs: ([chunk], None),
+        )
+
+        injected = service._fetch_field_match_docs(
+            ["Z"], {"Z": "partial"}, "title",
+            settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
+            prefilter_scores=None, acronyms_detected=dict(ACR))
+
+        assert len(injected) == 1
+        entry = injected[0]
+        # Still injected — the gate demotes, it never removes.
+        assert entry["payload"]["source_id"] == "Z"
+        # ...but with no acronym tier, since no body score exists to justify one.
+        assert entry["tier"] == 0
+        assert all(v is None for v in entry["field_scores"].values()
+                   if not isinstance(v, str))
 
     def test_body_matched_reads_the_dense_text_score(self, service):
         """The gate's signal is the dense `text` similarity, and only that."""
