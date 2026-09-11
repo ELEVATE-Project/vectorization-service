@@ -1,6 +1,7 @@
 import logging
 import time
 from typing import List, Dict, Optional, Any, Set
+import numpy as np
 from qdrant_client import models
 from qdrant_client.models import QueryRequest
 from app.core.clients.qdrant import qdrant_client
@@ -94,18 +95,33 @@ class PrioritizedSearchService:
         else:
             logger.info("No filters applied")
 
-    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None):
+    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None, prethreshold_by_source_out=None):
         """Process, rank, filter and deduplicate results.
 
         scoring_context_out: optional mutable dict forwarded to _rank_results so the
         caller can capture the per-query normalization context (min/max/pool size).
+
+        prethreshold_by_source_out: optional dict, filled with {source_id: best result}
+        before the threshold removes anything. Lets the keyword-match step below reuse
+        real scores. Pass None to skip it (semantic search, which never needs it).
         """
         logger.info(f"Total documents matched: {len(all_results)}")
 
         logger.info("Calculating weighted scores and ranking results")
         ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out)
         logger.info(f"Ranked results: {len(ranked_results)} documents")
-        
+
+        # Save the best chunk per source before filtering, so documents the threshold
+        # removes still have their real scores available later. Results are already
+        # sorted, so the first one we see per source is the best one.
+        if prethreshold_by_source_out is not None:
+            for entry in self._filter_best_per_source(ranked_results):
+                prethreshold_by_source_out[entry['payload'].get('source_id')] = entry
+            logger.info(
+                f"Captured {len(prethreshold_by_source_out)} pre-threshold sources "
+                f"for keyword-injection score reuse"
+            )
+
         # Apply filtering based on conditions
         if detail_filter_score is not None:
             logger.info("Applying detail_filter_score (field-level thresholds with OR logic)")
@@ -342,27 +358,32 @@ class PrioritizedSearchService:
                     }
                 )
             
+            # "hybrid" (default) applies the title/summary boost below; "semantic" skips
+            # it. Checked here, before ranking, so semantic search can also skip the
+            # extra bookkeeping that only the boost step needs.
+            search_mode = getattr(request, "search_mode", "hybrid")
+            boost_active = settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic"
+
             # Pass detail_filter_score if using field-level filtering.
             # scoring_context captures the per-query normalization reference (min/max/pool)
             # computed inside _rank_results; surfaced under search_config.scoring_context
             # when include_scoring_debug is set (see below).
             scoring_context: Dict[str, Any] = {}
+            # Only needed by the boost step below, so semantic search skips it.
+            prethreshold_by_source: Optional[Dict[str, Any]] = {} if boost_active else None
             top_results, unique_source_results = self._process_and_filter_results(
                 all_results, field_scores, weights, search_fields, top_k,
                 filter_score if not use_detail_filter else 0,
                 detail_filter_score if use_detail_filter else None,
                 scoring_context_out=scoring_context,
+                prethreshold_by_source_out=prethreshold_by_source,
             )
 
-            # Apply title boost when hybrid mode is active.
-            # Only two modes exist: "semantic" opts out of boosts; "hybrid" (the
-            # default) opts in. search_mode is validated to that set by Pydantic.
-            search_mode = getattr(request, "search_mode", "hybrid")
             # Source_ids injected by the title/summary boost below (filtered out of the
             # semantic pool). Tracked so total_results counts them — otherwise the
             # response could report fewer total than it returns.
             injected_source_ids: set = set()
-            if settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic":
+            if boost_active:
                 logger.info("Applying hybrid title + summary boost")
 
                 # Title boost (highest priority). Scroll retrieves prefix/partial
@@ -394,12 +415,23 @@ class PrioritizedSearchService:
                 # Inject title/summary-matched documents that were filtered out by the
                 # semantic score threshold (e.g. short abbreviation queries like "SMC").
                 # Title takes precedence when a source matched on both fields.
+                # These documents skip the score threshold, so we raise their score up to
+                # it. Without this they could come back scoring below the threshold the
+                # caller asked for. _floor_for returns whichever threshold is in use.
+                def _floor_for(field_name: str) -> float:
+                    if not use_detail_filter:
+                        return filter_score
+                    return getattr(detail_filter_score, field_name, 0.0) or 0.0
+
                 present_ids = {r["payload"].get("source_id") for r in top_results}
                 missing_title = [sid for sid in title_matches if sid not in present_ids]
                 if missing_title:
                     injected = self._fetch_field_match_docs(
                         missing_title, title_matches, "title",
                         settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
+                        prethreshold_by_source=prethreshold_by_source,
+                        query_embedding=query_embedding,
+                        score_floor=_floor_for("title"),
                     )
                     top_results = top_results + injected
                     present_ids.update(missing_title)
@@ -414,6 +446,9 @@ class PrioritizedSearchService:
                     injected = self._fetch_field_match_docs(
                         missing_summary, summary_matches, "summary",
                         settings.EXACT_SUMMARY_BOOST, settings.PARTIAL_SUMMARY_BOOST,
+                        prethreshold_by_source=prethreshold_by_source,
+                        query_embedding=query_embedding,
+                        score_floor=_floor_for("summary"),
                     )
                     top_results = top_results + injected
                     injected_source_ids.update(d["payload"].get("source_id") for d in injected)
@@ -896,6 +931,26 @@ class PrioritizedSearchService:
         """
         ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         return {key: idx + 1 for idx, (key, _) in enumerate(ordered)}
+
+    @staticmethod
+    def _cosine_similarity(a: Any, b: Any) -> Optional[float]:
+        """How similar two vectors are, 0 to 1. Same maths Qdrant uses (Distance.COSINE),
+        so the result is comparable to the scores Qdrant returns for a normal search.
+        Returns None, not 0.0, for a missing or unusable vector — None means "not scored".
+        """
+        if a is None or b is None:
+            return None
+        try:
+            va = np.asarray(a, dtype=np.float32)
+            vb = np.asarray(b, dtype=np.float32)
+        except (TypeError, ValueError):
+            return None
+        if va.ndim != 1 or va.shape != vb.shape:
+            return None
+        na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+        if na == 0.0 or nb == 0.0:
+            return None
+        return float(np.dot(va, vb) / (na * nb))
 
     def _rank_results(
         self,
@@ -1397,14 +1452,18 @@ class PrioritizedSearchService:
         field: str,
         exact_boost: float,
         partial_boost: float,
+        prethreshold_by_source: Optional[Dict[str, Dict[str, Any]]] = None,
+        query_embedding: Optional[Any] = None,
+        score_floor: float = 0.0,
     ) -> List[Dict[str, Any]]:
         """Fetch one representative chunk per source_id for documents that matched
         by ``field`` but were absent from semantic search results (e.g. short
         abbreviation queries where cosine similarity is too low to pass filter_score).
 
-        Each injected document receives a score derived from the boost multiplier
-        applied to a small floor value so it ranks below semantically strong results
-        but above no-result.
+        Each one gets a small score so it ranks below strong semantic results, raised to
+        ``score_floor`` (the threshold in use) so it never scores below what the caller
+        asked for. Per-field scores are reused from ``prethreshold_by_source`` when the
+        document was already scored, otherwise computed from its stored vectors.
 
         Optimized to fetch all missing documents in a single MatchAny query.
         """
@@ -1416,7 +1475,60 @@ class PrioritizedSearchService:
         FLOOR_SCORE = 0.15  # baseline before multiplier — keeps injected below strong semantic hits
         match_key = f"{field}_match"
         mult_key = f"{field}_multiplier"
+        prethreshold_by_source = prethreshold_by_source or {}
+
+        def _score_for(match_type: str) -> tuple:
+            """Returns (score, boost). Multiply first, then raise to the floor — doing it
+            the other way round (floor * boost) would push these above real search hits.
+            """
+            boost = exact_boost if match_type == "exact" else partial_boost
+            return min(max(FLOOR_SCORE * boost, score_floor), 1.0), boost
+
+        # Step 2: Documents we already scored earlier, before the threshold removed them.
+        # Their real scores are still in memory, so reuse them instead of asking Qdrant.
+        remaining: List[str] = []
+        for source_id in source_ids:
+            ranked = prethreshold_by_source.get(source_id)
+            if ranked is None:
+                remaining.append(source_id)
+                continue
+
+            match_type = matches.get(source_id, "partial")
+            score, boost = _score_for(match_type)
+
+            # Copy both dicts — the original is shared and must not be changed.
+            entry = dict(ranked)
+            entry["field_scores"] = dict(ranked.get("field_scores") or {})
+            entry["field_scores"][match_key] = match_type
+            entry["weighted_score"] = score
+            entry[mult_key] = boost
+            injected.append(entry)
+            logger.debug(
+                f"Reused pre-threshold scores for {field}-match doc {source_id} "
+                f"({match_type}), score {score:.4f}"
+            )
+
+        if not remaining:
+            logger.info(
+                f"Resolved all {len(source_ids)} missing '{field}' documents from the "
+                f"pre-threshold pool — no Qdrant request needed."
+            )
+            return injected
+
+        source_ids = remaining
         num_requests_before = len(source_ids)
+
+        # Step 3: The rest were never scored, so fetch their vectors and score them here.
+        # Skipped when there are too many to be worth downloading.
+        score_vectors = query_embedding is not None and len(source_ids) <= settings.INJECTED_DOC_SCORING_MAX
+        if query_embedding is not None and not score_vectors:
+            logger.info(
+                f"Skipping vector scoring for {len(source_ids)} injected '{field}' docs "
+                f"(over INJECTED_DOC_SCORING_MAX={settings.INJECTED_DOC_SCORING_MAX}); "
+                f"field_scores stay None."
+            )
+        # List the fields we want, never True — True would also download the BM25 vector.
+        with_vectors: Any = list(self.priority_order) if score_vectors else False
 
         logger.info(
             f"Resolving {num_requests_before} missing documents for field '{field}' boost. "
@@ -1451,7 +1563,7 @@ class PrioritizedSearchService:
                     limit=page_size,
                     offset=offset,
                     with_payload=True,
-                    with_vectors=False,
+                    with_vectors=with_vectors,
                 )
                 num_pages += 1
                 all_points.extend(batch)
@@ -1484,29 +1596,37 @@ class PrioritizedSearchService:
                 continue
             seen_sources.add(source_id)
 
-            # Step 4: Compute the boosted score.
-            # Match type is fetched from the matches cache (either 'exact' or 'partial')
-            # and multiplied with the floor score.
+            # Step 4: Compute the boosted score, floored at the caller's threshold.
             match_type = matches.get(source_id, "partial")
-            boost = exact_boost if match_type == "exact" else partial_boost
-            score = min(FLOOR_SCORE * boost, 1.0)
+            score, boost = _score_for(match_type)
 
-            # Injected docs were fetched via keyword/payload scroll — no vector query
-            # was run against them so no per-field cosine similarity exists.
-            # Use None (not 0.0) so the API consumer can distinguish
-            # "field was not scored" from "field scored exactly zero".
-            field_scores: Dict[str, Any] = {f: None for f in self.priority_order}
+            # Score each field against the query. A field is None when the document has
+            # no vector for it (empty fields are not stored) or scoring was skipped.
+            # None means "not scored" — never write 0.0 here, that means "scored zero".
+            vector_map = (getattr(point, "vector", None) or {}) if score_vectors else {}
+            field_scores: Dict[str, Any] = {
+                f: (self._cosine_similarity(query_embedding, vector_map.get(f))
+                    if score_vectors else None)
+                for f in self.priority_order
+            }
             field_scores[match_key] = match_type
+
+            # Combine the field scores using the same weights as a normal search, so this
+            # number can be compared against one. None when no field could be scored.
+            scored = [
+                (f, s) for f, s in field_scores.items()
+                if f in self.default_weights and isinstance(s, (int, float))
+            ]
+            raw_dense = (
+                sum(s * self.default_weights[f] for f, s in scored) if scored else None
+            )
 
             injected.append({
                 "id": point.id,
                 "payload": point.payload,
                 "weighted_score": score,
                 "field_scores": field_scores,
-                # raw_dense is undefined for keyword-injected docs (no vector query ran);
-                # None distinguishes it from a genuine 0.0. The matched field's multiplier
-                # is the boost that produced the floor score.
-                "raw_dense": None,
+                "raw_dense": raw_dense,
                 mult_key: boost,
             })
             logger.debug(f"Injected {field}-match doc {source_id} ({match_type}) with floor score {score:.4f}")

@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     EXACT_SUMMARY_BOOST: float = float(os.getenv("EXACT_SUMMARY_BOOST", "1.4"))
     PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.2"))
     METADATA_MATCH_BOOST: float = float(os.getenv("METADATA_MATCH_BOOST", "1.2"))
+    # How many keyword-matched documents we are willing to score per search. Scoring
+    # each one downloads 5 vectors, and a short query can match thousands of titles.
+    # Past this limit we skip scoring them and leave their field_scores as None.
+    INJECTED_DOC_SCORING_MAX: int = int(os.getenv("INJECTED_DOC_SCORING_MAX", "200"))
     # Queries shorter than this word count skip spaCy stop-word removal
     SHORT_QUERY_THRESHOLD: int = int(os.getenv("SHORT_QUERY_THRESHOLD", "3"))
     RRF_K: int = int(os.getenv("RRF_K", "60"))  # standard Reciprocal Rank Fusion constant
