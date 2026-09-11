@@ -17,16 +17,22 @@ def _normalize_token(raw_token: str) -> str:
 
 def detect_acronyms(query: str) -> Dict[str, List[str]]:
     """Detect acronyms in `query` via one batched Redis/Postgres lookup covering
-    every candidate token. Must be called with the case-preserving query, not
-    the lowercased/preprocessed one — these rules depend on case.
+    every candidate token.
 
-    Case rules:
-      - A fully-uppercase token (length > 1) is always checked.
-      - A single-word query is checked regardless of case.
-      - A lowercase/mixed-case word inside a multi-word query is skipped (e.g.
-        "diet" in "the diet chart" must not match the DIET acronym).
-      - An uppercase stopword (THE, AND, ON) in a multi-word query is dropped
-        before lookup; single-word queries are exempt so "BE" stays searchable.
+    Case-insensitive: every token of length > 1 is a candidate whatever its
+    case, and the acronym table is what decides. Requiring uppercase was the
+    stricter rule ("diet" in "the diet chart" must not match DIET), but it
+    assumed callers preserve the case the user typed, and the commons media API
+    lowercases the query before forwarding it — which silently disabled acronym
+    search for every multi-word query reaching this service. The table itself is
+    the narrow filter: a lowercase token that is not a registered acronym
+    resolves to nothing, so the only words that can now match spuriously are the
+    ones that are both everyday English and an acronym on file.
+
+    Remaining rules:
+      - A token shorter than 2 letters after normalization is skipped.
+      - A stopword (THE, AND, ON) in a multi-word query is dropped before
+        lookup; single-word queries are exempt so "BE" stays searchable.
     """
     if not query or not query.strip():
         return {}
@@ -43,9 +49,6 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
     for raw_token in raw_tokens:
         normalized = _normalize_token(raw_token)
         if len(normalized) < 2:
-            continue
-
-        if not (normalized.isupper() or is_single_word_query):
             continue
 
         if not is_single_word_query and normalized.lower() in STOP_WORDS:
