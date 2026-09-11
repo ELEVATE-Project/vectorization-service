@@ -129,15 +129,20 @@ class PrioritizedSearchService:
 
         if acronyms_detected:
             for r in ranked_results:
-                tier = self._assign_acronym_tier(
-                    r['payload'].get('title'), r['payload'].get('summary'), acronyms_detected)
+                title, summary = r['payload'].get('title'), r['payload'].get('summary')
+                tier = self._assign_acronym_tier(title, summary, acronyms_detected)
                 # An acronym in a title is a claim about the topic, not evidence
                 # of it, and the bands make it unappealable (tier 4 owns
                 # [0.8, 1.0] after the score rewrite in search()), so require the
-                # body to have matched too. Demotion is to 0, never removal:
-                # filter_score reads weighted_score, never the tier.
+                # body to have matched too. Falls back to the expansion tier
+                # rather than 0 — the ungated tiers must not be lost just because
+                # a literal acronym outranked them in _assign_acronym_tier's
+                # first-match chain, or adding the acronym to a title that
+                # already spells the expansion out would LOWER its rank.
+                # Demotion is never removal: filter_score reads weighted_score,
+                # never the tier.
                 if tier >= 3 and not self._body_matched(r.get('field_scores')):
-                    tier = 0
+                    tier = self._expansion_tier(title, summary, acronyms_detected)
                 r['tier'] = tier
             ranked_results.sort(key=lambda r: (r['tier'], r['weighted_score']), reverse=True)
 
@@ -1527,6 +1532,29 @@ class PrioritizedSearchService:
         score = field_scores.get("text")
         return score is not None and score > 0
 
+    def _expansion_tier(
+        self,
+        title: Optional[str],
+        summary: Optional[str],
+        acronyms_detected: Dict[str, List[str]],
+    ) -> int:
+        """The tier a document earns from EXPANSION matches alone: 2 in title,
+        1 in summary, 0 otherwise.
+
+        _assign_acronym_tier stops at its first match per acronym, so a literal
+        acronym (4/3) masks an expansion match (2/1) on the same document. The
+        body gate needs this to fall back to, otherwise zeroing a masked tier 4
+        would drop a title reading "DIET - District Institute of Education and
+        Training" below the same title without the acronym in it.
+        """
+        tier = 0
+        for expansions in acronyms_detected.values():
+            if any(self._phrase_in_text(exp, title) for exp in expansions):
+                tier = max(tier, 2)
+            elif any(self._phrase_in_text(exp, summary) for exp in expansions):
+                tier = max(tier, 1)
+        return tier
+
     def _assign_acronym_tier(
         self,
         title: Optional[str],
@@ -1913,10 +1941,14 @@ class PrioritizedSearchService:
                 # body score that could satisfy the gate — and "never measured"
                 # must not outrank "measured and found unrelated", which is what
                 # leaving this ungated did (floor 0.15 x 1.5 boost, tier 4, an
-                # exposed 0.845 against a scored document's 0.14). The expansion
-                # tiers 2/1 are left alone, matching _process_and_filter_results.
+                # exposed 0.845 against a scored document's 0.14). Falls back to
+                # the expansion tier, not 0, for the reason given there.
                 if tier >= 3:
-                    tier = 0
+                    tier = self._expansion_tier(
+                        point.payload.get("title"),
+                        point.payload.get("summary"),
+                        acronyms_detected,
+                    )
                 # No scores to be consistent with, so any chunk represents the
                 # source equally well — keep the scrolled one.
                 point_id = point.id

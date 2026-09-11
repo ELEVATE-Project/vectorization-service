@@ -489,6 +489,29 @@ class TestFieldMatchInjection:
         ])
         assert self._inject_one(service, "D")["tier"] == 2
 
+    def test_injected_acronym_does_not_erase_a_masked_expansion_tier(
+            self, service, monkeypatch):
+        """Adding the acronym to a title must never LOWER its tier.
+
+        _assign_acronym_tier stops at its first match, so the literal acronym
+        reports 4 and hides the expansion match on the same title. Zeroing that
+        outright made "DIET - District Institute of Education and Training"
+        rank below the same title with "DIET" removed. The gate falls back to
+        the expansion tier instead.
+        """
+        expansion = "District Institute of Education and Training"
+        self._patch_scroll_with(monkeypatch, [
+            _point("pt-f", "F", title=f"DIET — {expansion}", summary=""),
+        ])
+        assert self._inject_one(service, "F")["tier"] == 2
+
+        # Summary-only expansion falls back to 1, not 0.
+        self._patch_scroll_with(monkeypatch, [
+            _point("pt-g", "G", title="Annual Report",
+                   summary=f"Issued by DIET, the {expansion}"),
+        ])
+        assert self._inject_one(service, "G", field="summary")["tier"] == 1
+
     def test_no_acronyms_detected_keeps_every_injected_doc_at_tier_zero(
             self, service, monkeypatch):
         """Tiering stays a no-op for ordinary queries — unchanged contract."""
@@ -671,6 +694,17 @@ class TestTieringFollowsLexicalRanking:
         # Both land in the tier-0 band — demoted, NOT removed.
         assert len(response.results) == 2
         assert all(r.score < 0.2 for r in response.results)
+
+    def test_scored_path_also_falls_back_to_the_expansion_tier(self, service):
+        """Same fallback on the scored path, not only the injection one."""
+        expansion = ACR["DIET"][0]
+        both = f"DIET — {expansion}"
+        # The acronym masks the expansion match at 4 ...
+        assert service._assign_acronym_tier(both, None, dict(ACR)) == 4
+        # ... and the gate's fallback recovers 2 rather than dropping to 0.
+        assert service._expansion_tier(both, None, dict(ACR)) == 2
+        # A title with no expansion in it has nothing to fall back to.
+        assert service._expansion_tier("DIET Handbook", None, dict(ACR)) == 0
 
     def test_a_demoted_document_is_still_returned(self, service, monkeypatch):
         """filter_score reads weighted_score and never the tier.
