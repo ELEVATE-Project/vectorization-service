@@ -9,12 +9,12 @@ path only — it must never disturb an ordinary query. These tests pin:
    real score and field_scores when re-injected; one never retrieved still
    takes the untouched Release 2.0 floor.
 4. Title/summary multipliers unchanged.
-5. Acronym tiering — in particular that the EXPANSION tiers (2/1) actually fire.
-   Matching expansions as a literal phrase made them unreachable in practice
-   (verified live on q=DIET: every result landed in tier 4 or tier 0), so
-   _phrase_in_text matches on content words instead. These tests pin both that
-   it now fires for real title variants and that it does NOT fire for
-   near-misses that merely share common words.
+5. The acronym bonus that replaced hard tiers — in particular that the EXPANSION
+   grades actually fire. Matching expansions as a literal phrase made them
+   unreachable in practice (verified live on q=DIET), so _phrase_in_text matches
+   on content words instead. These tests pin both that it fires for real title
+   variants and that it does NOT fire for near-misses that merely share common
+   words — and that the bonus scales relevance rather than overriding it.
 6. The prefix-length floor (_words_match / ACRONYM_MIN_PREFIX_MATCH_LEN): content-word
    matching tolerates inflections via a prefix relationship, which unbounded
    let a single document letter satisfy a whole expansion word ("S M C
@@ -53,13 +53,13 @@ def _weighted_dense(field_scores):
     )
 
 
-# ── 1. Acronym tiering: expansion tiers must actually fire ────────────────
+# ── 1. Acronym bonus: expansion grades must actually fire ─────────────────
 
 ACR = {"DIET": ["District Institute of Education and Training"]}
 
 
 class TestPhraseInText:
-    """_phrase_in_text backs tiers 2/1 (expansion matched in title/summary)."""
+    """_phrase_in_text backs the expansion grades (expansion in title/summary)."""
 
     @pytest.mark.parametrize("title", [
         # the exact expansion
@@ -124,7 +124,7 @@ class TestPhraseInText:
 
 
 class TestWordsMatch:
-    """_words_match is the per-word rule _phrase_in_text applies (tiers 2/1)."""
+    """_words_match is the per-word rule _phrase_in_text applies (expansion grades)."""
 
     def test_exact_match(self, service):
         assert service._words_match("district", "district") is True
@@ -165,51 +165,96 @@ class TestWordsMatch:
         assert service._phrase_in_text("of and the", "totally unrelated title") is False
 
     def test_content_words_drops_stopwords(self, service):
-        assert service._content_words(ACR["DIET"][0]) == [
-            "district", "institute", "education", "training"]
+        # A tuple, not a list: _expansion_content_words is cached (the
+        # expansions are fixed for the request but it used to be recomputed
+        # inside every candidate's ranking call), so every caller now receives
+        # the SAME object. Handing out a mutable one would let any caller
+        # corrupt every later hit, so the immutability is part of the
+        # contract, not incidental.
+        assert service._expansion_content_words(ACR["DIET"][0]) == (
+            "district", "institute", "education", "training")
 
 
-class TestAssignAcronymTier:
-    def test_acronym_in_title_is_tier_4(self, service):
-        assert service._assign_acronym_tier("DIET Stakeholder Identity Map", None, ACR) == 4
+class TestAcronymBonus:
+    """The four grades that replaced tiers 4/2/3/1. `backed` is whether the
+    document's content mentions the acronym — required for the acronym grades
+    only."""
 
-    def test_acronym_in_summary_is_tier_3(self, service):
-        assert service._assign_acronym_tier("Some Title", "About the DIET programme", ACR) == 3
+    def test_acronym_in_title(self, service):
+        assert service._acronym_bonus(
+            "DIET Stakeholder Identity Map", None, ACR, True) == settings.ACRONYM_BONUS_TITLE_ACRONYM
 
-    def test_expansion_in_title_is_tier_2(self, service):
-        """The regression this fix targets: previously 0 because of the plural."""
-        assert service._assign_acronym_tier(
-            "Strengthening of District Institutes of Education and Training", None, ACR) == 2
+    def test_acronym_in_summary(self, service):
+        assert service._acronym_bonus(
+            "Some Title", "About the DIET programme", ACR, True) == settings.ACRONYM_BONUS_SUMMARY_ACRONYM
 
-    def test_expansion_in_summary_is_tier_1(self, service):
-        assert service._assign_acronym_tier(
-            "Some Title", "Run by the District Institute of Education and Training", ACR) == 1
+    def test_expansion_in_title(self, service):
+        """The plural regression: literal expansion matching never fired."""
+        assert service._acronym_bonus(
+            "Strengthening of District Institutes of Education and Training", None, ACR, False
+        ) == settings.ACRONYM_BONUS_TITLE_EXPANSION
 
-    def test_unrelated_is_tier_0(self, service):
-        assert service._assign_acronym_tier(
-            "Establishing Discipline Through Clear School Rules", "school rules", ACR) == 0
+    def test_expansion_in_summary(self, service):
+        assert service._acronym_bonus(
+            "Some Title", "Run by the District Institute of Education and Training", ACR, False
+        ) == settings.ACRONYM_BONUS_SUMMARY_EXPANSION
 
-    def test_acronym_beats_expansion_when_both_present(self, service):
-        assert service._assign_acronym_tier(
-            "DIET — District Institute of Education and Training", None, ACR) == 4
+    def test_unrelated_earns_nothing(self, service):
+        assert service._acronym_bonus(
+            "Establishing Discipline Through Clear School Rules", "school rules", ACR, True) == 0.0
+
+    def test_acronym_grade_beats_expansion_grade_when_both_present(self, service):
+        assert service._acronym_bonus(
+            "DIET — District Institute of Education and Training", None, ACR, True
+        ) == settings.ACRONYM_BONUS_TITLE_ACRONYM
 
     def test_literal_acronym_is_not_substring_matched(self, service):
-        """'DIET' must never match inside 'dietary' — tier 4/3 stays exact."""
-        assert service._assign_acronym_tier("Dietary guidelines for schools", None, ACR) == 0
+        """'DIET' must never match inside 'dietary', backed or not."""
+        assert service._acronym_bonus("Dietary guidelines for schools", None, ACR, True) == 0.0
 
     def test_underscore_separated_title_still_matches(self, service):
         """Filename-style titles use '_' as a separator; \\b would miss these."""
-        assert service._assign_acronym_tier(
-            "source_doc_COE_AM4C2_DIET_Empowerment_Design.xlsx", None, ACR) == 4
+        assert service._acronym_bonus(
+            "source_doc_COE_AM4C2_DIET_Empowerment_Design.xlsx", None, ACR, True
+        ) == settings.ACRONYM_BONUS_TITLE_ACRONYM
 
-    def test_multiple_acronyms_take_the_max_tier(self, service):
+    def test_multiple_acronyms_sum_their_own_best_grades(self, service):
+        """AC-15: a document matching both SMC and DIET must rank above one
+        matching only DIET — so multiple detected acronyms sum their own best
+        grades (each computed independently) rather than the whole bonus
+        collapsing to a single max across all of them."""
         acr = {
             "DIET": ["District Institute of Education and Training"],
             "SMC": ["School Management Committee"],
         }
-        # expansion-only match for one, literal match for the other
-        assert service._assign_acronym_tier(
-            "SMC handbook", "District Institute of Education and Training", acr) == 4
+        # literal match for SMC (title), expansion-only match for DIET (summary)
+        assert service._acronym_bonus(
+            "SMC handbook", "District Institute of Education and Training", acr, True
+        ) == settings.ACRONYM_BONUS_TITLE_ACRONYM + settings.ACRONYM_BONUS_SUMMARY_EXPANSION
+
+    def test_multiple_acronyms_summed_bonus_is_capped(self, service):
+        """The sum is bounded — two acronyms both landing a full title match
+        must not double the bonus outright."""
+        acr = {
+            "DIET": ["District Institute of Education and Training"],
+            "SMC": ["School Management Committee"],
+        }
+        uncapped = settings.ACRONYM_BONUS_TITLE_ACRONYM * 2
+        assert uncapped > settings.ACRONYM_BONUS_MULTI_MATCH_CAP
+        assert service._acronym_bonus("SMC DIET handbook", None, acr, True) == settings.ACRONYM_BONUS_MULTI_MATCH_CAP
+
+    def test_title_claim_without_content_evidence_earns_nothing(self, service):
+        """A title is a claim about the topic, not evidence — the corpus holds
+        documents titled 'DIET Reference Handbook' about coastal navigation."""
+        assert service._acronym_bonus("DIET Reference Handbook", None, ACR, False) == 0.0
+
+    def test_unbacked_acronym_keeps_its_expansion_grade(self, service):
+        """Every grade is evaluated, so an unbacked acronym never erases the
+        expansion grade the same title earns on its own — adding 'DIET' to a
+        title that spells the expansion out must not LOWER its rank."""
+        assert service._acronym_bonus(
+            f"DIET — {ACR['DIET'][0]}", None, ACR, False
+        ) == settings.ACRONYM_BONUS_TITLE_EXPANSION
 
 
 class TestFusionFormulaHasNoAcronymBranch:
@@ -406,7 +451,6 @@ class TestFieldMatchInjection:
             "field_scores": {"text": 0.29},
             "raw_dense": 0.2228,
             "keyword_score": 0.0,
-            "tier": 4,
         }
         entry = service._fetch_field_match_docs(
             ["900"], {"900": "partial"}, "title",
@@ -434,7 +478,12 @@ class TestFieldMatchInjection:
             lambda **kwargs: (points, None),
         )
 
-    def _inject_one(self, service, source_id, field="title"):
+    def _inject_one(self, service, monkeypatch, source_id, field="title", backed=()):
+        """`backed`: source ids whose content mentions the acronym (the BM25
+        check is stubbed, so these tests never reach Qdrant)."""
+        monkeypatch.setattr(
+            PrioritizedSearchService, "_sources_with_acronym_in_body",
+            lambda self, candidates: set(backed))
         boosts = (
             (settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST)
             if field == "title"
@@ -445,76 +494,89 @@ class TestFieldMatchInjection:
             acronyms_detected=ACR,
         )[0]
 
-    def test_injected_title_acronym_gets_no_tier_without_body_evidence(
+    def test_injected_title_acronym_gets_no_bonus_without_content_evidence(
             self, service, monkeypatch):
-        """A never-retrieved doc cannot claim an acronym tier.
+        """A never-retrieved doc can't claim the acronym bonus on its title alone.
 
-        The tier still comes from the shared rule rather than from which scroll
-        found the document (see the expansion-tier test below, which is what now
-        protects that). But nothing was ever measured about this document's
-        body, and "never measured" must not outrank "measured and found
-        unrelated" — ungated it took floor 0.15 x the 1.5 title boost at tier 4,
-        an exposed 0.845 against a scored document's 0.14.
+        The bonus comes from the shared rule (_acronym_bonus), not from which
+        scroll found the document — and that rule needs the content to mention
+        the acronym. Ungated, the old tiers put floor 0.15 x the 1.5 title
+        boost at tier 4: an exposed 0.845 against a scored document's 0.14.
         """
         self._patch_scroll_with(monkeypatch, [
             _point("pt-a", "A", title="DIET Handbook 2024", summary="Annual guidance"),
         ])
-        assert self._inject_one(service, "A")["tier"] == 0
+        entry = self._inject_one(service, monkeypatch, "A")
+        assert entry["acronym_bonus"] == 0.0
+        assert entry["weighted_score"] == pytest.approx(
+            self.FLOOR * settings.PARTIAL_TITLE_BOOST)
 
-    def test_injected_tier_zero_when_the_doc_has_no_acronym_signal(
+    def test_injected_title_acronym_with_content_evidence_earns_the_bonus(
+            self, service, monkeypatch):
+        """The content check is per document, so a document missing from the
+        retrieval pool — which pool depends on top_k — still earns the bonus
+        its content supports. Without this the bonus would be page-size
+        dependent on the injection path."""
+        self._patch_scroll_with(monkeypatch, [
+            _point("pt-a", "A", title="DIET Handbook 2024", summary="Annual guidance"),
+        ])
+        entry = self._inject_one(service, monkeypatch, "A", backed={"A"})
+        assert entry["acronym_bonus"] == settings.ACRONYM_BONUS_TITLE_ACRONYM
+        assert entry["weighted_score"] == pytest.approx(
+            self.FLOOR * settings.PARTIAL_TITLE_BOOST
+            * (1 + settings.ACRONYM_BONUS_TITLE_ACRONYM))
+
+    def test_injected_doc_with_no_acronym_signal_earns_nothing(
             self, service, monkeypatch):
         """The title lookup also matches ordinary query words.
 
         'Teacher training calendar' is found by the scroll for a query like
-        'DIET training' but carries no acronym or expansion — the shared rule
-        says tier 0, where the old lookup-derived guess handed out tier 2.
+        'DIET training' but carries no acronym or expansion.
         """
         self._patch_scroll_with(monkeypatch, [
             _point("pt-b", "B", title="Teacher training calendar", summary="Dates"),
         ])
-        assert self._inject_one(service, "B")["tier"] == 0
+        assert self._inject_one(service, monkeypatch, "B", backed={"B"})["acronym_bonus"] == 0.0
 
-    def test_injected_summary_acronym_also_gets_no_tier(self, service, monkeypatch):
-        """Tier 3 is gated on the body for the same reason tier 4 is."""
+    def test_injected_summary_acronym_also_needs_content_evidence(self, service, monkeypatch):
+        """The summary grade is gated on content for the same reason the title one is."""
         self._patch_scroll_with(monkeypatch, [
             _point("pt-c", "C", title="Annual Report", summary="The DIET met quarterly"),
         ])
-        assert self._inject_one(service, "C", field="summary")["tier"] == 0
+        assert self._inject_one(service, monkeypatch, "C", field="summary")["acronym_bonus"] == 0.0
 
-    def test_injected_expansion_in_title_is_tier_two(self, service, monkeypatch):
-        """The expansion tiers still fire through the injection path."""
+    def test_injected_expansion_in_title_earns_the_expansion_grade(self, service, monkeypatch):
+        """Expansion grades fire through the injection path, no content check needed."""
         self._patch_scroll_with(monkeypatch, [
             _point("pt-d", "D",
                    title="District Institutes of Education and Training", summary=""),
         ])
-        assert self._inject_one(service, "D")["tier"] == 2
+        assert self._inject_one(service, monkeypatch, "D")["acronym_bonus"] == \
+            settings.ACRONYM_BONUS_TITLE_EXPANSION
 
-    def test_injected_acronym_does_not_erase_a_masked_expansion_tier(
+    def test_unbacked_acronym_does_not_erase_the_expansion_grade(
             self, service, monkeypatch):
-        """Adding the acronym to a title must never LOWER its tier.
-
-        _assign_acronym_tier stops at its first match, so the literal acronym
-        reports 4 and hides the expansion match on the same title. Zeroing that
-        outright made "DIET - District Institute of Education and Training"
-        rank below the same title with "DIET" removed. The gate falls back to
-        the expansion tier instead.
-        """
+        """Adding the acronym to a title must never LOWER its rank: an unbacked
+        "DIET - District Institute of Education and Training" keeps the
+        expansion grade the same title earns without "DIET" in it."""
         expansion = "District Institute of Education and Training"
         self._patch_scroll_with(monkeypatch, [
             _point("pt-f", "F", title=f"DIET — {expansion}", summary=""),
         ])
-        assert self._inject_one(service, "F")["tier"] == 2
+        assert self._inject_one(service, monkeypatch, "F")["acronym_bonus"] == \
+            settings.ACRONYM_BONUS_TITLE_EXPANSION
 
-        # Summary-only expansion falls back to 1, not 0.
+        # Summary-only expansion keeps the summary expansion grade.
         self._patch_scroll_with(monkeypatch, [
             _point("pt-g", "G", title="Annual Report",
                    summary=f"Issued by DIET, the {expansion}"),
         ])
-        assert self._inject_one(service, "G", field="summary")["tier"] == 1
+        assert self._inject_one(service, monkeypatch, "G", field="summary")["acronym_bonus"] == \
+            settings.ACRONYM_BONUS_SUMMARY_EXPANSION
 
-    def test_no_acronyms_detected_keeps_every_injected_doc_at_tier_zero(
+    def test_no_acronyms_detected_gives_no_injected_doc_a_bonus(
             self, service, monkeypatch):
-        """Tiering stays a no-op for ordinary queries — unchanged contract."""
+        """The bonus is a no-op for ordinary queries — Release 2.0 floor x boost."""
         self._patch_scroll_with(monkeypatch, [
             _point("pt-e", "E", title="DIET Handbook", summary="About the DIET"),
         ])
@@ -522,21 +584,30 @@ class TestFieldMatchInjection:
             ["E"], {"E": "partial"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
         )[0]
-        assert entry["tier"] == 0
+        assert entry["acronym_bonus"] == 0.0
+        assert entry["weighted_score"] == pytest.approx(
+            self.FLOOR * settings.PARTIAL_TITLE_BOOST)
 
-    def test_scored_doc_still_keeps_its_pipeline_tier(self, service, monkeypatch):
-        """The fallback path is untouched — it already carried the real tier."""
+    def test_scored_doc_keeps_its_pipeline_bonus_applied_once(self, service, monkeypatch):
+        """The fallback carries the bonus the pipeline decided, and is re-scored
+        from its RELEVANCE — its weighted_score may already include the bonus
+        (a source cut by the top_k cap), and applying it again would count the
+        title twice."""
         self._patch_scroll_with(monkeypatch, [
             _point("pt-f", "F", title="Unrelated chunk title", summary=""),
         ])
-        real = {"id": "pt-f", "payload": {"source_id": "F"}, "weighted_score": 0.31,
-                "field_scores": {}, "tier": 3}
+        bonus = settings.ACRONYM_BONUS_SUMMARY_ACRONYM
+        real = {"id": "pt-f", "payload": {"source_id": "F"},
+                "relevance": 0.31, "weighted_score": 0.31 * (1 + bonus),
+                "acronym_bonus": bonus, "field_scores": {}}
         entry = service._fetch_field_match_docs(
             ["F"], {"F": "partial"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
             prefilter_scores={"F": real}, acronyms_detected=ACR,
         )[0]
-        assert entry["tier"] == 3
+        assert entry["acronym_bonus"] == bonus
+        assert entry["weighted_score"] == pytest.approx(
+            0.31 * settings.PARTIAL_TITLE_BOOST * (1 + bonus))
 
 
 # ── 5. Multipliers themselves are untouched ───────────────────────────────────
@@ -572,36 +643,83 @@ class TestFieldBoostUnchanged:
 # ── 6. Acronym retrieval still works ──────────────────────────────────────────
 
 class TestAcronymExpansionStillDrivesRetrieval:
+    """Patch target note: this suite used to stub `get_acronym_mapping` with
+    `raising=False`. That function was renamed to `get_expansions_batch`, and
+    because `raising=False` suppresses monkeypatch's "target does not exist"
+    error, the stub silently became a no-op — the real lookup ran instead,
+    hitting Redis and Postgres and failing anywhere the acronym_mapping table
+    wasn't populated. Never pass `raising=False` here: the whole point of the
+    check is to fail loudly the next time the function moves.
+    """
+
+    @staticmethod
+    def _fake_lookup(expansions_by_acronym):
+        """Stand-in for get_expansions_batch, matching its real contract:
+        takes the candidate tokens, returns only the ones it recognizes. A
+        stub that ignored its argument would pass even if detect_acronyms
+        looked up entirely the wrong tokens."""
+        def _lookup(acronyms):
+            return {a: expansions_by_acronym[a] for a in acronyms if a in expansions_by_acronym}
+        return _lookup
+
     def test_detected_acronym_yields_expansions(self, monkeypatch):
         """DIET must expand so 'District Institute...' documents are reachable."""
         import app.services.acronym_query_service as aqs
 
         monkeypatch.setattr(
-            aqs, "get_acronym_mapping",
-            lambda: {"DIET": ["District Institute of Education and Training"]},
-            raising=False,
+            aqs, "get_expansions_batch",
+            self._fake_lookup({"DIET": ["District Institute of Education and Training"]}),
         )
         detected = aqs.detect_acronyms("DIET")
         assert "DIET" in detected
         assert any("District Institute" in e for e in detected["DIET"])
 
+    def test_lookup_receives_normalized_candidates(self, monkeypatch):
+        """The tokens sent to the dictionary are uppercased and stripped of
+        punctuation. Pinning this is what the old stub couldn't do: it took no
+        argument, so detect_acronyms could have sent anything at all."""
+        import app.services.acronym_query_service as aqs
 
-# ── 7. Tiering is a lexical signal and rides the lexical switch ───────────────
+        seen = {}
 
-class TestTieringFollowsLexicalRanking:
-    """Acronym tiering must not outlive the boost block it is scored alongside.
+        def _capture(acronyms):
+            seen["candidates"] = list(acronyms)
+            return {"DIET": ["District Institute of Education and Training"]}
 
-    Tier ordering used to run unconditionally while the rewrite that folds tier
-    into the exposed score sat inside the `HYBRID_SEARCH_ENABLED and search_mode
-    != "semantic"` boost block. A semantic-mode acronym query therefore came back
-    tier-ORDERED with raw scores that contradicted the order, and any caller
-    re-sorting by score undid the ranking. Tiering is lexical — the same family
-    as the title boost semantic mode already opts out of — so it rides the same
-    switch.
+        monkeypatch.setattr(aqs, "get_expansions_batch", _capture)
+        aqs.detect_acronyms("D.I.E.T. handbook")
 
-    Doc A scores worse semantically but carries the acronym in its title; doc B
-    scores better with no acronym signal. Hybrid ranks A first (tier 4 beats tier
-    0); semantic ranks B first (pure similarity, no tiers).
+        # "D.I.E.T." normalizes to DIET; "handbook" is a candidate too (the
+        # dictionary, not the tokenizer, is what rejects ordinary words).
+        assert "DIET" in seen["candidates"]
+        assert all(c == c.upper() for c in seen["candidates"])
+
+    def test_empty_expansions_are_dropped(self, monkeypatch):
+        """A row with an empty expansions list must not reach the caller —
+        downstream code indexes expansions[0] unguarded."""
+        import app.services.acronym_query_service as aqs
+
+        monkeypatch.setattr(
+            aqs, "get_expansions_batch",
+            lambda acronyms: {"DIET": [], "SMC": ["School Management Committee"]},
+        )
+        detected = aqs.detect_acronyms("DIET SMC")
+        assert "DIET" not in detected
+        assert detected["SMC"] == ["School Management Committee"]
+
+
+# ── 7. The acronym bonus is lexical, scales relevance, rides the lexical switch ─
+
+class TestAcronymBonusFollowsLexicalRanking:
+    """The acronym bonus replaced hard tiers, and rides the same switch as the
+    title/summary boost: on in hybrid mode, off in semantic mode and when
+    HYBRID_SEARCH_ENABLED is false.
+
+    Doc A carries the acronym in its title; doc B carries none. Under tiers A
+    always won — tier 4 beat tier 0 however much weaker A was. Now the bonus
+    multiplies A's relevance by (1 + ACRONYM_BONUS_TITLE_ACRONYM), so A wins only
+    when it is close enough for the title to make up the difference. In the
+    default fixture A (0.135) is well under half of B (0.324), so B wins.
     """
 
     def _run(self, service, monkeypatch, search_mode, hybrid_enabled=True,
@@ -622,11 +740,11 @@ class TestTieringFollowsLexicalRanking:
             "pt-A": _point("pt-A", "A", title="DIET Handbook", summary="", text="a"),
             "pt-B": _point("pt-B", "B", title="Nutrition guide", summary="", text="b"),
         }
-        # pt-A carries a `text` score as well as the title one: an acronym tier
-        # now requires the document's own body to have matched too, and a
-        # title-only fixture models the document that rule demotes, not the
-        # genuine acronym hit this class is about. pt-B stays title-only — it
-        # has no acronym signal either way.
+        # pt-A carries a `text` score as well as the title one: the acronym
+        # bonus requires the document's content to back the title, and with
+        # BM25 off here that falls back to "the body matched". A title-only
+        # fixture models the document that rule denies. pt-B stays title-only —
+        # it has no acronym signal either way.
         field_scores = field_scores or {
             "pt-A": {"title": 0.30, "text": 0.10},
             "pt-B": {"title": 0.90},
@@ -634,7 +752,7 @@ class TestTieringFollowsLexicalRanking:
         monkeypatch.setattr(
             PrioritizedSearchService, "_parallel_batch_search",
             lambda self, **kw: (all_results, field_scores))
-        # Keep the boost itself out of it — this is about tiering, not multipliers.
+        # Keep the title/summary multipliers out of it — this is about the bonus.
         monkeypatch.setattr(
             PrioritizedSearchService, "_get_field_match_sources",
             lambda self, *a, **kw: {})
@@ -659,13 +777,30 @@ class TestTieringFollowsLexicalRanking:
         rescored = sorted(response.results, key=lambda r: r.score, reverse=True)
         assert [r.source_id for r in rescored] == as_returned
 
-    def test_hybrid_mode_still_tiers_and_bands_the_scores(self, service, monkeypatch):
-        """Acronym ranking is untouched where it was already coherent."""
+    def test_hybrid_mode_bonus_cannot_lift_a_much_weaker_document(self, service, monkeypatch):
+        """THE requirement: a title nudges, it never buries a stronger document.
+
+        Under tiers A came first here. Its relevance is well under half of B's,
+        so a title worth +20% can't close that gap — and scores are no longer
+        banded, so each reads as relevance, bonus included.
+        """
         response = self._run(service, monkeypatch, "hybrid")
+        assert [r.source_id for r in response.results] == ["B", "A"]
+        relevance_a = 0.30 * WEIGHTS["title"] + 0.10 * WEIGHTS["text"]
+        relevance_b = 0.90 * WEIGHTS["title"]
+        assert response.results[0].score == pytest.approx(relevance_b)
+        assert response.results[1].score == pytest.approx(
+            relevance_a * (1 + settings.ACRONYM_BONUS_TITLE_ACRONYM))
+
+    def test_hybrid_mode_bonus_closes_a_small_gap(self, service, monkeypatch):
+        """...but a title does lift a document that's nearly as relevant.
+
+        A at 0.80 title similarity is ~3% short of B; the +20% title bonus
+        carries it past. This is the case tiers got right, kept."""
+        response = self._run(
+            service, monkeypatch, "hybrid",
+            field_scores={"pt-A": {"title": 0.80, "text": 0.10}, "pt-B": {"title": 0.90}})
         assert [r.source_id for r in response.results] == ["A", "B"]
-        # A sits in the tier-4 band, B in the tier-0 band
-        assert 0.8 <= response.results[0].score < 1.0
-        assert 0.0 <= response.results[1].score < 0.2
 
     def test_hybrid_mode_order_is_reproducible_from_the_scores(
             self, service, monkeypatch):
@@ -675,39 +810,34 @@ class TestTieringFollowsLexicalRanking:
         rescored = sorted(response.results, key=lambda r: r.score, reverse=True)
         assert [r.source_id for r in rescored] == as_returned
 
-    def test_title_acronym_without_a_body_match_does_not_take_tier_4(
+    def test_title_acronym_without_content_evidence_earns_no_bonus(
             self, service, monkeypatch):
-        """The gate: a title is a claim of topic, not evidence of it.
+        """A title is a claim of topic, not evidence of it.
 
-        Documents carrying DIET in the title over an unrelated body outranked
-        genuine DIET material on the live corpus — tier 4 owns [0.8, 1.0] after
-        the score rewrite, so no relevance score can cross the boundary. Same
-        fixture as the class default, minus pt-A's `text` score: pt-A keeps its
-        DIET title but its body never matched.
+        The close-gap fixture again, minus pt-A's body score: with BM25 off here
+        the check falls back to "did the body match at all", and it didn't. A
+        loses the bonus that carried it past B above, so B's higher relevance
+        wins — and A keeps its plain relevance, demoted but not removed.
         """
         response = self._run(
             service, monkeypatch, "hybrid",
-            field_scores={"pt-A": {"title": 0.30}, "pt-B": {"title": 0.90}})
-        # A loses the tier-4 band it would otherwise hold, so B's higher
-        # similarity wins.
+            field_scores={"pt-A": {"title": 0.80}, "pt-B": {"title": 0.90}})
         assert [r.source_id for r in response.results] == ["B", "A"]
-        # Both land in the tier-0 band — demoted, NOT removed.
-        assert len(response.results) == 2
-        assert all(r.score < 0.2 for r in response.results)
+        assert response.results[1].score == pytest.approx(0.80 * WEIGHTS["title"])
 
-    def test_scored_path_also_falls_back_to_the_expansion_tier(self, service):
-        """Same fallback on the scored path, not only the injection one."""
-        expansion = ACR["DIET"][0]
-        both = f"DIET — {expansion}"
-        # The acronym masks the expansion match at 4 ...
-        assert service._assign_acronym_tier(both, None, dict(ACR)) == 4
-        # ... and the gate's fallback recovers 2 rather than dropping to 0.
-        assert service._expansion_tier(both, None, dict(ACR)) == 2
+    def test_scored_path_keeps_the_expansion_grade_when_the_acronym_is_unbacked(
+            self, service):
+        """Same rule on the scored path as the injection one."""
+        both = f"DIET — {ACR['DIET'][0]}"
+        assert service._acronym_bonus(both, None, dict(ACR), True) == \
+            settings.ACRONYM_BONUS_TITLE_ACRONYM
+        assert service._acronym_bonus(both, None, dict(ACR), False) == \
+            settings.ACRONYM_BONUS_TITLE_EXPANSION
         # A title with no expansion in it has nothing to fall back to.
-        assert service._expansion_tier("DIET Handbook", None, dict(ACR)) == 0
+        assert service._acronym_bonus("DIET Handbook", None, dict(ACR), False) == 0.0
 
     def test_a_demoted_document_is_still_returned(self, service, monkeypatch):
-        """filter_score reads weighted_score and never the tier.
+        """filter_score reads relevance and never the bonus.
 
         A title match IS a legitimate match; it just isn't proof of topic, so
         it ranks low rather than disappearing.
@@ -717,8 +847,9 @@ class TestTieringFollowsLexicalRanking:
             field_scores={"pt-A": {"title": 0.30}, "pt-B": {"title": 0.90}})
         assert "A" in [r.source_id for r in response.results]
 
-    def test_injected_never_scored_doc_gets_no_acronym_tier(self, service, monkeypatch):
-        """A document no vector query reached must not take an acronym tier.
+    def test_injected_never_scored_doc_gets_no_acronym_bonus(self, service, monkeypatch):
+        """A document no vector query reached must not take an acronym bonus
+        unless its content backs it.
 
         _fetch_field_match_docs injects title/summary matches the threshold
         dropped. On the floor branch nothing was ever measured about the
@@ -731,6 +862,10 @@ class TestTieringFollowsLexicalRanking:
             "app.services.prioritized_search_service.qdrant_client.scroll",
             lambda **kwargs: ([chunk], None),
         )
+        # Content check: this document's content doesn't mention DIET.
+        monkeypatch.setattr(
+            PrioritizedSearchService, "_sources_with_acronym_in_body",
+            lambda self, candidates: set())
 
         injected = service._fetch_field_match_docs(
             ["Z"], {"Z": "partial"}, "title",
@@ -741,13 +876,14 @@ class TestTieringFollowsLexicalRanking:
         entry = injected[0]
         # Still injected — the gate demotes, it never removes.
         assert entry["payload"]["source_id"] == "Z"
-        # ...but with no acronym tier, since no body score exists to justify one.
-        assert entry["tier"] == 0
+        # ...but with no acronym bonus, since nothing backs the title's claim.
+        assert entry["acronym_bonus"] == 0.0
         assert all(v is None for v in entry["field_scores"].values()
                    if not isinstance(v, str))
 
     def test_body_matched_reads_the_dense_text_score(self, service):
-        """The gate's signal is the dense `text` similarity, and only that."""
+        """The FALLBACK content check (BM25 unavailable) reads the dense `text`
+        similarity, and only that."""
         assert service._body_matched({"text": 0.4}) is True
         assert service._body_matched({"text": None}) is False
         assert service._body_matched({"text": 0.0}) is False
@@ -756,7 +892,7 @@ class TestTieringFollowsLexicalRanking:
         # A sparse score alone must not satisfy it.
         assert service._body_matched({settings.SPARSE_VECTOR_NAME: 37.2}) is False
 
-    def test_hybrid_kill_switch_off_also_drops_tiering(self, service, monkeypatch):
+    def test_hybrid_kill_switch_off_also_drops_the_bonus(self, service, monkeypatch):
         """HYBRID_SEARCH_ENABLED=false trips the same switch as semantic mode."""
         response = self._run(service, monkeypatch, "hybrid", hybrid_enabled=False)
         assert [r.source_id for r in response.results] == ["B", "A"]
@@ -768,7 +904,7 @@ class TestTieringFollowsLexicalRanking:
         response = self._run(service, monkeypatch, "semantic")
         assert response.acronym_info == {"detected": True, "mapping": dict(ACR)}
 
-    def test_tiering_is_skipped_not_just_unused_in_semantic_mode(
+    def test_bonus_is_skipped_not_just_unused_in_semantic_mode(
             self, service, monkeypatch):
         """_process_and_filter_results must receive None, not an empty gesture."""
         seen = {}
@@ -783,7 +919,7 @@ class TestTieringFollowsLexicalRanking:
         self._run(service, monkeypatch, "semantic")
         assert seen["acronyms_detected"] is None
 
-    def test_tiering_is_passed_through_in_hybrid_mode(self, service, monkeypatch):
+    def test_bonus_is_passed_through_in_hybrid_mode(self, service, monkeypatch):
         seen = {}
         original = PrioritizedSearchService._process_and_filter_results
 
