@@ -524,7 +524,17 @@ def list_acronyms(
         if is_active is not None:
             query = query.filter(AcronymMapping.is_active.is_(is_active))
         if prefix and prefix.strip():
-            query = query.filter(AcronymMapping.acronym.like(f"{prefix.strip().upper()}%"))
+            # Escape LIKE's own wildcards (%, _) so a prefix containing them is
+            # matched as a literal string, not as a broader pattern.
+            escaped_prefix = (
+                prefix.strip().upper()
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            query = query.filter(
+                AcronymMapping.acronym.like(f"{escaped_prefix}%", escape="\\")
+            )
         total = query.count()
         rows = (
             query.order_by(AcronymMapping.acronym)
