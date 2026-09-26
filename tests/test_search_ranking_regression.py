@@ -310,14 +310,14 @@ class TestFilterAndOrderingUnchanged:
         )
         assert len(top) == 2
 
-    def test_prefilter_scores_out_captures_pre_filter_entries(self, service):
+    def test_prethreshold_by_source_out_captures_pre_filter_entries(self, service):
         """The snapshot must include sources the threshold then removes — that is
         the whole point of taking it before filtering."""
         all_results, field_scores = self._fixture()
         snapshot = {}
         top, _ = service._process_and_filter_results(
             all_results, field_scores, WEIGHTS, FIELDS, top_k=10, threshold=0.9,
-            prefilter_scores_out=snapshot,
+            prethreshold_by_source_out=snapshot,
         )
         kept = {r["payload"]["source_id"] for r in top}
         assert set(snapshot) == {"1", "2", "3", "4"}
@@ -365,8 +365,13 @@ class TestFieldMatchInjection:
         assert entry["raw_dense"] is None
         assert entry["title_multiplier"] == settings.PARTIAL_TITLE_BOOST
 
-    def test_scored_but_filtered_source_keeps_its_real_score(self, service, monkeypatch):
-        """The fix: the multiplier must apply to a real score, not a constant."""
+    def test_reused_source_keeps_real_field_scores_not_weighted_score(self, service, monkeypatch):
+        """A reused (pre-threshold) source still gets the floor/score_floor formula
+        for weighted_score, same as a never-scored document — the guarantee that an
+        injected document never reads as scoring below the caller's threshold applies
+        uniformly. What DOES survive from the real pipeline scoring is the per-field
+        breakdown (field_scores/raw_dense/keyword_score), so debug output stays
+        accurate even though the ranking score itself is the floor-based one."""
         self._patch_scroll(monkeypatch, ["219"])
         real = {
             "id": "pt-219",
@@ -379,19 +384,21 @@ class TestFieldMatchInjection:
         injected = service._fetch_field_match_docs(
             ["219"], {"219": "partial"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-            prefilter_scores={"219": real},
+            prethreshold_by_source={"219": real},
         )
         entry = injected[0]
         assert entry["weighted_score"] == pytest.approx(
-            0.31 * settings.PARTIAL_TITLE_BOOST)
+            self.FLOOR * settings.PARTIAL_TITLE_BOOST)
         # real per-field similarities survive instead of being blanked
         assert entry["field_scores"]["tags"] == 0.61
         assert entry["field_scores"]["title_match"] == "partial"
         assert entry["raw_dense"] == 0.2228
         assert entry["keyword_score"] == 0.0
 
-    def test_real_score_beats_the_floor_it_replaced(self, service, monkeypatch):
-        """Concretely: source 219 for q=DIET stops being pinned at 0.225."""
+    def test_reused_and_never_scored_sources_land_on_the_same_floor(self, service, monkeypatch):
+        """A reused source and a never-scored source get the identical weighted_score
+        (both go through the same floor/score_floor formula) — only their field_scores
+        metadata differs (real values vs None)."""
         self._patch_scroll(monkeypatch, ["219"])
         real = {
             "payload": {"source_id": "219"}, "weighted_score": 0.31,
@@ -400,24 +407,25 @@ class TestFieldMatchInjection:
         floor_only = service._fetch_field_match_docs(
             ["219"], {"219": "partial"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-        )[0]["weighted_score"]
+        )[0]
         with_real = service._fetch_field_match_docs(
             ["219"], {"219": "partial"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-            prefilter_scores={"219": real},
-        )[0]["weighted_score"]
-        assert floor_only == pytest.approx(0.225)
-        assert with_real > floor_only
+            prethreshold_by_source={"219": real},
+        )[0]
+        assert floor_only["weighted_score"] == pytest.approx(0.225)
+        assert with_real["weighted_score"] == pytest.approx(floor_only["weighted_score"])
+        assert floor_only["field_scores"]["tags"] is None
+        assert with_real["field_scores"]["tags"] == 0.61
 
     def test_boost_cap_still_applies(self, service, monkeypatch):
-        """Release 2.0 caps a boosted score at 1.0; that must not regress."""
+        """The floor/boost/score_floor formula never produces a score above 1.0,
+        no matter how high score_floor (the caller's threshold) is."""
         self._patch_scroll(monkeypatch, ["5"])
-        real = {"payload": {"source_id": "5"}, "weighted_score": 0.95,
-                "field_scores": {"title": 0.9}}
         entry = service._fetch_field_match_docs(
             ["5"], {"5": "exact"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-            prefilter_scores={"5": real},
+            score_floor=2.0,
         )[0]
         assert entry["weighted_score"] == 1.0
 
@@ -430,7 +438,7 @@ class TestFieldMatchInjection:
             self, service, monkeypatch):
         """A multi-chunk source must not pair one chunk's text with another's score.
 
-        prefilter_scores holds the BEST chunk per source; the scroll returns chunks
+        prethreshold_by_source holds the BEST chunk per source; the scroll returns chunks
         in arbitrary order. Taking id/payload from the scroll while taking the score
         from the fallback returns a passage that never earned it — and the id also
         drives search()'s late payload retrieval, which then locks the wrong text in.
@@ -455,12 +463,12 @@ class TestFieldMatchInjection:
         entry = service._fetch_field_match_docs(
             ["900"], {"900": "partial"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-            prefilter_scores={"900": best_chunk},
+            prethreshold_by_source={"900": best_chunk},
         )[0]
         assert entry["id"] == "pt-900-c7"
         assert entry["payload"]["text"] == "the passage that scored"
         assert entry["weighted_score"] == pytest.approx(
-            0.31 * settings.PARTIAL_TITLE_BOOST)
+            self.FLOOR * settings.PARTIAL_TITLE_BOOST)
 
     def test_floor_path_still_takes_the_scrolled_chunk(self, service, monkeypatch):
         """No fallback means no scores to be consistent with — any chunk will do."""
@@ -589,10 +597,12 @@ class TestFieldMatchInjection:
             self.FLOOR * settings.PARTIAL_TITLE_BOOST)
 
     def test_scored_doc_keeps_its_pipeline_bonus_applied_once(self, service, monkeypatch):
-        """The fallback carries the bonus the pipeline decided, and is re-scored
-        from its RELEVANCE — its weighted_score may already include the bonus
-        (a source cut by the top_k cap), and applying it again would count the
-        title twice."""
+        """The fallback carries the bonus the pipeline already decided upstream, and
+        that bonus is applied to the floor/score_floor relevance exactly once here —
+        its OWN weighted_score may already include the bonus (a source cut by the
+        top_k cap), so re-reading acronym_bonus and multiplying it in again, rather
+        than reusing the fallback's weighted_score directly, is what stops the title
+        from being counted twice."""
         self._patch_scroll_with(monkeypatch, [
             _point("pt-f", "F", title="Unrelated chunk title", summary=""),
         ])
@@ -603,11 +613,11 @@ class TestFieldMatchInjection:
         entry = service._fetch_field_match_docs(
             ["F"], {"F": "partial"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-            prefilter_scores={"F": real}, acronyms_detected=ACR,
+            prethreshold_by_source={"F": real}, acronyms_detected=ACR,
         )[0]
         assert entry["acronym_bonus"] == bonus
         assert entry["weighted_score"] == pytest.approx(
-            0.31 * settings.PARTIAL_TITLE_BOOST * (1 + bonus))
+            self.FLOOR * settings.PARTIAL_TITLE_BOOST * (1 + bonus))
 
 
 # ── 5. Multipliers themselves are untouched ───────────────────────────────────
@@ -870,7 +880,7 @@ class TestAcronymBonusFollowsLexicalRanking:
         injected = service._fetch_field_match_docs(
             ["Z"], {"Z": "partial"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-            prefilter_scores=None, acronyms_detected=dict(ACR))
+            prethreshold_by_source=None, acronyms_detected=dict(ACR))
 
         assert len(injected) == 1
         entry = injected[0]

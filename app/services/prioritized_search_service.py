@@ -2,7 +2,7 @@ import logging
 import re
 import time
 from typing import List, Dict, Optional, Any, Set, Tuple
-
+import numpy as np
 from qdrant_client import models
 from qdrant_client.models import QueryRequest
 from app.core.clients.qdrant import qdrant_client
@@ -104,15 +104,20 @@ class PrioritizedSearchService(AcronymRankingMixin):
         else:
             logger.info("No filters applied")
 
-    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None, acronyms_detected=None, prefilter_scores_out=None, relevance_override=None):
+    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None, acronyms_detected=None, prethreshold_by_source_out=None, relevance_override=None, sparse_issued=False):
         """Process, rank, filter and deduplicate results.
 
         scoring_context_out: optional mutable dict forwarded to _rank_results so the
         caller can capture the per-query normalization context (min/max/pool size).
+        sparse_issued: whether the BM25 branch was sent to Qdrant. Forwarded to
+        _rank_results, which uses it (not the presence of sparse hits) to choose the
+        scoring formula, so the returned score stays on one scale across queries.
+
         relevance_override: optional {point_id: relevance} replacing the fused score
         for ordering and the filter_score threshold (see
         _blended_acronym_relevance). field_scores and the fusion breakdown are left
         as retrieved, so detail_filter_score and debug output don't move.
+
         acronyms_detected: optional {acronym: [expansions]} map. When truthy, each
         candidate earns a proportional acronym bonus (see _acronym_bonus):
         final = relevance x (1 + bonus). The bonus is applied AFTER the threshold —
@@ -126,16 +131,18 @@ class PrioritizedSearchService(AcronymRankingMixin):
         acronym-titled document outrank any untitled one however much weaker it
         was — measured on the local corpus, 16-43 cases per top 20 of a document
         sitting above one more than 20% more relevant.
-        prefilter_scores_out: optional mutable dict filled with source_id -> best
+
+        prethreshold_by_source_out: optional mutable dict filled with source_id -> best
         ranked entry, captured BEFORE the threshold filter runs. The caller uses
         this so a title/summary match later re-injected by _fetch_field_match_docs
-        (because the semantic threshold dropped it) can carry its real relevance
-        and acronym bonus instead of the synthetic floor.
+        (because the semantic threshold dropped it) can carry its real relevance,
+        field_scores and acronym bonus instead of the synthetic floor. Pass None to
+        skip it (semantic search, which never needs it).
         """
         logger.info(f"Total documents matched: {len(all_results)}")
 
         logger.info("Calculating weighted scores and ranking results")
-        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out)
+        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out, sparse_issued)
         logger.info(f"Ranked results: {len(ranked_results)} documents")
 
         if relevance_override:
@@ -151,11 +158,18 @@ class PrioritizedSearchService(AcronymRankingMixin):
             for r in ranked_results:
                 r['relevance'] = r['weighted_score']
 
-        if prefilter_scores_out is not None:
+        # Save the best chunk per source before filtering, so documents the threshold
+        # removes still have their real scores available later. Results are already
+        # sorted, so the first one we see per source is the best one.
+        if prethreshold_by_source_out is not None:
             for entry in self._filter_best_per_source(ranked_results):
                 source_id = entry['payload'].get('source_id')
                 if source_id:
-                    prefilter_scores_out[source_id] = entry
+                    prethreshold_by_source_out[source_id] = entry
+            logger.info(
+                f"Captured {len(prethreshold_by_source_out)} pre-threshold sources "
+                f"for keyword-injection score reuse"
+            )
 
         # Apply filtering based on conditions
         if detail_filter_score is not None:
@@ -230,6 +244,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     source_id=result_data['payload'].get('source_id', ''),
                     score=result_data['weighted_score'],
                     field_scores=field_scores,
+                    # Not debug-gated: when set, the score is a keyword-match floor rather
+                    # than a fused semantic score, which changes how it should be read.
+                    # A response where every row carries this is a degraded result set.
+                    match_source=result_data.get('match_source'),
                     # title_match/summary_match are part of the scoring breakdown, so they
                     # are debug-gated like the other breakdown fields — surfaced only when
                     # include_scoring_debug is set (None otherwise keeps the field out of
@@ -251,6 +269,12 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     # them, even for docs the boost pass didn't touch (e.g. keyword-injected).
                     title_multiplier=result_data.get('title_multiplier', 1.0) if include_scoring_debug else None,
                     summary_multiplier=result_data.get('summary_multiplier', 1.0) if include_scoring_debug else None,
+                    # No default here, unlike the multipliers above: the key is only ever
+                    # set at all when the query was an acronym query (_assign_acronym_bonuses
+                    # runs conditionally), so a bare .get() correctly stays None for an
+                    # ordinary query — 0.0 would wrongly read as "an acronym bonus of zero
+                    # was computed" rather than "the bonus mechanism never ran".
+                    acronym_bonus=result_data.get('acronym_bonus') if include_scoring_debug else None,
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")
@@ -528,8 +552,11 @@ class PrioritizedSearchService(AcronymRankingMixin):
             # embedding and merge same-field hits with max(), which is a no-op for
             # the single-embedding case.
             if settings.SPARSE_SEARCH_ENABLED:
-                logger.info("Starting hybrid batch search (dense + BM25 sparse, RRF fusion)")
-                all_results, field_scores = self._hybrid_batch_search(
+                logger.info(
+                    "Starting hybrid batch search (dense + BM25 sparse, "
+                    f"{settings.HYBRID_FUSION_METHOD} fusion)"
+                )
+                all_results, field_scores, sparse_issued = self._hybrid_batch_search(
                     search_fields=search_fields,
                     query_text=sparse_query_text,
                     query_embeddings=query_embeddings,
@@ -540,6 +567,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 )
             else:
                 logger.info("Starting parallel batch search across all fields")
+                # No sparse branch on this path, so there is no BM25 query to fuse and the
+                # raw weighted-cosine-sum is the correct scoring.
+                sparse_issued = False
                 all_results, field_scores = self._parallel_batch_search(
                     search_fields=search_fields,
                     weights=weights,
@@ -572,7 +602,6 @@ class PrioritizedSearchService(AcronymRankingMixin):
             # computed inside _rank_results; surfaced under search_config.scoring_context
             # when include_scoring_debug is set (see below).
             scoring_context: Dict[str, Any] = {}
-            prefilter_scores_by_source: Dict[str, Dict[str, Any]] = {}
 
             # Only two modes exist: "semantic" opts out of boosts; "hybrid" (the
             # default) opts in. search_mode is validated to that set by Pydantic.
@@ -593,6 +622,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
             # Everything else — ordinary queries, semantic mode, the hybrid kill
             # switch — goes through the unchanged path below.
             soft_acronym_ranking = bool(acronyms_detected) and lexical_ranking_enabled
+            # Only needed by the boost step below, so semantic search skips it.
+            prethreshold_by_source: Optional[Dict[str, Dict[str, Any]]] = (
+                {} if lexical_ranking_enabled else None
+            )
 
             # Score the pool 60/40 against the query and its expansion (see
             # _blended_acronym_relevance). Only meaningful when an expansion
@@ -624,8 +657,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 detail_filter_score if use_detail_filter else None,
                 scoring_context_out=scoring_context,
                 acronyms_detected=acronyms_detected if lexical_ranking_enabled else None,
-                prefilter_scores_out=prefilter_scores_by_source,
+                prethreshold_by_source_out=prethreshold_by_source,
                 relevance_override=relevance_override,
+                sparse_issued=sparse_issued,
             )
 
             # Source_ids injected by the title/summary boost below (filtered out of the
@@ -691,12 +725,22 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 # Inject title/summary-matched documents that were filtered out by the
                 # semantic score threshold (e.g. short abbreviation queries like "SMC").
                 # Title takes precedence when a source matched on both fields.
+                # These documents skip the score threshold, so we raise their score up to
+                # it. Without this they could come back scoring below the threshold the
+                # caller asked for. _floor_for returns whichever threshold is in use.
+                def _floor_for(field_name: str) -> float:
+                    if not use_detail_filter:
+                        return filter_score
+                    return getattr(detail_filter_score, field_name, 0.0) or 0.0
+
                 present_ids = {r["payload"].get("source_id") for r in top_results}
                 missing_title = [sid for sid in title_matches if sid not in present_ids]
                 if missing_title:
                     injected = self._fetch_field_match_docs(
                         missing_title, title_matches, "title", *title_boosts,
-                        prefilter_scores=prefilter_scores_by_source,
+                        prethreshold_by_source=prethreshold_by_source,
+                        query_embedding=query_embeddings[0],
+                        score_floor=_floor_for("title"),
                         acronyms_detected=acronyms_detected,
                     )
                     top_results = top_results + injected
@@ -711,7 +755,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 if missing_summary:
                     injected = self._fetch_field_match_docs(
                         missing_summary, summary_matches, "summary", *summary_boosts,
-                        prefilter_scores=prefilter_scores_by_source,
+                        prethreshold_by_source=prethreshold_by_source,
+                        query_embedding=query_embeddings[0],
+                        score_floor=_floor_for("summary"),
                         acronyms_detected=acronyms_detected,
                     )
                     top_results = top_results + injected
@@ -772,15 +818,12 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     "metadata": detail_filter_score.metadata
                 }
 
-            # Additive debug block: expose the per-query normalization reference + boost
-            # config so QA can reproduce normalized_dense/normalized_sparse and the boost
-            # step by hand. Only when include_scoring_debug is set (keeps prod responses
-            # lean). scoring_context already holds candidate_pool_size and, in hybrid mode,
-            # dense_min/max + sparse_min/max from _rank_results; augment with the fusion
-            # weights and the boost multiplier table (all from settings).
+            # Gated by include_scoring_debug to keep prod responses lean. _rank_results
+            # has already filled scoring_context; add just the boost multipliers.
             if request.include_scoring_debug:
-                scoring_context["dense_weight"] = settings.HYBRID_DENSE_WEIGHT
-                scoring_context["sparse_weight"] = settings.HYBRID_SPARSE_WEIGHT
+                # Never default dense_weight/sparse_weight from settings: _rank_results
+                # writes them only where weighted fusion ran, so their absence is the
+                # signal that it didn't (dense-only, empty-BM25, RRF).
                 scoring_context["boost_config"] = {
                     "exact_title_boost": settings.EXACT_TITLE_BOOST,
                     "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
@@ -905,8 +948,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
         query_embeddings: List[Any],
         filter_conditions: Optional[models.Filter],
         limit: int,
-    ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
-        """Execute hybrid search using parallel batch queries with client-side RRF fusion.
+    ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]], bool]:
+        """Execute hybrid search using parallel batch queries with client-side fusion.
+
+        The fusion method is selected by HYBRID_FUSION_METHOD ("weighted" or "rrf").
 
         This maintains keyword (BM25 sparse) search active while exposing raw field-level
         similarity scores for detail_filter_score verification.
@@ -922,6 +967,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
         (once per embedding). query_text (for the single BM25 sparse request — sparse
         fan-out is a string-level OR, not multiple requests) is expected to already
         carry any acronym OR-expansion baked in by the caller.
+
+        Returns (all_results, field_scores, sparse_issued), where ``sparse_issued`` means
+        the BM25 query was SENT, not that it matched — _rank_results needs that
+        distinction to keep zero-hit sparse queries on the hybrid [0, 1] scale.
         """
         try:
             from qdrant_client.models import QueryRequest, SparseVector
@@ -959,6 +1008,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
             # words rather than a single unknown token that produces empty indices.
             bm25_query_text = query_text.replace("_", " ")
             sparse_indices, sparse_values = generate_sparse_vector(bm25_query_text)
+            # Tracks that the BM25 branch was sent, independently of whether it matched.
+            sparse_issued = bool(sparse_indices)
             if sparse_indices:
                 search_requests.append(
                     QueryRequest(
@@ -973,6 +1024,12 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     )
                 )
                 valid_fields.append(settings.SPARSE_VECTOR_NAME)
+            else:
+                # A query that tokenises to nothing (e.g. only stopwords or punctuation) has no
+                # lexical signal at all, so there is no sparse modality to fuse.
+                logger.info(
+                    f"BM25 query '{bm25_query_text}' produced no tokens; sparse branch not issued"
+                )
 
             logger.info(f"Executing client-side hybrid batch search across {len(valid_fields)} fields: {valid_fields}")
 
@@ -1030,8 +1087,22 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     if qdrant_name in scores and semantic_name not in scores:
                         scores[semantic_name] = scores[qdrant_name]
 
-            logger.info(f"Client-side hybrid search returned {len(all_results)} unique documents (metadata-only)")
-            return all_results, field_scores
+            sparse_hit_count = sum(
+                1 for scores in field_scores.values() if settings.SPARSE_VECTOR_NAME in scores
+            )
+            logger.info(
+                f"Client-side hybrid search returned {len(all_results)} unique documents "
+                f"(metadata-only); sparse_issued={sparse_issued}, sparse_hits={sparse_hit_count}"
+            )
+            if sparse_issued and sparse_hit_count == 0:
+                # Expected when a narrow filter excludes every BM25 match, or the term is absent
+                # from the filtered subset. Logged because it means the sparse modality
+                # contributes nothing to this query's ranking — see _rank_results, which keeps
+                # the hybrid scale and shifts the full weight onto dense.
+                logger.info(
+                    "Sparse branch was issued but matched nothing; dense will carry full weight"
+                )
+            return all_results, field_scores, sparse_issued
 
         except (ImportError, RuntimeError) as exc:
             # ImportError: optional sparse deps (fastembed / qdrant SparseVector)
@@ -1051,13 +1122,16 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 f"Hybrid search unavailable ({type(exc).__name__}: {exc}); "
                 "falling back to dense-only parallel search."
             )
-            return self._parallel_batch_search(
+            # sparse_issued=False: this is a genuine dense-only search (the sparse encoder or
+            # its deps are unavailable), so the plain weighted-cosine-sum path is correct here.
+            all_results, field_scores = self._parallel_batch_search(
                 search_fields=search_fields,
                 weights=self.default_weights,
                 query_embeddings=query_embeddings,
                 filter_conditions=filter_conditions,
                 limit=limit,
             )
+            return all_results, field_scores, False
 
     def _build_filters(
         self,
@@ -1227,6 +1301,26 @@ class PrioritizedSearchService(AcronymRankingMixin):
         ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         return {key: idx + 1 for idx, (key, _) in enumerate(ordered)}
 
+    @staticmethod
+    def _cosine_similarity(a: Any, b: Any) -> Optional[float]:
+        """How similar two vectors are, 0 to 1. Same maths Qdrant uses (Distance.COSINE),
+        so the result is comparable to the scores Qdrant returns for a normal search.
+        Returns None, not 0.0, for a missing or unusable vector — None means "not scored".
+        """
+        if a is None or b is None:
+            return None
+        try:
+            va = np.asarray(a, dtype=np.float32)
+            vb = np.asarray(b, dtype=np.float32)
+        except (TypeError, ValueError):
+            return None
+        if va.ndim != 1 or va.shape != vb.shape:
+            return None
+        na, nb = float(np.linalg.norm(va)), float(np.linalg.norm(vb))
+        if na == 0.0 or nb == 0.0:
+            return None
+        return float(np.dot(va, vb) / (na * nb))
+
     def _rank_results(
         self,
         all_results: Dict[str, Any],
@@ -1234,6 +1328,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
         weights: Dict[str, float],
         search_fields: List[str],
         scoring_context_out: Optional[Dict[str, Any]] = None,
+        sparse_issued: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Rank results using weighted multi-field scoring.
@@ -1244,49 +1339,48 @@ class PrioritizedSearchService(AcronymRankingMixin):
         Hybrid path (dense + BM25 sparse): the dense component is always the weighted
         multi-field cosine sum; the dense+sparse fusion is selected by
         settings.HYBRID_FUSION_METHOD:
-          - "weighted" (default): each modality is min-max normalized to [0, 1] across
+          - "weighted": each modality is min-max normalized to [0, 1] across
             the candidate pool, then fused:
                 Final_Score = HYBRID_DENSE_WEIGHT × dense_norm + HYBRID_SPARSE_WEIGHT × sparse_norm
           - "rrf": Reciprocal Rank Fusion over two lists — the combined dense list
             (ranked by the weighted cosine sum) and the sparse list:
                 Final_Score = minmax( 1/(RRF_K+dense_rank) + 1/(RRF_K+sparse_rank) )
         Both modes keep the final score on a calibrated 0-1 scale comparable to
-        filter_score, instead of the raw RRF fused value (~0-0.1) which never clears a
+        filter_score, instead of the raw RRF fused value, which sits far below any
         cosine-scale threshold.
 
-        Note: hybrid mode is detected by the presence of a raw sparse (BM25) score in
-        field_scores (the sparse field key), not a separate all-field RRF value. The
-        "rrf" fusion method below computes its own RRF over exactly TWO lists — the
-        single combined dense list (the 5 dense fields collapsed into one weighted
-        cosine sum, raw_dense) and the sparse list (raw_sparse) — i.e. up to two rank
-        terms per doc, NOT one RRF term per dense field. _apply_detail_filter is pure
-        per-field OR logic and does not consume any fusion score.
+        Two easy mistakes:
+          - Hybrid mode follows ``sparse_issued`` (query sent), NOT whether it matched;
+            a zero-hit sparse branch stays here with its weight shifted onto dense.
+          - "rrf" fuses TWO lists — the combined dense list and the sparse list — so a
+            doc gets at most two rank terms, not one per dense field.
 
         Args:
             all_results: Dictionary of search results by point ID
             field_scores: Scores for each field per point
             weights: Weight configuration for each field
             search_fields: List of fields searched
-            scoring_context_out: Optional mutable dict. When provided, it is populated
-                with the per-query normalization context (candidate_pool_size and, in
-                hybrid mode, dense_min/max + sparse_min/max) so the caller can surface it
-                under search_config.scoring_context without recomputing raw_dense/raw_sparse
-                or keeping per-request state on the (shared) service instance. Left empty
-                on the dense-only path except for candidate_pool_size.
+            scoring_context_out: Optional mutable dict, filled with the per-query scoring
+                context for search_config.scoring_context. Keys:
+                  candidate_pool_size, sparse_issued, sparse_has_hits — every path; the
+                      flags describe retrieval, not fusion.
+                  dense_min/max, sparse_min/max — hybrid only.
+                  dense_weight, sparse_weight — weighted-fusion branch only, with the
+                      weights actually applied (1.0/0.0 if sparse matched nothing).
+                      Absent elsewhere; never back-fill from settings.
 
         Returns:
             List of ranked results sorted by weighted score (descending)
         """
         sparse_name = settings.SPARSE_VECTOR_NAME
-        # Hybrid mode is signalled by the presence of a raw sparse (BM25) score under
-        # the sparse field key — _hybrid_batch_search injects it only when the BM25
-        # query actually participated and returned hits. This is the same key the rrf/
-        # weighted fusion below reads as raw_sparse, so detection and fusion stay tied
-        # to one signal. Detecting it this way (rather than via a global flag or a
-        # separate all-field RRF marker) keeps the dense-only fallback and the
-        # empty-sparse edge case on the plain weighted-sum path, avoiding score
-        # deflation. In hybrid mode we fuse normalized dense + sparse scores.
-        is_hybrid = any(sparse_name in fs for fs in field_scores.values())
+        # Keys off whether the BM25 branch was ISSUED, not whether it matched: a zero-hit
+        # sparse branch would otherwise flip scoring from the normalized [0, 1] fusion to
+        # the raw cosine sum, which occupies a much lower range — no single filter_score
+        # spans both. Zero hits
+        # are handled by weight redistribution in the `weighted` branch instead.
+        # sparse_has_hits is a floor, not a replacement: hits imply hybrid without the flag.
+        sparse_has_hits = any(sparse_name in fs for fs in field_scores.values())
+        is_hybrid = sparse_issued or sparse_has_hits
 
         # Fusion method (env-selectable): "weighted" min-max score fusion, or "rrf"
         # rank fusion of the combined dense list vs the sparse list. The dense
@@ -1333,16 +1427,27 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     if point_id in sparse_rank:
                         fused += 1.0 / (rrf_k + sparse_rank[point_id])
                     rrf_raw[point_id] = fused
-                # Normalize to [0, 1] so filter_score keeps a comparable scale
-                # (raw RRF values are ~0-0.03 and would never clear a threshold).
+                # Normalize to [0, 1] so filter_score keeps a comparable scale (raw RRF
+                # values sit on a 1/RRF_K scale and would never clear a threshold).
                 # rrf_raw is retained for debug surfacing (pre-normalization).
                 hybrid_scores = self._min_max_normalize(rrf_raw)
             else:
-                # Weighted min-max score fusion (default).
+                # Weighted min-max score fusion.
                 norm_dense = self._min_max_normalize(raw_dense)
                 norm_sparse = self._min_max_normalize(raw_sparse)
-                dense_w = settings.HYBRID_DENSE_WEIGHT
-                sparse_w = settings.HYBRID_SPARSE_WEIGHT
+                if sparse_has_hits:
+                    dense_w = settings.HYBRID_DENSE_WEIGHT
+                    sparse_w = settings.HYBRID_SPARSE_WEIGHT
+                else:
+                    # Sparse ran but matched nothing, so norm_sparse is all 0. Keeping the
+                    # configured split would shrink every score by the sparse share for a
+                    # silent modality, pushing good results under filter_score; dense takes
+                    # the full weight instead.
+                    dense_w, sparse_w = 1.0, 0.0
+                    logger.info(
+                        "No sparse hits in candidate pool; dense weight raised to 1.0 "
+                        "to keep the fused score on the [0, 1] scale"
+                    )
                 for point_id in raw_dense:
                     hybrid_scores[point_id] = (
                         dense_w * norm_dense.get(point_id, 0.0)
@@ -1362,10 +1467,21 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 if sparse_vals:
                     scoring_context_out["sparse_min"] = min(sparse_vals)
                     scoring_context_out["sparse_max"] = max(sparse_vals)
+                # The weights actually applied, which differ from the configured ones when
+                # the sparse branch matched nothing (see redistribution above). Reporting
+                # settings here instead would make the debug numbers irreproducible.
+                if fusion_method != "rrf":
+                    scoring_context_out["dense_weight"] = dense_w
+                    scoring_context_out["sparse_weight"] = sparse_w
 
         # candidate_pool_size is meaningful in both modes.
         if scoring_context_out is not None:
             scoring_context_out["candidate_pool_size"] = len(all_results)
+            # Retrieval facts, every path — unlike dense_weight/sparse_weight above, which
+            # report fusion. Outside `if is_hybrid` so a client can tell "never issued"
+            # from "ran but contributed nothing".
+            scoring_context_out["sparse_issued"] = sparse_issued
+            scoring_context_out["sparse_has_hits"] = sparse_has_hits
 
         ranked = []
 
@@ -1752,16 +1868,19 @@ class PrioritizedSearchService(AcronymRankingMixin):
         field: str,
         exact_boost: float,
         partial_boost: float,
-        prefilter_scores: Optional[Dict[str, Dict[str, Any]]] = None,
+        prethreshold_by_source: Optional[Dict[str, Dict[str, Any]]] = None,
+        query_embedding: Optional[Any] = None,
+        score_floor: float = 0.0,
         acronyms_detected: Optional[Dict[str, List[str]]] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch one representative chunk per source_id for documents that matched
         by ``field`` but were absent from semantic search results (e.g. short
         abbreviation queries where cosine similarity is too low to pass filter_score).
 
-        Each injected document receives a score derived from the boost multiplier
-        applied to a small floor value so it ranks below semantically strong results
-        but above no-result.
+        Each one gets a small score so it ranks below strong semantic results, raised to
+        ``score_floor`` (the threshold in use) so it never scores below what the caller
+        asked for. Per-field scores are reused from ``prethreshold_by_source`` when the
+        document was already scored, otherwise computed from its stored vectors.
 
         prefilter_scores: optional source_id -> ranked entry map (see
         _process_and_filter_results' prefilter_scores_out) for documents the normal
@@ -1787,7 +1906,72 @@ class PrioritizedSearchService(AcronymRankingMixin):
         FLOOR_SCORE = 0.15  # baseline before multiplier — keeps injected below strong semantic hits
         match_key = f"{field}_match"
         mult_key = f"{field}_multiplier"
+        prethreshold_by_source = prethreshold_by_source or {}
+
+        def _score_for(match_type: str) -> tuple:
+            """Returns (score, boost). Multiply first, then raise to the floor — doing it
+            the other way round (floor * boost) would push these above real search hits.
+            """
+            boost = exact_boost if match_type == "exact" else partial_boost
+            return min(max(FLOOR_SCORE * boost, score_floor), 1.0), boost
+
+        # Step 2: Documents we already scored earlier, before the threshold removed them.
+        # Their real scores are still in memory, so reuse them instead of asking Qdrant.
+        remaining: List[str] = []
+        for source_id in source_ids:
+            ranked = prethreshold_by_source.get(source_id)
+            if ranked is None:
+                remaining.append(source_id)
+                continue
+
+            match_type = matches.get(source_id, "partial")
+            # _score_for's floor/score_floor guarantee applies here too — an
+            # injected document must never read as scoring below the threshold
+            # the caller asked for, reused or not. The acronym bonus (our
+            # addition) multiplies on top of that, same as everywhere else in
+            # the acronym path: final = relevance x (1 + bonus).
+            relevance, boost = _score_for(match_type)
+            bonus = ranked.get("acronym_bonus", 0.0)
+            score = relevance * (1.0 + bonus)
+
+            # Copy both dicts — the original is shared and must not be changed.
+            entry = dict(ranked)
+            entry["field_scores"] = dict(ranked.get("field_scores") or {})
+            entry["field_scores"][match_key] = match_type
+            entry["weighted_score"] = score
+            entry["relevance"] = relevance
+            entry["acronym_bonus"] = bonus
+            entry[mult_key] = boost
+            # Marks the score as a keyword-match floor, not a semantic one; otherwise an
+            # all-injected response is indistinguishable from a real result set.
+            entry["match_source"] = f"{field}_keyword_match"
+            injected.append(entry)
+            logger.debug(
+                f"Reused pre-threshold scores for {field}-match doc {source_id} "
+                f"({match_type}), score {score:.4f}"
+            )
+
+        if not remaining:
+            logger.info(
+                f"Resolved all {len(source_ids)} missing '{field}' documents from the "
+                f"pre-threshold pool — no Qdrant request needed."
+            )
+            return injected
+
+        source_ids = remaining
         num_requests_before = len(source_ids)
+
+        # Step 3: The rest were never scored, so fetch their vectors and score them here.
+        # Skipped when there are too many to be worth downloading.
+        score_vectors = query_embedding is not None and len(source_ids) <= settings.INJECTED_DOC_SCORING_MAX
+        if query_embedding is not None and not score_vectors:
+            logger.info(
+                f"Skipping vector scoring for {len(source_ids)} injected '{field}' docs "
+                f"(over INJECTED_DOC_SCORING_MAX={settings.INJECTED_DOC_SCORING_MAX}); "
+                f"field_scores stay None."
+            )
+        # List the fields we want, never True — True would also download the BM25 vector.
+        with_vectors: Any = list(self.priority_order) if score_vectors else False
 
         logger.info(
             f"Resolving {num_requests_before} missing documents for field '{field}' boost. "
@@ -1822,7 +2006,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     limit=page_size,
                     offset=offset,
                     with_payload=True,
-                    with_vectors=False,
+                    with_vectors=with_vectors,
                 )
                 num_pages += 1
                 all_points.extend(batch)
@@ -1850,6 +2034,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
         # in exactly the way the scored path no longer is. The same per-document
         # BM25 check applies. None (BM25 unavailable) withholds the acronym
         # grades, as before: nothing was measured about these documents.
+        # source_ids here is `remaining` (reassigned above) — every id already
+        # covered by prethreshold_by_source was resolved in Step 2 and never
+        # reaches this point, so no extra check for that is needed.
         floor_body_sources: Optional[Set[str]] = set()
         if acronyms_detected:
             floor_candidates: List[Dict[str, Any]] = []
@@ -1859,8 +2046,6 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 if not sid or sid not in source_ids or sid in considered:
                     continue
                 considered.add(sid)
-                if (prefilter_scores or {}).get(sid) is not None:
-                    continue  # scored path — its bonus was already decided upstream
                 floor_candidates.append({"payload": point.payload})
             floor_body_sources = self._sources_with_acronym_in_body(
                 self._sources_claiming_acronym(floor_candidates, acronyms_detected)
@@ -1878,85 +2063,66 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 continue
             seen_sources.add(source_id)
 
-            # Step 4: Compute the boosted score.
-            # Match type is fetched from the matches cache (either 'exact' or 'partial')
-            # and multiplied with the floor score.
+            # Step 4: Compute the boosted score, floored at the caller's threshold.
+            # (Documents already known via prethreshold_by_source were handled in
+            # Step 2 above and never reach this loop — this is only the genuinely
+            # never-scored remainder.)
             match_type = matches.get(source_id, "partial")
-            boost = exact_boost if match_type == "exact" else partial_boost
+            relevance, boost = _score_for(match_type)
 
-            fallback = (prefilter_scores or {}).get(source_id)
-            if fallback is not None:
-                # Scored by the normal pipeline, then dropped by filter_score or the
-                # page cap. Keep the real relevance/field_scores/bonus so the boost
-                # multiplies an actual relevance score rather than a constant.
-                # "relevance" is read before weighted_score: on the acronym path
-                # weighted_score may already carry the bonus, which must not be
-                # applied a second time below.
-                base = fallback.get("relevance", fallback["weighted_score"])
-                field_scores: Dict[str, Any] = dict(fallback.get("field_scores") or {})
-                entry_raw_dense = fallback.get("raw_dense")
-                entry_keyword = fallback.get("keyword_score")
-                bonus = fallback.get("acronym_bonus", 0.0)
-                # Identify the entry by the chunk that EARNED these scores, not by
-                # whichever chunk the scroll happened to return first. Those are
-                # different points for any multi-chunk source (prefilter_scores holds
-                # the best chunk per source, see _filter_best_per_source), and the id
-                # also drives the late payload retrieval in search() — so taking it
-                # from the scroll pairs one chunk's text with another chunk's score.
-                point_id = fallback.get("id", point.id)
-                payload = fallback.get("payload") or point.payload
-            else:
-                # Genuinely absent from the candidate pool — no vector query was ever
-                # run against this document, so no per-field cosine similarity exists.
-                # Use None (not 0.0) so the API consumer can distinguish "field was
-                # not scored" from "field scored exactly zero".
-                base = FLOOR_SCORE
-                field_scores = {f: None for f in self.priority_order}
-                entry_raw_dense = None
-                entry_keyword = None
-                # The bonus, unlike the scores, IS computable here: the scroll ran
-                # with with_payload=True, so this point carries the document's own
-                # title and summary — same function every scored candidate goes
-                # through, same content check (floor_body_sources, above). On the
-                # floor base the bonus is small in absolute terms, so a document
-                # nothing was measured about stays below the ones that were.
-                bonus = (
-                    self._acronym_bonus(
-                        point.payload.get("title"),
-                        point.payload.get("summary"),
-                        acronyms_detected,
-                        floor_body_sources is not None
-                        and str(source_id) in floor_body_sources,
-                    )
-                    if acronyms_detected
-                    else 0.0
+            # Score each field against the query. A field is None when the document has
+            # no vector for it (empty fields are not stored) or scoring was skipped.
+            # None means "not scored" — never write 0.0 here, that means "scored zero".
+            vector_map = (getattr(point, "vector", None) or {}) if score_vectors else {}
+            field_scores: Dict[str, Any] = {
+                f: (self._cosine_similarity(query_embedding, vector_map.get(f))
+                    if score_vectors else None)
+                for f in self.priority_order
+            }
+            # The bonus, unlike the scores, IS computable here: the scroll ran with
+            # with_payload=True, so this point carries the document's own title and
+            # summary — same function every scored candidate goes through, same
+            # content check (floor_body_sources, above). On the floor base the
+            # bonus is small in absolute terms, so a document nothing was measured
+            # about stays below the ones that were.
+            bonus = (
+                self._acronym_bonus(
+                    point.payload.get("title"),
+                    point.payload.get("summary"),
+                    acronyms_detected,
+                    floor_body_sources is not None
+                    and str(source_id) in floor_body_sources,
                 )
-                # No scores to be consistent with, so any chunk represents the
-                # source equally well — keep the scrolled one.
-                point_id = point.id
-                payload = point.payload
-
-            relevance = min(base * boost, 1.0)
+                if acronyms_detected
+                else 0.0
+            )
             score = relevance * (1.0 + bonus)
             field_scores[match_key] = match_type
 
+            # Combine the field scores using the same weights as a normal search, so this
+            # number can be compared against one. None when no field could be scored.
+            scored = [
+                (f, s) for f, s in field_scores.items()
+                if f in self.default_weights and isinstance(s, (int, float))
+            ]
+            raw_dense = (
+                sum(s * self.default_weights[f] for f, s in scored) if scored else None
+            )
+
             injected.append({
-                "id": point_id,
-                "payload": payload,
+                "id": point.id,
+                "payload": point.payload,
                 "weighted_score": score,
                 "field_scores": field_scores,
-                # raw_dense/keyword_score stay None for floor-path docs (no vector
-                # query ran); None distinguishes that from a genuine 0.0.
-                "raw_dense": entry_raw_dense,
-                "keyword_score": entry_keyword,
+                "raw_dense": raw_dense,
                 "relevance": relevance,
                 "acronym_bonus": bonus,
                 mult_key: boost,
+                # See the note at the other injection site: this score is a keyword-match
+                # floor, so it must be distinguishable from a real fused score.
+                "match_source": f"{field}_keyword_match",
             })
-            logger.debug(
-                f"Injected {field}-match doc {source_id} ({match_type}) with score "
-                f"{score:.4f} ({'real' if fallback is not None else 'floor'} base {base:.4f} x {boost})"
-            )
+            logger.debug(f"Injected {field}-match doc {source_id} ({match_type}) with floor score {score:.4f}")
 
         missing_after = len(source_ids) - len(seen_sources)
         logger.info(

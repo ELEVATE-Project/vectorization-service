@@ -196,6 +196,14 @@ class SearchResultItem(BaseModel):
             "for unscored fields to distinguish them from a genuine zero-score."
         )
     )
+    match_source: Optional[str] = Field(
+        default=None,
+        description="Set only on documents injected by the title/summary keyword-match "
+                    "step (e.g. 'title_keyword_match'); None otherwise. Their `score` is "
+                    "a synthetic floor (FLOOR_SCORE x boost), not a fused semantic score, "
+                    "so it is not comparable to semantically retrieved results. If every "
+                    "item carries it, the score threshold emptied the semantic pool."
+    )
     keyword_score: Optional[float] = Field(
         default=None,
         description="Raw BM25 sparse vector score (Phase 2). Surfaced BY DEFAULT whenever "
@@ -249,6 +257,17 @@ class SearchResultItem(BaseModel):
         description="Boost factor applied for a summary keyword match (exact/partial). "
                     "1.0 means NO boost was applied (neutral no-op), not a phantom boost. "
                     "Applied after title_multiplier, each capped at 1.0. "
+                    "Debug-only (include_scoring_debug=true)."
+    )
+    acronym_bonus: Optional[float] = Field(
+        default=None,
+        description="Proportional bonus from the acronym/expansion match in title or "
+                    "summary (see the four ACRONYM_BONUS_* settings), applied as "
+                    "score = relevance x (1 + acronym_bonus). 0.0 means no bonus applied "
+                    "(neutral, not a phantom bonus) — this is the actual mechanism behind "
+                    "the boost on acronym queries; title_multiplier/summary_multiplier are "
+                    "neutralized to 1.0 there to avoid double-counting the same signal. "
+                    "None when the query wasn't an acronym query at all. "
                     "Debug-only (include_scoring_debug=true)."
     )
     title_match: Optional[str] = Field(

@@ -102,11 +102,11 @@ class Settings(BaseSettings):
     # Order determines search priority: Title > Chunk > Tags > Summary > Metadata
     SEARCH_PRIORITY_ORDER: list = ["title", "text", "tags", "summary", "metadata"]
     SEARCH_PRIORITY_WEIGHTS: dict = {
-        "title": 0.36,      # 36% weight for title matches
-        "text": 0.27,       # 27% weight for chunk/content matches
-        "tags": 0.14,       # 14% weight for tag matches
-        "summary": 0.14,    # 14% weight for summary matches
-        "metadata": 0.09    # 9% weight for metadata matches
+        "title": 0.34,      # 34% weight for title matches
+        "text": 0.26,       # 26% weight for chunk/content matches
+        "tags": 0.20,       # 20% weight for tag/category matches (up from 14%)
+        "summary": 0.12,    # 12% weight for summary matches
+        "metadata": 0.08    # 8% weight for metadata matches
     }
     DEFAULT_SEARCH_TOP_K: int = 10
     MAX_SEARCH_TOP_K: int = 100
@@ -121,6 +121,10 @@ class Settings(BaseSettings):
     EXACT_SUMMARY_BOOST: float = float(os.getenv("EXACT_SUMMARY_BOOST", "1.4"))
     PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.2"))
     METADATA_MATCH_BOOST: float = float(os.getenv("METADATA_MATCH_BOOST", "1.2"))
+    # How many keyword-matched documents we are willing to score per search. Scoring
+    # each one downloads 5 vectors, and a short query can match thousands of titles.
+    # Past this limit we skip scoring them and leave their field_scores as None.
+    INJECTED_DOC_SCORING_MAX: int = int(os.getenv("INJECTED_DOC_SCORING_MAX", "200"))
     # Queries shorter than this word count skip spaCy stop-word removal
     SHORT_QUERY_THRESHOLD: int = int(os.getenv("SHORT_QUERY_THRESHOLD", "3"))
     RRF_K: int = int(os.getenv("RRF_K", "60"))  # standard Reciprocal Rank Fusion constant

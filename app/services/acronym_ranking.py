@@ -580,7 +580,7 @@ class AcronymRankingMixin:
 
         def score(text: str, vector: Any) -> Dict[Any, float]:
             if settings.SPARSE_SEARCH_ENABLED:
-                results, scores = self._hybrid_batch_search(
+                results, scores, sparse_issued = self._hybrid_batch_search(
                     search_fields=search_fields, query_text=text,
                     query_embeddings=[vector], filter_conditions=only_pool,
                     limit=len(pool_ids),
@@ -591,8 +591,9 @@ class AcronymRankingMixin:
                     query_embeddings=[vector], filter_conditions=only_pool,
                     limit=len(pool_ids),
                 )
+                sparse_issued = False
             return {r['id']: r['weighted_score']
-                    for r in self._rank_results(results, scores, weights, search_fields)}
+                    for r in self._rank_results(results, scores, weights, search_fields, sparse_issued=sparse_issued)}
 
         try:
             by_query = score(query_text, query_embedding)
