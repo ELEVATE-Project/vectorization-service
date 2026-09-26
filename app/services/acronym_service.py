@@ -1,7 +1,8 @@
 import json
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
@@ -71,9 +72,42 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
         if cached is None:
             missing.append(acronym)
             continue
-        decoded = json.loads(cached)
-        if decoded is not None:
-            result[acronym] = decoded
+
+        # Parse inside its own guard: the try above covers only the Redis READ,
+        # so an unparseable value used to raise JSONDecodeError straight out of
+        # search() as a 500 on an ordinary query. A cache entry is never worth
+        # failing a request over — treat a bad one exactly like a cache miss and
+        # let Postgres, the source of truth, answer instead.
+        try:
+            decoded = json.loads(cached)
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                f"Acronym {acronym!r} has an unparseable cached value, "
+                f"falling back to Postgres: {e}"
+            )
+            missing.append(acronym)
+            continue
+
+        # None is the NEGATIVE cache entry ("looked this up, it isn't an
+        # acronym"). Skipped WITHOUT going into `missing` — routing it to
+        # Postgres would defeat the negative cache and re-query every ordinary
+        # English word on every request.
+        if decoded is None:
+            continue
+
+        # The same shape check the DB rows already get. Without it a cached bare
+        # string survives as-is and expansions[0] downstream yields its first
+        # CHARACTER, silently searching for "D" instead of the expansion; a
+        # cached dict or list-of-ints fails later as a RuntimeError instead.
+        if not _valid_expansions(decoded):
+            logger.warning(
+                f"Acronym {acronym!r} has a malformed cached value "
+                f"({decoded!r}), falling back to Postgres"
+            )
+            missing.append(acronym)
+            continue
+
+        result[acronym] = decoded
 
     if not missing:
         return result
@@ -97,7 +131,11 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
         )
         if settings.CACHE_ENABLED:
             try:
-                cache_client.set_many({
+                # if-absent for the same reason as the normal write-back below:
+                # this is an absence we inferred from a FAILED lookup, which is
+                # even weaker evidence than a successful "not found", so it must
+                # never overwrite a real value someone else cached.
+                cache_client.set_many_if_absent({
                     _cache_key(a): (json.dumps(None), settings.REDIS_DB_ERROR_CACHE_TTL)
                     for a in missing
                 })
@@ -116,30 +154,42 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
                 f"Acronym {mapping.acronym!r} has malformed expansions in DB "
                 f"({mapping.expansions!r}), treating as not found"
             )
-    cache_writes: Dict[str, Tuple[str, int]] = {}
+    # Split by what we actually learned, because the two need different write
+    # rules. A FOUND value came from Postgres, the source of truth, so writing
+    # it unconditionally is safe. A NOT-FOUND is only an absence, and an absence
+    # can be filled in while we were querying: a bulk upload committing in that
+    # window calls refresh_cache and writes the real value, and an unconditional
+    # write-back then buried it under `null` for the whole negative TTL — an hour
+    # in which a freshly uploaded acronym was in the database but invisible to
+    # search. Negative entries therefore go through SET..NX, which makes the
+    # "is it still absent" check and the write one atomic step inside Redis.
+    found_writes: Dict[str, Tuple[str, int]] = {}
+    absent_writes: Dict[str, Tuple[str, int]] = {}
     for acronym in missing:
         if acronym in found_by_acronym:
             result[acronym] = found_by_acronym[acronym]
-            cache_writes[_cache_key(acronym)] = (
+            found_writes[_cache_key(acronym)] = (
                 json.dumps(found_by_acronym[acronym]), settings.REDIS_CACHE_TTL
             )
         else:
-            cache_writes[_cache_key(acronym)] = (
+            absent_writes[_cache_key(acronym)] = (
                 json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL
             )
 
     if settings.CACHE_ENABLED:
         try:
-            cache_client.set_many(cache_writes)
+            cache_client.set_many(found_writes)
+            cache_client.set_many_if_absent(absent_writes)
         except Exception as e:
             logger.warning(
-                f"Acronym batch cache write-through failed for {len(cache_writes)} acronym(s): {e}"
+                "Acronym batch cache write-through failed for "
+                f"{len(found_writes) + len(absent_writes)} acronym(s): {e}"
             )
 
     return result
 
 
-def invalidate_cache(acronyms: List[str]) -> None:
+def invalidate_cache(acronyms: List[str]) -> bool:
     """Drop cached entries for the given acronyms in one batched round-trip.
     Call after any write to those rows so stale expansions aren't served
     until TTL expiry.
@@ -147,14 +197,23 @@ def invalidate_cache(acronyms: List[str]) -> None:
     Swallows Redis errors (logged) rather than raising — this is already the
     degraded-mode fallback when the cache is having problems (e.g. the bulk
     upload endpoint calls this when refresh_cache() itself failed), so letting
-    it raise would turn an already-committed, successful write into a 500."""
+    it raise would turn an already-committed, successful write into a 500.
+
+    Returns True when the cache is consistent with the database afterwards
+    (including the nothing-to-do and cache-disabled cases), False when the
+    delete failed and stale entries may still be served for up to
+    REDIS_CACHE_TTL. Swallowing the error is right; staying SILENT about it was
+    not — a bulk upload that deactivated 30 acronyms returned 200 with no hint
+    that all 30 were still live in search for the next 24 hours."""
     if not acronyms or not settings.CACHE_ENABLED:
-        return
+        return True
     keys = [_cache_key(a.strip().upper()) for a in acronyms]
     try:
         cache_client.delete_many(keys)
+        return True
     except Exception as e:
         logger.warning(f"Acronym cache invalidation failed for {len(keys)} key(s): {e}")
+        return False
 
 
 def refresh_cache(acronyms: List[str]) -> None:
@@ -177,6 +236,10 @@ def refresh_cache(acronyms: List[str]) -> None:
     finally:
         db.close()
 
+    # Collect first, write once. One pipelined round-trip instead of one SETEX
+    # per acronym — the same batching the read side (get_expansions_batch) has
+    # always used. A 500-row upload was 500 sequential round-trips.
+    writes: Dict[str, Tuple[str, int]] = {}
     for mapping in mappings:
         if not _valid_expansions(mapping.expansions):
             logger.warning(
@@ -184,7 +247,14 @@ def refresh_cache(acronyms: List[str]) -> None:
                 f"expansions ({mapping.expansions!r})"
             )
             continue
-        cache_client.set(_cache_key(mapping.acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
+        writes[_cache_key(mapping.acronym)] = (
+            json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL
+        )
+
+    # Deliberately NOT wrapped: the bulk-upload caller catches a refresh failure
+    # and invalidates the whole batch instead, so swallowing it here would hide
+    # the failure and leave stale expansions cached.
+    cache_client.set_many(writes)
 
 
 def load_acronym_cache() -> int:
@@ -206,7 +276,7 @@ def load_acronym_cache() -> int:
     finally:
         db.close()
 
-    warmed = 0
+    writes: Dict[str, Tuple[str, int]] = {}
     for mapping in mappings:
         if not _valid_expansions(mapping.expansions):
             logger.warning(
@@ -214,15 +284,28 @@ def load_acronym_cache() -> int:
                 f"expansions ({mapping.expansions!r})"
             )
             continue
-        try:
-            cache_client.set(_cache_key(mapping.acronym), json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL)
-        except Exception as e:
-            logger.warning(f"Cache warm failed for {mapping.acronym!r}, skipping: {e}")
-            continue
-        warmed += 1
+        writes[_cache_key(mapping.acronym)] = (
+            json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL
+        )
 
-    logger.info(f"Acronym cache warmed: {warmed} active acronym(s)")
-    return warmed
+    # One pipelined round-trip rather than ~550 sequential ones at boot. The
+    # per-acronym try/except this replaces could only ever have salvaged a
+    # partial warm-up from a mid-flight Redis failure; a pipeline rides one
+    # connection either way, so the batch is all-or-nothing. The failure is
+    # logged and swallowed because a cold cache must never stop the service
+    # booting — get_expansions_batch still falls back to Postgres per query,
+    # so a cold cache costs latency on first touch, not correctness.
+    try:
+        cache_client.set_many(writes)
+    except Exception as e:
+        logger.warning(
+            f"Acronym cache warm-up failed for {len(writes)} acronym(s), "
+            f"continuing with a cold cache: {e}"
+        )
+        return 0
+
+    logger.info(f"Acronym cache warmed: {len(writes)} active acronym(s)")
+    return len(writes)
 
 
 def _split_expansions(raw: str) -> List[str]:
@@ -246,6 +329,27 @@ def _split_expansions(raw: str) -> List[str]:
 # Read off the model rather than hardcoded, so this can't silently drift out
 # of sync if the column length is ever changed there.
 _ACRONYM_MAX_LENGTH = AcronymMapping.__table__.c.acronym.type.length
+
+# Letters only, 1-4 space-separated words — matches exactly what
+# detect_acronyms() can ever actually find (single tokens and the up-to-4-word
+# phrase windows in acronym_query_service.py). Anything outside this shape
+# (symbols like "WI-FI", digits like "4G", a stray "/" or "-") can never be
+# detected, so bulk_upsert rejects it up front instead of silently accepting
+# a row that will sit in the table forever unreachable.
+_ACRONYM_KEY_RE = re.compile(r"^[A-Z]+(?: [A-Z]+){0,3}$")
+
+
+def _is_valid_acronym_key(acronym: str) -> bool:
+    if not _ACRONYM_KEY_RE.match(acronym):
+        return False
+    words = acronym.split(" ")
+    # A single-letter WHOLE key ("A") can never be a candidate on its own —
+    # detect_acronyms drops any token under 2 letters. A single-letter word
+    # INSIDE a phrase is fine ("RBI GRADE B" is a real, working entry): the
+    # phrase-window path only requires each word to be non-empty.
+    if len(words) == 1 and len(words[0]) < 2:
+        return False
+    return True
 
 
 def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List[dict]]:
@@ -273,6 +377,18 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
                 "index": index,
                 "acronym": raw_acronym or None,
                 "reason": "acronym and expansions must be non-empty after trimming whitespace",
+            })
+            continue
+
+        if not _is_valid_acronym_key(acronym):
+            errors.append({
+                "index": index,
+                "acronym": acronym,
+                "reason": (
+                    "acronym must be letters only (1-4 space-separated words; "
+                    "a lone word needs at least 2 letters) — this can never be "
+                    "detected in a search query otherwise"
+                ),
             })
             continue
 
@@ -379,3 +495,43 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
         db.close()
 
     return created, updated, deactivated, errors
+
+
+def list_acronyms(
+    prefix: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> Tuple[List[AcronymMapping], int]:
+    """Read path for GET /api/acronyms (AC-16: there was no way to inspect
+    the dictionary via the API at all, active or not). Queries Postgres
+    directly rather than the Redis cache, which only ever holds active rows
+    and was never meant to support listing/pagination — this is an
+    admin/inspection endpoint, not the search hot path, so a plain query per
+    call is fine.
+
+    prefix: case-insensitive match against the START of the acronym key, so
+    "RTE" matches both "RTE" and "RTE ACT". is_active=None (the default)
+    returns both active and inactive rows on purpose — omitting inactive
+    rows entirely was the original gap.
+
+    Returns (rows, total) — total is the full match count ignoring
+    limit/offset, for the caller to build pagination from.
+    """
+    db = SessionLocal()
+    try:
+        query = db.query(AcronymMapping)
+        if is_active is not None:
+            query = query.filter(AcronymMapping.is_active.is_(is_active))
+        if prefix and prefix.strip():
+            query = query.filter(AcronymMapping.acronym.like(f"{prefix.strip().upper()}%"))
+        total = query.count()
+        rows = (
+            query.order_by(AcronymMapping.acronym)
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        return rows, total
+    finally:
+        db.close()

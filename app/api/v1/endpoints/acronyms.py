@@ -1,18 +1,56 @@
 import csv
 import io
 import logging
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import verify_admin_token, verify_internal_token
 from app.config import settings
 from app.constants import ACRONYM_CSV_COLUMN_ACRONYM, ACRONYM_CSV_COLUMN_EXPANSIONS
-from app.models.api_models import AcronymBulkUploadResponse
-from app.services.acronym_service import bulk_upsert, invalidate_cache, refresh_cache
+from app.models.api_models import AcronymBulkUploadResponse, AcronymItem, AcronymListResponse
+from app.services.acronym_service import bulk_upsert, invalidate_cache, list_acronyms, refresh_cache
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.get(
+    "",
+    response_model=AcronymListResponse,
+    dependencies=[Depends(verify_internal_token)],
+)
+async def get_acronyms(
+    prefix: Optional[str] = Query(None, description="Case-insensitive match against the start of the acronym key"),
+    is_active: Optional[bool] = Query(None, description="Filter by active status; omit to include both"),
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    """Read-only: list the acronym dictionary, active and inactive rows both
+    by default (AC-16 — there was previously no way to inspect it via the
+    API at all). Gated by internal_access_token only, not admin_auth_token
+    too — reading the dictionary is lower-risk than writing to it.
+    """
+    rows, total = await run_in_threadpool(
+        list_acronyms, prefix=prefix, is_active=is_active, limit=limit, offset=offset
+    )
+    return AcronymListResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        items=[
+            AcronymItem(
+                acronym=row.acronym,
+                expansions=row.expansions,
+                description=row.description,
+                is_active=row.is_active,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+            for row in rows
+        ],
+    )
 
 
 @router.post(
@@ -66,24 +104,40 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
     # cached expansion in place. If anything in this block fails, invalidate the
     # whole batch instead so the next lookup reloads from Postgres rather than
     # serving stale data.
+    # Tracked so the caller learns whether the cache actually caught up. False
+    # means the write committed but stale entries may still be served — for a
+    # deactivated acronym that is up to REDIS_CACHE_TTL (24h) of it still
+    # working in search. The request deliberately still succeeds: the database
+    # change is done, and re-uploading would not fix a cache problem.
+    cache_refreshed = True
     if created or updated:
         active_batch = [a for a in (created + updated) if a not in deactivated]
         try:
             if active_batch:
                 await run_in_threadpool(refresh_cache, active_batch)
             if deactivated:
-                await run_in_threadpool(invalidate_cache, deactivated)
+                cache_refreshed = await run_in_threadpool(invalidate_cache, deactivated)
         except Exception as e:
             logger.warning(f"Cache refresh failed after bulk upload, invalidating instead: {e}")
-            await run_in_threadpool(invalidate_cache, created + updated)
+            cache_refreshed = await run_in_threadpool(invalidate_cache, created + updated)
+
+    if not cache_refreshed:
+        logger.warning(
+            "Acronym bulk upload committed but the cache could not be updated; "
+            "stale entries may be served until their TTL expires"
+        )
 
     logger.info(
         f"Acronym bulk upload: {len(created)} created, {len(updated)} updated, "
-        f"{len(errors)} error(s)"
+        f"{len(deactivated)} deactivated, {len(errors)} error(s)"
     )
     return AcronymBulkUploadResponse(
         received=len(rows),
         created=len(created),
         updated=len(updated),
+        # Already computed by bulk_upsert and used above to invalidate the
+        # right cache keys; it was simply never surfaced to the caller.
+        deactivated=len(deactivated),
+        cache_refreshed=cache_refreshed,
         errors=errors,
     )

@@ -101,7 +101,6 @@ POCSO,Protection of Children from Sexual Offences,Act to protect children from s
 RPWD ACT,Rights of Persons with Disabilities Act,Act protecting rights of persons with disabilities including in education
 RTE,Right to Education,Act providing free and compulsory education for children between 6 and 14 years
 RTE ACT,Right to Education Act,Act mandating free and compulsory education for children aged 6-14 years
-SWAYAM PRABHA,SWAYAM PRABHA,Group of DTH channels broadcasting educational programs
 NIPUN BHARAT,National Initiative for Proficiency in Reading with Understanding and Numeracy,National mission for ensuring foundational literacy and numeracy by Grade 3
 DIKSHA,Digital Infrastructure for Knowledge Sharing,National platform for school education with engaging learning material
 NEP,National Education Policy,"New education policy of 2020 replacing the 1986 NPE, focusing on holistic and multidisciplinary education"
@@ -109,14 +108,11 @@ NPE,National Policy on Education,"Framework for education development in India (
 GIAN,Global Initiative of Academic Networks,Scheme for tapping talent pool of scientists and entrepreneurs abroad for higher education
 KGBV,Kasturba Gandhi Balika Vidyalaya,"Residential schools for girls from SC, ST, OBC, and minority communities"
 KVS,Kendriya Vidyalaya Sangathan,Autonomous body for establishing and managing Kendriya Vidyalayas for children of transferable central government employees
-MID DAY MEAL,Mid Day Meal Scheme,School meal program to improve nutritional status of school-age children
 NVS,Navodaya Vidyalaya Samiti,Autonomous body for establishing and managing Jawahar Navodaya Vidyalayas
 PM SHRI,PM Schools for Rising India,Scheme for upgrading existing schools to exemplar schools
-PADHE BHARAT BADHE BHARAT,Padhe Bharat Badhe Bharat,Program for improving reading and writing skills in early grades
 RMSA,Rashtriya Madhyamik Shiksha Abhiyan,Government program for universalization of secondary education (now integrated with Samagra Shiksha)
 SPARC,Scheme for Promotion of Academic and Research Collaboration,Scheme for improving research ecosystem in India through international collaboration
 SSA,Sarva Shiksha Abhiyan,Government program for universalization of elementary education (now integrated with Samagra Shiksha)
-SAMAGRA SHIKSHA,Samagra Shiksha Abhiyan,Integrated scheme for school education from pre-school to senior secondary level
 AFCAT,Air Force Common Admission Test,"Entrance exam for recruitment in Indian Air Force flying, technical, and ground duty branches"
 AILET,All India Law Entrance Test,Entrance exam conducted by NLU Delhi for law programs
 ALP,Assistant Loco Pilot,RRB exam for recruitment to assistant loco pilot posts
@@ -131,7 +127,6 @@ CMS,Combined Medical Services,UPSC conducted exam for recruitment to medical ser
 CSE,Civil Services Examination,"UPSC conducted exam for recruitment to IAS, IPS, IFS, and other central services"
 CSIR NET,Council of Scientific and Industrial Research National Eligibility Test,National level test for determining eligibility for lectureship and Junior Research Fellowship in science subjects
 GATE,Graduate Aptitude Test in Engineering,"National level examination for admission to postgraduate programs in IITs and IISc, and for PSU recruitment"
-GROUP D,Group D,RRB exam for recruitment to Level 1 posts in Indian Railways
 IBSAT,ICFAI Business School Aptitude Test,Entrance exam for admission to ICFAI Business School programs
 ICAR AIEEA,Indian Council of Agricultural Research All India Entrance Examination for Admission,Entrance exam for admission to agricultural universities
 IES,Indian Engineering Services,UPSC conducted exam for recruitment to engineering services in various government departments
@@ -202,15 +197,11 @@ MAN,Metropolitan Area Network,Network spanning a city or large campus
 WAN,Wide Area Network,Network spanning large geographical area
 WLAN,Wireless Local Area Network,Wireless computer network
 MOOC,Massive Open Online Course,Online course aimed at unlimited participation and open access
-PM EVIDYA,PM eVIDYA,Initiative for multi-mode access to digital education
 NIOS,National Institute of Open Schooling,Board for distance education at school level providing flexible learning opportunities
 IGNOU,Indira Gandhi National Open University,National open university for distance and open learning
 SIOU,State Open Universities,State-level open universities providing distance education
-FLIPPED CLASSROOM,Flipped Classroom,Instructional strategy where direct instruction moves to individual space
 ABL,Activity Based Learning,Method of learning where activities are the basis of learning
-BLENDED LEARNING,Blended Learning,Combination of online and face-to-face learning
 CBL,Competency Based Learning,Approach to teaching and learning based on demonstrating mastery of skills
-HYBRID LEARNING,Hybrid Learning,Flexible learning combining in-person and online elements
 OBE,Outcome-Based Education,Education based on achieving specific outcomes
 PBL,Project Based Learning,Teaching method in which students learn by actively engaging in real-world projects
 TBL,Team-Based Learning,Collaborative learning in structured teams
@@ -269,18 +260,13 @@ UAY,Uchchatar Avishkar Yojana,Scheme for promoting innovation in IITs
 VAJRA,Visiting Advanced Joint Research Faculty Scheme,Scheme for attracting top international faculty to Indian institutions
 EDUSAT,Educational Satellite,Satellite dedicated to serving the educational sector
 AICTE PG SCHOLARSHIP,All India Council for Technical Education Postgraduate Scholarship,Scholarship for GATE/GPAT qualified students pursuing M.Tech/M.Pharm
-CENTRAL SECTOR,Central Sector Scheme of Scholarship,Merit-based scholarship for college and university students
 INSPIRE,Innovation in Science Pursuit for Inspired Research,DST scholarship program for attracting talent to science education and research
-ISHAN UDAY,ISHAN UDAY,Special scholarship scheme for North Eastern Region
 KVPY,Kishore Vaigyanik Protsahan Yojana,"National fellowship program in basic sciences (discontinued, merged with INSPIRE)"
 NMMS,National Means-cum-Merit Scholarship,Central sector scholarship for meritorious students from economically weaker sections
 NTSE,National Talent Search Examination,National level scholarship program for identifying and nurturing talented students
 PG INDIRA GANDHI,Post Graduate Indira Gandhi Scholarship for Single Girl Child,Scholarship for single girl child pursuing postgraduate studies
 PM YASASVI,Prime Minister Young Achievers Scholarship Award Scheme for Vibrant India,"Scholarship for OBC, EBC, and DNT students for school and college education"
 PMSSS,Prime Minister's Special Scholarship Scheme,Scholarship for students from Jammu & Kashmir and Ladakh for higher education
-POST MATRIC,Post Matric Scholarship,"Scholarship for students belonging to SC, ST, OBC, and minority communities for post-matriculation studies"
-PRE MATRIC,Pre Matric Scholarship,Scholarship for students belonging to minority communities and SC/ST for pre-matriculation studies
-TOP CLASS EDUCATION,Top Class Education for SC Students,Scholarship for SC students for pursuing studies in premier institutions
 NSP,National Scholarship Portal,One-stop solution for scholarship applications and disbursement
 CBSE,Central Board of Secondary Education,National level board of education for public and private schools under the Union Government of India
 CISCE,Council for the Indian School Certificate Examinations,Private national level board conducting ICSE and ISC examinations
@@ -303,7 +289,6 @@ NOS,National Occupational Standards,Standards describing competent performance i
 NSQF,National Skills Qualifications Framework,Competency-based framework for organizing qualifications
 QF,Qualifications Framework,Framework for defining and classifying qualifications
 QP,Qualification Pack,Set of NOSs aligned to a job role
-BETI BACHAO BETI PADHAO,Beti Bachao Beti Padhao,"Scheme for survival, protection, and education of the girl child"
 API,Application Programming Interface,Interface for software applications to communicate
 CRM,Customer Relationship Management,Software for managing interactions with students and stakeholders
 SDK,Software Development Kit,Set of tools for developing software applications
@@ -311,7 +296,6 @@ SIS,Student Information System,Software for managing student data
 TMS,Training Management System,Software for managing training programs
 CU,Calcutta University,State university in West Bengal and one of the oldest multidisciplinary universities in India
 MU,Mumbai University,State university in Maharashtra and one of the oldest universities in India
-MADRAS UNIVERSITY,University of Madras,State university in Tamil Nadu and one of the oldest universities in India
 OU,Osmania University,"State university in Hyderabad, Telangana"
 SPPU,Savitribai Phule Pune University,"State university in Pune, Maharashtra formerly known as University of Pune"
 DM,Doctorate of Medicine|District Magistrate,"Doctorate of Medicine is a super specialty medical degree; District Magistrate is a senior district-level administrative officer"
@@ -346,13 +330,6 @@ HTML,HyperText Markup Language,Standard markup language for web pages
 HTTP,HyperText Transfer Protocol,Protocol for transferring web pages
 HTTPS,HyperText Transfer Protocol Secure,Secure version of HTTP
 URL,Uniform Resource Locator,Address of a web resource
-ALUMNI QUOTA,Alumni Quota,Preference in admission for children of alumni
-DEFENCE QUOTA,Defence Quota,Seats reserved for children of defence personnel
-EWS QUOTA,EWS Quota,25% seats reserved for EWS students in private schools under RTE
-MANAGEMENT QUOTA,Management Quota,Seats reserved for school management to fill at their discretion
-RTE QUOTA,RTE Quota,25% seats reserved for disadvantaged groups in private schools under RTE Act
-SIBLING QUOTA,Sibling Quota,Preference in admission for siblings of existing students
-SPORTS QUOTA,Sports Quota,Seats reserved for students excelling in sports
 CGPA,Cumulative Grade Point Average,Cumulative average of grade points across all terms/years
 GPA,Grade Point Average,Average of grade points obtained in all subjects
 CCE,Continuous and Comprehensive Evaluation,Former evaluation system for holistic assessment of students
@@ -361,53 +338,26 @@ SA,Summative Assessment,End-of-term assessment under CCE
 BACKGROUND CHECK,Teacher Background Verification,Mandatory police verification for school staff
 CCTV BUS,CCTV in School Buses,Surveillance cameras in school transport vehicles
 CHILDLINE,Childline India Foundation,24-hour emergency phone service for children in distress (1098)
-DISASTER DRILL,Disaster Management Drill,"Practice for earthquake, flood, and other disaster responses"
-FIRE DRILL,Fire Safety Drill,Regular practice for fire evacuation procedures
 GPS BUS,GPS in School Buses,GPS tracking system in school transport
-HEALTH CARD,School Health Card,Health record maintained for each student
-IRON FOLIC,Iron and Folic Acid Supplementation,Program providing IFA tablets to adolescents
-LIFE SKILLS,Life Skills Education,Education for developing coping and decision-making skills
-MENSTRUAL HYGIENE,Menstrual Hygiene Management,Program promoting menstrual hygiene in schools
-MENTAL HEALTH,Mental Health Program,Programs promoting student mental health and well-being
 POCSO ACT,Protection of Children from Sexual Offences Act,Act protecting children from sexual abuse and exploitation in schools
-SWACHH VIDYALAYA,Swachh Vidyalaya Puraskar,Award for schools maintaining cleanliness and hygiene
 WASH,"Water, Sanitation and Hygiene",Program for clean water and sanitation in schools
 EBSB,Ek Bharat Shreshtha Bharat,Program promoting cultural exchange and language learning among states
 FLN,Foundational Literacy and Numeracy,Core focus under NIPUN Bharat for classes 1-3
-ONE CLASS ONE CHANNEL,One Class One TV Channel,12 dedicated Swayam Prabha channels for each class
 MDM,Mid Day Meal Scheme,"School meal program to improve nutrition, attendance, and enrollment"
 PM POSHAN,Pradhan Mantri Poshan Shakti Nirman,Renamed Mid Day Meal Scheme focusing on nutrition
-PADHE BHARAT,Padhe Bharat Badhe Bharat,Program for improving reading and writing skills in early grades (Classes 1-2)
 NROER,National Repository of Open Educational Resources,Digital repository of open educational resources by NCERT
 ANNUAL EXAM,Annual Examination,Year-end examination conducted by schools
 BOARD EXAM,Board Examination,Public examination conducted by education boards for classes 10 and 12
-GRACE MARKS,Grace Marks,Additional marks given to help students pass
-HALF YEARLY,Half Yearly Examination,Mid-term examination conducted in schools
-PERIODIC TEST,Periodic Test,Regular tests conducted periodically under revised assessment patterns
-PRIVATE CANDIDATE,Private Candidate,Student appearing for board exam without attending regular school
-SUBJECT ENRICHMENT,Subject Enrichment Activities,Activities for deeper understanding of subjects
 UMC,Unfair Means Case,Case of cheating or using prohibited materials in exams
-UNIT TEST,Unit Test,Short test conducted after completion of a unit/chapter
-FIT INDIA,Fit India Movement,Movement encouraging physical activity and sports in schools
 AIM,Atal Innovation Mission,Mission promoting innovation and entrepreneurship including ATLs in schools
 PRI,Panchayati Raj Institution,Local self-government bodies involved in school education monitoring
 AR EDU,Augmented Reality in Education,Using AR technology for immersive learning experiences
-ADAPTIVE LEARNING,Adaptive Learning System,Technology that adapts to individual student needs
-DIGITAL MARKSHEET,Digital Marksheet,Online version of examination marksheet
-ENERGIZED TEXTBOOK,Energized Textbook,Textbooks embedded with QR codes linking to multimedia content
-GOOGLE CLASSROOM,Google Classroom,Google's free web service for classroom management
-KHAN ACADEMY,Khan Academy,Free online learning platform with Indian curriculum content
-MICROSOFT TEAMS,Microsoft Teams for Education,Microsoft's collaboration platform for education
 OLABS,Online Labs,Amrita University's virtual lab platform for schools
 OMR,Optical Mark Recognition,Technology for reading marked answers in offline exams
 ONLINE EXAM,Online Examination,Examinations conducted through digital platforms
 PARENT APP,Parent Mobile Application,App for parents to monitor child's progress and attendance
-PERSONALIZED LEARNING,Personalized Learning,Tailoring education to individual student needs
-QR CODE TEXTBOOK,QR Code in Textbooks,Textbooks with QR codes linking to digital content on DIKSHA
 VR EDU,Virtual Reality in Education,Using VR technology for immersive learning experiences
 VIRTUAL LAB,Virtual Laboratory,Online platform for conducting science experiments virtually
-WHITEHAT JR,WhiteHat Junior,Coding classes for children
-OPEN SCHOOL,Open School,School providing flexible distance education options
 PATRACHAR,Patrachar Vidyalaya,Delhi government open school for private candidates
 BOSSE,Board of Open Schooling and Skill Education,Open school board under NIOS for Sikkim and Northeast
 MPSOS,Madhya Pradesh State Open School,State open school for distance education in Madhya Pradesh
@@ -420,22 +370,11 @@ PWD,Persons with Disabilities,Category for students with disabilities eligible f
 SC,Scheduled Castes,Historically disadvantaged castes eligible for reservation
 ST,Scheduled Tribes,Historically disadvantaged tribes eligible for reservation
 SSY,Sukanya Samriddhi Yojana,Small savings scheme for girl child education and marriage expenses
-BEGUM HAZRAT MAHAL,Begum Hazrat Mahal National Scholarship,Scholarship for girl students from minority communities in classes 9-12
 MYSY,Mukhya Mantri Yuva Swavalamban Yojana,Gujarat state scholarship for meritorious students
-MERIT CUM MEANS,Merit-cum-Means Scholarship,Scholarship for minority students based on merit and means
-TOP CLASS SCHOOL,Top Class Education for SC Students,Scholarship for SC students in top-class private residential schools
 OASIS,Online Application for Scholarships in Studies,"West Bengal scholarship portal for SC, ST, and OBC students"
 PRERANA,Post Matric Scholarship for ST Students,Portal for post-matric scholarship for ST students
 EPASS,Electronic Payment and Application System of Scholarships,Online scholarship portal for various states
-CONSUMER CLUB,Consumer Club,Clubs creating awareness about consumer rights
-DISASTER MGMT CLUB,Disaster Management Club,Clubs creating awareness about disaster preparedness
-ECO CLUB,Eco Club,Environmental clubs in schools for creating awareness
-HEALTH CLUB,Health and Wellness Club,Clubs promoting health and wellness among students
-HERITAGE CLUB,Heritage Club,Clubs for preserving and promoting cultural heritage
-LITERACY CLUB,Literacy Club,Clubs promoting reading and literacy skills
 MATHS CLUB,Mathematics Club,Clubs promoting interest in mathematics
-ROAD SAFETY CLUB,Road Safety Club,Clubs promoting road safety awareness
-SCIENCE CLUB,Science Club,Clubs fostering scientific temperament and innovation
 CC,Character Certificate,Certificate attesting to student's character and conduct
 MC,Migration Certificate,Certificate required for students moving from one board to another
 SLC,School Leaving Certificate,Certificate issued when a student leaves school permanently
@@ -447,8 +386,6 @@ VEC,Village Education Committee,Village-level committee for monitoring school ed
 ATL,Atal Tinkering Lab,Workspaces in schools for students to explore STEM concepts
 CCTV SCHOOL,CCTV in Schools,Surveillance cameras for school security
 COMPUTER LAB,Computer Laboratory,Room equipped with computers for student use
-DISABLED TOILET,Disabled-Friendly Toilet,Toilets accessible for students with disabilities
-DRINKING WATER,Safe Drinking Water,Provision of potable water in schools
 ICT,Information and Communication Technology,Technology tools used in education
 ICT LAB,Information and Communication Technology Lab,Computer labs in schools under government schemes
 INCINERATOR,Sanitary Napkin Incinerator,Facility for safe disposal of sanitary napkins
@@ -456,17 +393,12 @@ LANGUAGE LAB,Language Laboratory,Room equipped for language learning with audio-
 RO PLANT,Reverse Osmosis Plant,Water purification system
 SCIENCE LAB,Science Laboratory,Room equipped for conducting science experiments
 SEPARATE TOILET,Separate Toilets for Girls,Gender-segregated toilet facilities
-SMART BOARD,Interactive Smart Board,Digital interactive whiteboard for teaching
 SMART CLASS,Smart Classroom,Technology-enabled classroom with digital teaching aids
-SOLAR PANEL,Solar Panel,Solar energy system for electricity generation
 TLM,Teaching Learning Material,Materials used by teachers for effective instruction
 AWES,Army Welfare Education Society,Society managing Army Public Schools
 AI SUBJECT,Artificial Intelligence,Subject introduced in CBSE for classes 9-12
-DATA SCIENCE,Data Science,Subject introduced in CBSE for skill development
 EVS,Environmental Studies,Subject combining environmental science and social studies for primary classes
 INFO PRAC,Informatics Practices,Subject for studying information technology applications
-LEGAL STUDIES,Legal Studies,Subject for studying basics of law and legal system
-MASS MEDIA,Mass Media Studies,Subject for studying media and communication
 SST,Social Science / Social Studies,"Subject combining history, geography, civics, and economics"
 APS,Army Public School,Schools for children of Indian Army personnel managed by AWES
 AWC,Anganwadi Centre,Center under ICDS providing early childhood care and education
@@ -474,10 +406,8 @@ EMRS,Eklavya Model Residential School,Residential schools for ST students provid
 PM SHRI SCHOOL,PM Schools for Rising India,Upgraded exemplar schools under PM SHRI scheme
 RIMC,Rashtriya Indian Military College,Prestigious military school in Dehradun for NDA preparation
 RMS,Rashtriya Military School,Military schools for boys preparing for armed forces careers
-SAINIK SCHOOL,Sainik School,Residential schools preparing students for entry into National Defence Academy
 BBBP,Beti Bachao Beti Padhao,"Scheme for survival, protection, and education of the girl child"
 ICDS,Integrated Child Development Services,Government program for children under 6 providing nutrition and preschool education
-KHELO INDIA,Khelo India,National program for sports development including school-level talent identification
 AHSEC,Assam Higher Secondary Education Council,State board for HS (Class 12) exams in Assam
 BIEAP,Board of Intermediate Education Andhra Pradesh,State board for intermediate (Class 11-12) in Andhra Pradesh
 BSE ODISHA,Board of Secondary Education Odisha,State board for Class 10 (HSC) exams in Odisha
@@ -493,7 +423,6 @@ COHSEM,Council of Higher Secondary Education Manipur,State board for higher seco
 DGE TN,Directorate of Government Examinations Tamil Nadu,Directorate conducting SSLC and HSC exams in Tamil Nadu
 DHSE KERALA,Directorate of Higher Secondary Education Kerala,Directorate for higher secondary education (Class 11-12) in Kerala
 GSEB,Gujarat Secondary and Higher Secondary Education Board,State board for SSC and HSC exams in Gujarat
-GOA BOARD,Goa Board of Secondary and Higher Secondary Education,State board for secondary and higher secondary education in Goa
 HBSE,Haryana Board of School Education,State board for secondary and senior secondary exams in Haryana (BSEH)
 HPBOSE,Himachal Pradesh Board of School Education,State board for school education in Himachal Pradesh
 JAC,Jharkhand Academic Council,State board for school and intermediate education in Jharkhand
@@ -548,7 +477,6 @@ JRC,Junior Red Cross,Youth wing of Indian Red Cross Society in schools
 NCC,National Cadet Corps,Tri-services organization grooming youth into disciplined citizens
 NSS,National Service Scheme,Public service program for higher secondary and college students
 NYKS,Nehru Yuva Kendra Sangathan,Autonomous body for youth development through various activities
-SCOUTS & GUIDES,Bharat Scouts and Guides,National scouting and guiding organization for character building
 JRF,Junior Research Fellowship,"Research fellowship offered by bodies such as CSIR, UGC, DBT, ICMR for postgraduate researchers"
 UG,Under Graduate,"Undergraduate level of study, below postgraduate"
 BSE,Board of Secondary Education,"State-level board responsible for secondary education examinations (e.g. BSE Odisha, BSE Telangana)"

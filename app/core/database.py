@@ -11,7 +11,21 @@ engine = create_engine(
     # lookups (acronym_service.get_expansions_batch() also caches the
     # resulting failure so it doesn't repeat this — now-bounded — cost for
     # every candidate token in the query).
-    connect_args={"connect_timeout": settings.POSTGRES_CONNECT_TIMEOUT},
+    #
+    # connect_timeout only covers OPENING a connection though — once one is
+    # established, nothing bounded a QUERY running on it. "options": "-c
+    # statement_timeout=..." sets that Postgres-side GUC for every session
+    # opened through this engine (bare integer = milliseconds, Postgres's
+    # default unit), so a connection that accepts new connections fine but
+    # hangs on an actual query now gets that query cancelled instead of
+    # blocking the request forever. A query that legitimately needs more
+    # room can override it per-transaction with `SET LOCAL statement_timeout
+    # = '30s'` right before running — that doesn't touch this default for
+    # anything else.
+    connect_args={
+        "connect_timeout": settings.POSTGRES_CONNECT_TIMEOUT,
+        "options": f"-c statement_timeout={settings.POSTGRES_STATEMENT_TIMEOUT_MS}",
+    },
 )
 SessionLocal = sessionmaker(bind=engine)
 

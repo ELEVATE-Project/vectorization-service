@@ -1,3 +1,4 @@
+from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Optional, List, Dict, Any, Literal
 from app.config import settings
@@ -308,4 +309,27 @@ class AcronymBulkUploadResponse(BaseModel):
     received: int
     created: int
     updated: int
+    # Rows in this batch whose is_active was set to false. A SUBSET of
+    # created + updated, not a separate category — without it a batch that
+    # disables 30 acronyms is indistinguishable from one that edits them.
+    deactivated: int
+    # False means the rows committed but the cache could not be updated, so
+    # stale expansions may still be served until their TTL expires (up to
+    # REDIS_CACHE_TTL for a deactivated acronym). The upload itself succeeded;
+    # the fix is to clear the cache, not to re-upload.
+    cache_refreshed: bool = True
     errors: List[AcronymUploadError]
+
+class AcronymItem(BaseModel):
+    acronym: str
+    expansions: List[str]
+    description: Optional[str] = None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+class AcronymListResponse(BaseModel):
+    total: int = Field(..., description="Total rows matching the filters, independent of limit/offset")
+    limit: int
+    offset: int
+    items: List[AcronymItem]
