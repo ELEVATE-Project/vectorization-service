@@ -275,6 +275,12 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     # ordinary query — 0.0 would wrongly read as "an acronym bonus of zero
                     # was computed" rather than "the bonus mechanism never ran".
                     acronym_bonus=result_data.get('acronym_bonus') if include_scoring_debug else None,
+                    # Only ever set for a document reused via prethreshold_by_source
+                    # (see _fetch_field_match_docs) — the real relevance the pipeline
+                    # measured before the threshold dropped it, kept visible instead of
+                    # being silently replaced by the synthetic floor score. None means
+                    # either debug is off or this document was never actually measured.
+                    measured_relevance=result_data.get('measured_relevance') if include_scoring_debug else None,
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")
@@ -640,15 +646,35 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 # at large top_k). Anything outside the cap keeps its retrieval
                 # score (_process_and_filter_results falls back to it for any
                 # id relevance_override doesn't cover).
+                #
+                # normalization_reference: None while pool_ids is still the full
+                # pool (nothing excluded, self-normalizing is already correct).
+                # Once capped, the full pool's own dense/sparse min-max is
+                # captured here (from the SAME prelim ranking pass we already
+                # need to pick the cutoff, so this is free) and passed through so
+                # the capped subset's rescore lands on the same scale as the
+                # untouched remainder, instead of being stretched to fill [0, 1]
+                # against just its own narrower range.
+                normalization_reference: Optional[Dict[str, float]] = None
                 if len(pool_ids) > settings.ACRONYM_RESCORE_POOL_LIMIT:
-                    prelim_ranked = self._rank_results(all_results, field_scores, weights, search_fields)
+                    full_pool_context: Dict[str, Any] = {}
+                    prelim_ranked = self._rank_results(
+                        all_results, field_scores, weights, search_fields,
+                        scoring_context_out=full_pool_context,
+                    )
                     pool_ids = [r['id'] for r in prelim_ranked[:settings.ACRONYM_RESCORE_POOL_LIMIT]]
+                    normalization_reference = {
+                        k: full_pool_context[k] for k in
+                        ("dense_min", "dense_max", "sparse_min", "sparse_max")
+                        if k in full_pool_context
+                    }
                 relevance_override = self._blended_acronym_relevance(
                     pool_ids, search_fields, weights,
                     query_text=dense_query_texts[0],
                     query_embedding=query_embeddings[0],
                     expansion_text=dense_query_texts[1],
                     expansion_embedding=query_embeddings[1],
+                    normalization_reference=normalization_reference,
                 )
 
             top_results, unique_source_results = self._process_and_filter_results(
@@ -1274,21 +1300,37 @@ class PrioritizedSearchService(AcronymRankingMixin):
         return None
     
     @staticmethod
-    def _min_max_normalize(scores: Dict[Any, float]) -> Dict[Any, float]:
+    def _min_max_normalize(
+        scores: Dict[Any, float],
+        lo: Optional[float] = None,
+        hi: Optional[float] = None,
+    ) -> Dict[Any, float]:
         """Min-max normalize a {key: score} map to the [0, 1] range.
 
         When every score is equal (single candidate or a flat pool) the range is
         zero and a min-max is undefined; a positive value maps to 1.0 and a zero
         value to 0.0 so that present candidates are never spuriously zeroed out.
+
+        lo/hi: optional external reference range, in place of the range of
+        `scores` itself. Every other caller omits these and gets the original
+        self-normalizing behaviour; the acronym rescore path (see
+        _blended_acronym_relevance) supplies the FULL retrieval pool's range so
+        a subset rescored on its own (ACRONYM_RESCORE_POOL_LIMIT) lands on the
+        same scale as candidates that were never rescored, instead of being
+        stretched to fill [0, 1] against just its own, possibly much narrower,
+        range. Clamped to [0, 1] since a value scored against different text
+        (the literal acronym vs its expansion) than the one lo/hi came from can
+        legitimately fall outside that external range.
         """
         if not scores:
             return {}
-        values = list(scores.values())
-        lo, hi = min(values), max(values)
+        if lo is None or hi is None:
+            values = list(scores.values())
+            lo, hi = min(values), max(values)
         if hi <= lo:
             return {k: (1.0 if v > 0 else 0.0) for k, v in scores.items()}
         span = hi - lo
-        return {k: (v - lo) / span for k, v in scores.items()}
+        return {k: max(0.0, min(1.0, (v - lo) / span)) for k, v in scores.items()}
 
     @staticmethod
     def _rank_positions(scores: Dict[Any, float]) -> Dict[Any, int]:
@@ -1329,6 +1371,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
         search_fields: List[str],
         scoring_context_out: Optional[Dict[str, Any]] = None,
         sparse_issued: bool = False,
+        normalization_reference: Optional[Dict[str, float]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Rank results using weighted multi-field scoring.
@@ -1368,6 +1411,14 @@ class PrioritizedSearchService(AcronymRankingMixin):
                   dense_weight, sparse_weight — weighted-fusion branch only, with the
                       weights actually applied (1.0/0.0 if sparse matched nothing).
                       Absent elsewhere; never back-fill from settings.
+            normalization_reference: Optional {dense_min, dense_max, sparse_min,
+                sparse_max} — when given (weighted-fusion branch only), min-max
+                normalizes against THIS range instead of computing a fresh one from
+                `field_scores`. For rescoring a capped subset of a larger pool (see
+                _blended_acronym_relevance) so the subset's scores land on the same
+                scale as the untouched remainder, rather than being locally
+                stretched to fill [0, 1] on their own. None (every other caller)
+                is the original self-normalizing behaviour.
 
         Returns:
             List of ranked results sorted by weighted score (descending)
@@ -1432,9 +1483,14 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 # rrf_raw is retained for debug surfacing (pre-normalization).
                 hybrid_scores = self._min_max_normalize(rrf_raw)
             else:
-                # Weighted min-max score fusion.
-                norm_dense = self._min_max_normalize(raw_dense)
-                norm_sparse = self._min_max_normalize(raw_sparse)
+                # Weighted min-max score fusion. External reference (if given) keeps
+                # a rescored subset on the same scale as the untouched remainder —
+                # see the normalization_reference docstring above.
+                ref = normalization_reference or {}
+                norm_dense = self._min_max_normalize(
+                    raw_dense, ref.get("dense_min"), ref.get("dense_max"))
+                norm_sparse = self._min_max_normalize(
+                    raw_sparse, ref.get("sparse_min"), ref.get("sparse_max"))
                 if sparse_has_hits:
                     dense_w = settings.HYBRID_DENSE_WEIGHT
                     sparse_w = settings.HYBRID_SPARSE_WEIGHT
@@ -1882,13 +1938,15 @@ class PrioritizedSearchService(AcronymRankingMixin):
         asked for. Per-field scores are reused from ``prethreshold_by_source`` when the
         document was already scored, otherwise computed from its stored vectors.
 
-        prefilter_scores: optional source_id -> ranked entry map (see
-        _process_and_filter_results' prefilter_scores_out) for documents the normal
-        pipeline DID score but that filter_score then dropped. For those, the real
-        relevance/field_scores/acronym bonus are used instead of the synthetic floor —
-        a document the pipeline actually measured should not be re-added as if
-        nothing were known about it. Sources genuinely absent from the candidate
-        pool still take the floor path unchanged.
+        prethreshold_by_source: optional source_id -> ranked entry map (see
+        _process_and_filter_results' prethreshold_by_source_out) for documents the
+        normal pipeline DID score but that filter_score then dropped. For those,
+        the real field_scores/acronym bonus are reused and the real relevance is
+        preserved under measured_relevance — but weighted_score/relevance still go
+        through the same floor formula as every other injected document, so a
+        rescued entry can never be mistaken for a genuine semantic hit. Sources
+        genuinely absent from the candidate pool still take the floor path
+        unchanged (and get no measured_relevance, since nothing was measured).
 
         acronyms_detected: same map _process_and_filter_results uses for the
         acronym bonus. Only when truthy is a bonus given at all — it must stay a
@@ -1933,6 +1991,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
             relevance, boost = _score_for(match_type)
             bonus = ranked.get("acronym_bonus", 0.0)
             score = relevance * (1.0 + bonus)
+            # The real relevance the pipeline actually measured before the threshold
+            # dropped this document — about to be overwritten by the floor formula
+            # above. Kept under its own key so it isn't lost with zero trace.
+            measured_relevance = ranked.get("relevance", ranked.get("weighted_score"))
 
             # Copy both dicts — the original is shared and must not be changed.
             entry = dict(ranked)
@@ -1940,6 +2002,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
             entry["field_scores"][match_key] = match_type
             entry["weighted_score"] = score
             entry["relevance"] = relevance
+            entry["measured_relevance"] = measured_relevance
             entry["acronym_bonus"] = bonus
             entry[mult_key] = boost
             # Marks the score as a keyword-match floor, not a semantic one; otherwise an
@@ -2037,7 +2100,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
         # source_ids here is `remaining` (reassigned above) — every id already
         # covered by prethreshold_by_source was resolved in Step 2 and never
         # reaches this point, so no extra check for that is needed.
-        floor_body_sources: Optional[Set[str]] = set()
+        floor_body_sources: Optional[Dict[str, Set[str]]] = {}
         if acronyms_detected:
             floor_candidates: List[Dict[str, Any]] = []
             considered: Set[str] = set()
@@ -2085,13 +2148,21 @@ class PrioritizedSearchService(AcronymRankingMixin):
             # content check (floor_body_sources, above). On the floor base the
             # bonus is small in absolute terms, so a document nothing was measured
             # about stays below the ones that were.
+            #
+            # Per-document, per-acronym: which of THIS point's detected acronyms
+            # were actually verified in ITS body, not just whether any acronym
+            # was backed anywhere in the batch (see _sources_with_acronym_in_body).
+            backed_acronyms = (
+                {a for a, sources in floor_body_sources.items() if str(source_id) in sources}
+                if floor_body_sources is not None
+                else set()
+            )
             bonus = (
                 self._acronym_bonus(
                     point.payload.get("title"),
                     point.payload.get("summary"),
                     acronyms_detected,
-                    floor_body_sources is not None
-                    and str(source_id) in floor_body_sources,
+                    backed_acronyms,
                 )
                 if acronyms_detected
                 else 0.0

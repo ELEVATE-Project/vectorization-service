@@ -270,6 +270,17 @@ class SearchResultItem(BaseModel):
                     "None when the query wasn't an acronym query at all. "
                     "Debug-only (include_scoring_debug=true)."
     )
+    measured_relevance: Optional[float] = Field(
+        default=None,
+        description="The real relevance the pipeline measured for this document before "
+                    "the search threshold dropped it and it was re-added as a keyword "
+                    "match (see match_source). weighted_score/relevance for a reused "
+                    "document are still the synthetic floor score, same as any other "
+                    "injected result — this field is only where the original, fully "
+                    "measured number is kept so it isn't lost. None both when debug is "
+                    "off and when the document was never actually measured (a genuinely "
+                    "new keyword match, or a normal non-injected result)."
+    )
     title_match: Optional[str] = Field(
         default=None,
         description="Title match type: 'exact', 'partial', or None if no title match"

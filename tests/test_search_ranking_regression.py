@@ -176,46 +176,47 @@ class TestWordsMatch:
 
 
 class TestAcronymBonus:
-    """The four grades that replaced tiers 4/2/3/1. `backed` is whether the
-    document's content mentions the acronym — required for the acronym grades
-    only."""
+    """The four grades that replaced tiers 4/2/3/1. `backed_acronyms` is the set
+    of acronyms whose content is verified to mention them — required for the
+    acronym grades only, and per-acronym (see test_body_evidence_does_not_leak_
+    between_acronyms below for why it can't just be a single flag)."""
 
     def test_acronym_in_title(self, service):
         assert service._acronym_bonus(
-            "DIET Stakeholder Identity Map", None, ACR, True) == settings.ACRONYM_BONUS_TITLE_ACRONYM
+            "DIET Stakeholder Identity Map", None, ACR, {"DIET"}) == settings.ACRONYM_BONUS_TITLE_ACRONYM
 
     def test_acronym_in_summary(self, service):
         assert service._acronym_bonus(
-            "Some Title", "About the DIET programme", ACR, True) == settings.ACRONYM_BONUS_SUMMARY_ACRONYM
+            "Some Title", "About the DIET programme", ACR, {"DIET"}) == settings.ACRONYM_BONUS_SUMMARY_ACRONYM
 
     def test_expansion_in_title(self, service):
         """The plural regression: literal expansion matching never fired."""
         assert service._acronym_bonus(
-            "Strengthening of District Institutes of Education and Training", None, ACR, False
+            "Strengthening of District Institutes of Education and Training", None, ACR, set()
         ) == settings.ACRONYM_BONUS_TITLE_EXPANSION
 
     def test_expansion_in_summary(self, service):
         assert service._acronym_bonus(
-            "Some Title", "Run by the District Institute of Education and Training", ACR, False
+            "Some Title", "Run by the District Institute of Education and Training", ACR, set()
         ) == settings.ACRONYM_BONUS_SUMMARY_EXPANSION
 
     def test_unrelated_earns_nothing(self, service):
         assert service._acronym_bonus(
-            "Establishing Discipline Through Clear School Rules", "school rules", ACR, True) == 0.0
+            "Establishing Discipline Through Clear School Rules", "school rules", ACR, {"DIET"}) == 0.0
 
     def test_acronym_grade_beats_expansion_grade_when_both_present(self, service):
         assert service._acronym_bonus(
-            "DIET — District Institute of Education and Training", None, ACR, True
+            "DIET — District Institute of Education and Training", None, ACR, {"DIET"}
         ) == settings.ACRONYM_BONUS_TITLE_ACRONYM
 
     def test_literal_acronym_is_not_substring_matched(self, service):
         """'DIET' must never match inside 'dietary', backed or not."""
-        assert service._acronym_bonus("Dietary guidelines for schools", None, ACR, True) == 0.0
+        assert service._acronym_bonus("Dietary guidelines for schools", None, ACR, {"DIET"}) == 0.0
 
     def test_underscore_separated_title_still_matches(self, service):
         """Filename-style titles use '_' as a separator; \\b would miss these."""
         assert service._acronym_bonus(
-            "source_doc_COE_AM4C2_DIET_Empowerment_Design.xlsx", None, ACR, True
+            "source_doc_COE_AM4C2_DIET_Empowerment_Design.xlsx", None, ACR, {"DIET"}
         ) == settings.ACRONYM_BONUS_TITLE_ACRONYM
 
     def test_multiple_acronyms_sum_their_own_best_grades(self, service):
@@ -229,7 +230,7 @@ class TestAcronymBonus:
         }
         # literal match for SMC (title), expansion-only match for DIET (summary)
         assert service._acronym_bonus(
-            "SMC handbook", "District Institute of Education and Training", acr, True
+            "SMC handbook", "District Institute of Education and Training", acr, {"DIET", "SMC"}
         ) == settings.ACRONYM_BONUS_TITLE_ACRONYM + settings.ACRONYM_BONUS_SUMMARY_EXPANSION
 
     def test_multiple_acronyms_summed_bonus_is_capped(self, service):
@@ -241,19 +242,33 @@ class TestAcronymBonus:
         }
         uncapped = settings.ACRONYM_BONUS_TITLE_ACRONYM * 2
         assert uncapped > settings.ACRONYM_BONUS_MULTI_MATCH_CAP
-        assert service._acronym_bonus("SMC DIET handbook", None, acr, True) == settings.ACRONYM_BONUS_MULTI_MATCH_CAP
+        assert service._acronym_bonus(
+            "SMC DIET handbook", None, acr, {"DIET", "SMC"}) == settings.ACRONYM_BONUS_MULTI_MATCH_CAP
+
+    def test_body_evidence_does_not_leak_between_acronyms(self, service):
+        """A document's body backing SMC must not also count as backing for a
+        DIET title claim on the same document — each acronym's grade is only
+        gated on ITS OWN entry in backed_acronyms."""
+        acr = {
+            "DIET": ["District Institute of Education and Training"],
+            "SMC": ["School Management Committee"],
+        }
+        # Title claims both acronyms; only SMC's content is actually backed.
+        assert service._acronym_bonus(
+            "DIET SMC Handbook", None, acr, {"SMC"}
+        ) == settings.ACRONYM_BONUS_TITLE_ACRONYM  # SMC's grade only, not DIET's too
 
     def test_title_claim_without_content_evidence_earns_nothing(self, service):
         """A title is a claim about the topic, not evidence — the corpus holds
         documents titled 'DIET Reference Handbook' about coastal navigation."""
-        assert service._acronym_bonus("DIET Reference Handbook", None, ACR, False) == 0.0
+        assert service._acronym_bonus("DIET Reference Handbook", None, ACR, set()) == 0.0
 
     def test_unbacked_acronym_keeps_its_expansion_grade(self, service):
         """Every grade is evaluated, so an unbacked acronym never erases the
         expansion grade the same title earns on its own — adding 'DIET' to a
         title that spells the expansion out must not LOWER its rank."""
         assert service._acronym_bonus(
-            f"DIET — {ACR['DIET'][0]}", None, ACR, False
+            f"DIET — {ACR['DIET'][0]}", None, ACR, set()
         ) == settings.ACRONYM_BONUS_TITLE_EXPANSION
 
 
@@ -394,6 +409,8 @@ class TestFieldMatchInjection:
         assert entry["field_scores"]["title_match"] == "partial"
         assert entry["raw_dense"] == 0.2228
         assert entry["keyword_score"] == 0.0
+        # the real relevance the pipeline measured is kept, not just dropped
+        assert entry["measured_relevance"] == pytest.approx(0.31)
 
     def test_reused_and_never_scored_sources_land_on_the_same_floor(self, service, monkeypatch):
         """A reused source and a never-scored source get the identical weighted_score
@@ -417,6 +434,9 @@ class TestFieldMatchInjection:
         assert with_real["weighted_score"] == pytest.approx(floor_only["weighted_score"])
         assert floor_only["field_scores"]["tags"] is None
         assert with_real["field_scores"]["tags"] == 0.61
+        # never-scored path has nothing measured to preserve; reused path does
+        assert "measured_relevance" not in floor_only
+        assert with_real["measured_relevance"] == pytest.approx(0.31)
 
     def test_boost_cap_still_applies(self, service, monkeypatch):
         """The floor/boost/score_floor formula never produces a score above 1.0,
@@ -488,10 +508,12 @@ class TestFieldMatchInjection:
 
     def _inject_one(self, service, monkeypatch, source_id, field="title", backed=()):
         """`backed`: source ids whose content mentions the acronym (the BM25
-        check is stubbed, so these tests never reach Qdrant)."""
+        check is stubbed, so these tests never reach Qdrant). ACR is always the
+        single-acronym {"DIET": [...]} fixture in this class, so the mocked
+        per-acronym mapping only ever needs the one "DIET" key."""
         monkeypatch.setattr(
             PrioritizedSearchService, "_sources_with_acronym_in_body",
-            lambda self, candidates: set(backed))
+            lambda self, candidates: {"DIET": set(backed)})
         boosts = (
             (settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST)
             if field == "title"
@@ -839,12 +861,12 @@ class TestAcronymBonusFollowsLexicalRanking:
             self, service):
         """Same rule on the scored path as the injection one."""
         both = f"DIET — {ACR['DIET'][0]}"
-        assert service._acronym_bonus(both, None, dict(ACR), True) == \
+        assert service._acronym_bonus(both, None, dict(ACR), {"DIET"}) == \
             settings.ACRONYM_BONUS_TITLE_ACRONYM
-        assert service._acronym_bonus(both, None, dict(ACR), False) == \
+        assert service._acronym_bonus(both, None, dict(ACR), set()) == \
             settings.ACRONYM_BONUS_TITLE_EXPANSION
         # A title with no expansion in it has nothing to fall back to.
-        assert service._acronym_bonus("DIET Handbook", None, dict(ACR), False) == 0.0
+        assert service._acronym_bonus("DIET Handbook", None, dict(ACR), set()) == 0.0
 
     def test_a_demoted_document_is_still_returned(self, service, monkeypatch):
         """filter_score reads relevance and never the bonus.
@@ -875,7 +897,7 @@ class TestAcronymBonusFollowsLexicalRanking:
         # Content check: this document's content doesn't mention DIET.
         monkeypatch.setattr(
             PrioritizedSearchService, "_sources_with_acronym_in_body",
-            lambda self, candidates: set())
+            lambda self, candidates: {})
 
         injected = service._fetch_field_match_docs(
             ["Z"], {"Z": "partial"}, "title",

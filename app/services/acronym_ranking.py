@@ -385,8 +385,9 @@ class AcronymRankingMixin:
 
     def _sources_with_acronym_in_body(
         self, sources_by_acronym: Dict[str, Set[str]]
-    ) -> Optional[Set[str]]:
-        """Which of the candidate sources mention their acronym in the body.
+    ) -> Optional[Dict[str, Set[str]]]:
+        """Which of the candidate sources mention THEIR OWN acronym in the body,
+        kept separate per acronym.
 
         One BM25 query per acronym for the bare acronym alone — not the
         expansion bag the retrieval query uses, which matches any document
@@ -397,19 +398,25 @@ class AcronymRankingMixin:
         large a retrieval pool happened to be drawn. Checked per SOURCE, across
         all of its chunks, including chunks that never made the pool.
 
+        Returned per-acronym rather than as one flat set: a query naming several
+        acronyms (e.g. "DIET SMC") must not let a document's body evidence for
+        SMC count as evidence for a DIET title claim on the same document —
+        each acronym's set here only ever contains sources verified for THAT
+        acronym specifically.
+
         Returns None when BM25 can't answer (sparse search disabled, the encoder
         unavailable, or the query failed) so the caller falls back rather than
         treating "couldn't check" as "checked and absent". About 12 ms per
         acronym on the local corpus.
         """
         if not sources_by_acronym:
-            return set()
+            return {}
         if not settings.SPARSE_SEARCH_ENABLED:
             return None
         try:
             from app.core.clients.sparse_encoder import generate_sparse_vector
 
-            backed: Set[str] = set()
+            backed: Dict[str, Set[str]] = {}
             for acronym, sources in sources_by_acronym.items():
                 indices, values = generate_sparse_vector(acronym)
                 if not indices:
@@ -426,7 +433,7 @@ class AcronymRankingMixin:
                     limit=len(sources),
                     with_payload=False,
                 )
-                backed.update(str(group.id) for group in response.groups)
+                backed[acronym] = {str(group.id) for group in response.groups}
             return backed
         except Exception as exc:
             logger.warning(
@@ -439,7 +446,7 @@ class AcronymRankingMixin:
         title: Optional[str],
         summary: Optional[str],
         acronyms_detected: Dict[str, List[str]],
-        content_backs_acronym: bool,
+        backed_acronyms: Set[str],
     ) -> float:
         """The proportional bonus a document earns: the best that applies of
 
@@ -454,13 +461,21 @@ class AcronymRankingMixin:
         most a (bonus) relative gap and never lifts a weak document over a much
         stronger one.
 
-        The two acronym grades also require content_backs_acronym: a title or
-        summary is a claim about the topic, not evidence of it (the corpus holds
+        The two acronym grades also require backed_acronyms: a title or summary
+        is a claim about the topic, not evidence of it (the corpus holds
         documents titled "DIET Reference Handbook" whose content is coastal
         navigation). Expansion grades don't — spelling the expansion out is
         itself the evidence. Every grade is evaluated rather than stopping at
         the first match, so an unbacked acronym in the title still leaves the
         document eligible for its expansion grade.
+
+        backed_acronyms is per-DOCUMENT, not a single flag: it's the subset of
+        acronyms_detected whose body content was actually verified for THIS
+        document. A query naming several acronyms (e.g. "DIET SMC") must not
+        let body evidence for one acronym count as evidence for another — a
+        document titled "DIET Handbook" whose body only ever says "SMC" earns
+        the DIET title grade only if "DIET" is itself in backed_acronyms, not
+        because SOME acronym's evidence was found somewhere in the document.
 
         Several detected acronyms: each gets its OWN best grade (computed
         independently, exactly as a single acronym would be), and those are
@@ -481,6 +496,7 @@ class AcronymRankingMixin:
         summary_expansion = settings.ACRONYM_BONUS_SUMMARY_EXPANSION
         total = 0.0
         for acronym, expansions in acronyms_detected.items():
+            content_backs_acronym = acronym in backed_acronyms
             best = 0.0
             if content_backs_acronym and self._term_in_text(acronym, title):
                 best = max(best, title_acronym)
@@ -507,10 +523,13 @@ class AcronymRankingMixin:
         """Set r['acronym_bonus'] on every row.
 
         Content backing comes from one BM25 check per acronym over exactly the
-        candidate sources (_sources_with_acronym_in_body), so it depends on the document
-        and never on how large a retrieval pool top_k drew. When BM25 can't
-        answer, it falls back to the old pool-membership check per chunk rather
-        than withholding every acronym bonus at once.
+        candidate sources (_sources_with_acronym_in_body), kept separate per
+        acronym so a query naming several acronyms can't let one acronym's body
+        evidence count as backing for another. When BM25 can't answer, it falls
+        back to the old pool-membership check per chunk rather than withholding
+        every acronym bonus at once — that fallback is a single document-wide
+        signal (no per-acronym distinction is possible from it), so it applies
+        uniformly to every detected acronym, same as before.
 
         Memoized per source when BM25 answered — the bonus depends only on
         title, summary and the source's content, which every chunk shares, and
@@ -533,15 +552,23 @@ class AcronymRankingMixin:
             key = str(source_id) if source_id is not None else None
             if body_sources is not None and key is not None:
                 if key not in by_source:
+                    backed_acronyms = {
+                        acronym for acronym, sources in body_sources.items()
+                        if key in sources
+                    }
                     by_source[key] = self._acronym_bonus(
                         payload.get('title'), payload.get('summary'),
-                        acronyms_detected, key in body_sources,
+                        acronyms_detected, backed_acronyms,
                     )
                 r['acronym_bonus'] = by_source[key]
             else:
+                # Uniform fallback, applied to every acronym alike — see docstring.
+                backed_acronyms = (
+                    set(acronyms_detected) if self._body_matched(r.get('field_scores')) else set()
+                )
                 r['acronym_bonus'] = self._acronym_bonus(
                     payload.get('title'), payload.get('summary'),
-                    acronyms_detected, self._body_matched(r.get('field_scores')),
+                    acronyms_detected, backed_acronyms,
                 )
 
     def _blended_acronym_relevance(
@@ -553,6 +580,7 @@ class AcronymRankingMixin:
         query_embedding: Any,
         expansion_text: str,
         expansion_embedding: Any,
+        normalization_reference: Optional[Dict[str, float]] = None,
     ) -> Optional[Dict[Any, float]]:
         """Relevance for an acronym query:
             (1 - W) x score_against_query + W x score_against_expansion
@@ -573,6 +601,15 @@ class AcronymRankingMixin:
         candidate -- ids left out simply keep their retrieval score. Returns
         None — callers keep the retrieval scores — when the pool is empty or
         rescoring fails.
+
+        normalization_reference: forwarded to _rank_results (see its docstring).
+        When pool_ids is a capped SUBSET of a larger retrieval pool, this should
+        be the full pool's own {dense_min, dense_max, sparse_min, sparse_max} —
+        without it, min-max normalizing the subset on its own gives it a
+        different scale than the untouched remainder that kept its original
+        retrieval score, which corrupts both ordering and the filter_score
+        threshold across the cutoff boundary. None when pool_ids already IS the
+        full pool (nothing was excluded, so self-normalizing is already correct).
         """
         if not pool_ids:
             return None
@@ -593,7 +630,11 @@ class AcronymRankingMixin:
                 )
                 sparse_issued = False
             return {r['id']: r['weighted_score']
-                    for r in self._rank_results(results, scores, weights, search_fields, sparse_issued=sparse_issued)}
+                    for r in self._rank_results(
+                        results, scores, weights, search_fields,
+                        sparse_issued=sparse_issued,
+                        normalization_reference=normalization_reference,
+                    )}
 
         try:
             by_query = score(query_text, query_embedding)
