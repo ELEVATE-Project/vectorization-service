@@ -107,7 +107,8 @@ class BaseDocumentOperation:
                     status_code=400,
                     detail=f"source_id must be at most {settings.MAX_SOURCE_ID_LENGTH} characters"
                 )
-            if not re.match(settings.SOURCE_ID_PATTERN, source_id):
+            # fullmatch: an env-overridden pattern without ^...$ must not accept a valid prefix
+            if not re.fullmatch(settings.SOURCE_ID_PATTERN, source_id):
                 raise HTTPException(
                     status_code=400,
                     detail=f"source_id contains invalid characters (allowed pattern: {settings.SOURCE_ID_PATTERN})"
@@ -119,7 +120,7 @@ class BaseDocumentOperation:
         # Previously anything starting with "P" passed (e.g. "Pxyz");
         # now it must be "P" followed by digits, returned upper-cased.
         normalized = priority.strip().upper() if priority else ""
-        if not re.match(settings.PRIORITY_PATTERN, normalized):
+        if not re.fullmatch(settings.PRIORITY_PATTERN, normalized):
             raise HTTPException(
                 status_code=400,
                 detail="Invalid priority format. Must be P1, P2, P3, etc."
