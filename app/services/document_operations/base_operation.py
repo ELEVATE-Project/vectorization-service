@@ -95,7 +95,7 @@ class BaseDocumentOperation:
                 detail="source_id is required and cannot be empty"
             )
 
-        # Strip so " 975" and "975" never end up stored as two different documents;
+        # Strip surrounding whitespace so padded and unpadded ids never become two documents;
         # delete/update/search all filter on the exact stored string.
         source_id = source_id.strip()
 

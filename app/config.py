@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     PRIORITY_PATTERN: str = os.getenv("PRIORITY_PATTERN", r"^P\d+$")  # P1, P2, ...
 
 
+    # Document-level fields stored once at the payload top level (indexed, embedded, filtered);
+    # upload drops their copy from payload["metadata"]. Caller keys like TITLE are not affected.
+    OMITTED_FIELDS_FROM_METADATA: list = ["title", "summary", "tags"]
+
     # Prioritized Search Configuration
     # Order determines search priority: Title > Chunk > Tags > Summary > Metadata
     SEARCH_PRIORITY_ORDER: list = ["title", "text", "tags", "summary", "metadata"]

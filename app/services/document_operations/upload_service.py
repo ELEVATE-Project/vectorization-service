@@ -128,15 +128,6 @@ class UploadService(BaseDocumentOperation):
             if company_id:
                 additional_metadata['company'] = company_id
 
-            # Add title, summary, and tags to metadata if provided
-            if title:
-                additional_metadata['title'] = title
-            if summary:
-                additional_metadata['summary'] = summary
-            if tags:
-                # Tags are already a list
-                additional_metadata['tags'] = tags
-
             # markdown_url (already validated) means content comes from the URL,
             # so the uploaded file itself is not parsed and its type is not checked.
             use_markdown_url = bool(additional_metadata.get('markdown_url'))
@@ -357,15 +348,14 @@ class UploadService(BaseDocumentOperation):
         if company_id:
             chunk_metadata['company'] = company_id
         
-        if title and 'title' not in chunk_metadata:
-            chunk_metadata['title'] = title
-        
-        if summary and 'summary' not in chunk_metadata:
-            chunk_metadata['summary'] = summary
-        
-        if tags and 'tags' not in chunk_metadata:
-            chunk_metadata['tags'] = tags
-        
+        # title/summary/tags are stored once at the payload top level; drop the caller's
+        # metadata copy when the top level holds it or it is empty (commons sends tags: []).
+        # A value sent only in metadata is kept so it is not lost. TITLE is caller data, kept.
+        top_level = {"title": title, "summary": summary, "tags": tags}
+        for field in settings.OMITTED_FIELDS_FROM_METADATA:
+            if field in chunk_metadata and (top_level.get(field) or not chunk_metadata[field]):
+                del chunk_metadata[field]
+
         if source_id:
             chunk_metadata['source_id'] = source_id
         
@@ -402,7 +392,11 @@ class UploadService(BaseDocumentOperation):
         logger.info(f"Generating embeddings for {len(processed_chunks)} chunks")
         text_embeddings = generate_embeddings([chunk["text"] for chunk in processed_chunks])
 
-        field_embeddings = self._generate_field_embeddings(title, summary, tags, additional_metadata)
+        # The metadata vector keeps its original input (metadata + title/summary/tags) so
+        # ranking is unchanged, even though those fields are no longer stored in metadata.
+        embedding_metadata = dict(additional_metadata or {})
+        embedding_metadata.update({k: v for k, v in (("title", title), ("summary", summary), ("tags", tags)) if v})
+        field_embeddings = self._generate_field_embeddings(title, summary, tags, embedding_metadata)
 
         # Phase 2: generate BM25 sparse vectors when enabled.
         sparse_vectors: List[object] = []
