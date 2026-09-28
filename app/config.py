@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
 
+    # Ingestion validation rules (POST /api/documents). source_id is the key every chunk
+    # is stored/deleted/filtered by, so it must be short and unambiguous.
+    MAX_SOURCE_ID_LENGTH: int = int(os.getenv("MAX_SOURCE_ID_LENGTH", 255))
+    SOURCE_ID_PATTERN: str = os.getenv("SOURCE_ID_PATTERN", r"^[A-Za-z0-9_\-.:]+$")
+    PRIORITY_PATTERN: str = os.getenv("PRIORITY_PATTERN", r"^P\d+$")  # P1, P2, ...
+
 
     # Prioritized Search Configuration
     # Order determines search priority: Title > Chunk > Tags > Summary > Metadata

@@ -5,7 +5,7 @@ from typing import List, Dict, Optional, Any
 from fastapi import HTTPException, UploadFile
 from qdrant_client import models
 from app.services.document_operations.base_operation import BaseDocumentOperation
-from app.core.clients.qdrant import upload_to_qdrant
+from app.core.clients.qdrant import upload_to_qdrant, qdrant_client
 from app.core.clients.embedding import generate_embeddings, validate_vector
 from app.config import settings
 from app.services.file_processors.csv_processor import CSVProcessor
@@ -39,23 +39,95 @@ class UploadService(BaseDocumentOperation):
         """Get list of all supported file types"""
         return list(self.processor_map.keys())
 
+    def validate_upload_file(self, file: UploadFile, check_type: bool = True) -> str:
+        """Validate the uploaded file's name/type/declared size; returns the lowercase extension"""
+        if file is None or not file.filename or not file.filename.strip():
+            raise HTTPException(status_code=400, detail="A file with a filename is required")
+
+        # Reject unsupported types before reading/parsing the body, so the caller gets
+        # a clear 400 instead of a late processor failure.
+        file_extension = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+        if check_type and f".{file_extension}" not in self.processor_map:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: '{file_extension or 'none'}'. "
+                       f"Supported types: {self.get_supported_file_types()}"
+            )
+
+        # Fast-path size check when the server already knows the upload size;
+        # validate_file_content() re-checks on the real bytes.
+        if file.size is not None and file.size > self._max_file_size_bytes():
+            raise self._file_too_large()
+        return file_extension or "txt"
+
+    def validate_file_content(self, file_content: bytes) -> None:
+        """Reject empty or oversized file bodies"""
+        if not file_content:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        if len(file_content) > self._max_file_size_bytes():
+            raise self._file_too_large()
+
+    @staticmethod
+    def _max_file_size_bytes() -> int:
+        return settings.MAX_FILE_SIZE_MB * 1024 * 1024
+
+    @staticmethod
+    def _file_too_large() -> HTTPException:
+        return HTTPException(
+            status_code=413,
+            detail=f"File exceeds the maximum allowed size of {settings.MAX_FILE_SIZE_MB} MB"
+        )
+
+    def _ensure_upload_complete(self, upload_results: dict, source_id: str) -> None:
+        """Fail the request (and roll back this request's points) on an empty or partial upload"""
+        if upload_results.get("success_count", 0) == 0 and upload_results.get("error_count", 0) == 0:
+            raise HTTPException(
+                status_code=500,
+                detail="No valid chunks could be built for upload; nothing was stored."
+            )
+        if upload_results.get("error_count", 0) == 0:
+            return
+
+        # Some batches failed: delete the points this request did store so a half-indexed
+        # document is never left behind; the caller can safely retry the whole upload.
+        point_ids = upload_results.get("point_ids") or []
+        try:
+            if point_ids:
+                qdrant_client.delete(
+                    collection_name=settings.COLLECTION_NAME,
+                    points_selector=models.PointIdsList(points=point_ids),
+                )
+                logger.warning(f"Rolled back {len(point_ids)} points for source_id {source_id} after partial upload")
+        except Exception as exc:
+            logger.error(f"Rollback of partial upload for source_id {source_id} failed: {exc}")
+
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Upload to vector store failed for source_id {source_id}: "
+                f"{upload_results['error_count']} of {upload_results.get('total_points', len(point_ids))} "
+                f"points failed. No partial document was kept; retry the request."
+            ),
+        )
+
     async def process(self, file: UploadFile, priority: str, metadata: Dict[str, Any] = None,
                       source_id: str = None, company_id: str = None,
                       title: str = None, summary: str = None, tags: List[str] = None):
         """Process file upload with company_id support"""
         try:
-            # Validate inputs
-            self.validate_source_id(source_id)
-            self.validate_priority(priority)
-
-            # Use metadata dict directly (already parsed by endpoint)
-            additional_metadata = metadata if metadata else {}
+            # Validate and normalize every caller-controlled field before any processing,
+            # so a bad request never reaches parsing, embedding or Qdrant.
+            source_id = self.validate_source_id(source_id, strict=True)
+            priority = self.validate_priority(priority)
+            company_id, title, summary, tags, additional_metadata = self.validate_document_fields(
+                source_id, company_id, title, summary, tags, metadata
+            )
             logger.info(f"Received metadata: {additional_metadata}")
 
             # Add company_id to metadata if provided
             if company_id:
                 additional_metadata['company'] = company_id
-            
+
             # Add title, summary, and tags to metadata if provided
             if title:
                 additional_metadata['title'] = title
@@ -65,14 +137,16 @@ class UploadService(BaseDocumentOperation):
                 # Tags are already a list
                 additional_metadata['tags'] = tags
 
+            # markdown_url (already validated) means content comes from the URL,
+            # so the uploaded file itself is not parsed and its type is not checked.
+            use_markdown_url = bool(additional_metadata.get('markdown_url'))
+            file_extension = self.validate_upload_file(file, check_type=not use_markdown_url)
+
             # Ensure collections exist
             await self.ensure_collections()
 
-            # Initialize file_extension
-            file_extension = file.filename.split(".")[-1].lower() if file.filename else "txt"
-
             # Check if markdown_url is present in metadata
-            if additional_metadata and 'markdown_url' in additional_metadata and additional_metadata['markdown_url']:
+            if use_markdown_url:
                 # Extract text from URL instead of processing file
                 url = additional_metadata['markdown_url']
                 logger.info(f"Extracting text from markdown_url: {url}")
@@ -81,8 +155,10 @@ class UploadService(BaseDocumentOperation):
                 )
                 file_extension = "url_extracted"  # Mark as URL-extracted content
             else:
-                # Process file based on type (normal flow)
+                # Process file based on type (normal flow); size/emptiness are checked
+                # on the actual bytes because UploadFile.size is not always populated.
                 file_content = await file.read()
+                self.validate_file_content(file_content)
 
                 processed_chunks = await self._process_file_by_type(
                     file_content, file.filename, priority, file_extension
@@ -99,6 +175,10 @@ class UploadService(BaseDocumentOperation):
                 processed_chunks, additional_metadata, source_id, company_id, title, summary, tags
             )
 
+            # upload_to_qdrant swallows per-batch errors and only counts them; a partial or
+            # empty upload must fail the request instead of returning 201 to the caller.
+            self._ensure_upload_complete(upload_results, source_id)
+
             return {
                 "status": "success",
                 "message": f"Successfully processed {len(processed_chunks)} chunks from {file.filename}",
@@ -113,9 +193,11 @@ class UploadService(BaseDocumentOperation):
                 "summary": summary,
                 "tags": tags,
                 "supported_file_types": self.get_supported_file_types(),
+                # Report the metadata exactly as stored in Qdrant (merged, incl. source_id),
+                # not the raw processor metadata, which never contained source_id.
                 "sample_chunk": {
                     "text": processed_chunks[0]["text"] if processed_chunks else None,
-                    "metadata": processed_chunks[0]["metadata"] if processed_chunks else None,
+                    "metadata": upload_results.get("sample_metadata"),
                 },
             }
 
@@ -254,14 +336,25 @@ class UploadService(BaseDocumentOperation):
         """Prepare and merge metadata for a chunk"""
         if not isinstance(chunk["metadata"], dict):
             logger.warning("Chunk metadata is not a dict, initializing empty dict")
-            chunk_metadata = {}
+            processor_metadata = {}
         else:
-            chunk_metadata = chunk["metadata"].copy()
+            processor_metadata = chunk["metadata"]
 
-        if additional_metadata:
-            chunk_metadata.update(additional_metadata)
+        # Caller metadata first, then processor metadata on top: processor keys (source =
+        # filename, type = "docx"/"pdf", is_hindi, total_chunks) describe the parsed file
+        # and back the file_type filter, so a caller's "source"/"type" must not overwrite them.
+        chunk_metadata = dict(additional_metadata) if additional_metadata else {}
+        chunk_metadata.update(processor_metadata)
 
-        if company_id and 'company' not in chunk_metadata:
+        # Keep a conflicting caller value instead of dropping it (e.g. commons-backend
+        # sends source="file" and type=<MIME type>) under non-colliding keys.
+        for key, preserved_key in (("source", "origin"), ("type", "mime_type")):
+            caller_value = (additional_metadata or {}).get(key)
+            if caller_value is not None and caller_value != processor_metadata.get(key):
+                chunk_metadata.setdefault(preserved_key, caller_value)
+
+        # company is the organization filter key; always the validated company_id.
+        if company_id:
             chunk_metadata['company'] = company_id
         
         if title and 'title' not in chunk_metadata:
@@ -377,6 +470,11 @@ class UploadService(BaseDocumentOperation):
                 f"{upload_results['error_count']} failed"
             )
 
+            # point_ids let process() roll back a partial upload; sample_metadata is the
+            # stored (merged) metadata of the first point, returned to the caller as-is.
+            upload_results["point_ids"] = [point.id for point in points]
+            upload_results["sample_metadata"] = points[0].payload["metadata"]
             return upload_results
 
-        return {"total_points": 0, "success_count": 0, "error_count": 0}
+        return {"total_points": 0, "success_count": 0, "error_count": 0,
+                "point_ids": [], "sample_metadata": None}
