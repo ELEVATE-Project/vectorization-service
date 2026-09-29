@@ -115,6 +115,19 @@ class BaseDocumentOperation:
                 )
         return source_id
 
+    def normalize_company_id(self, company_id: Optional[str]) -> Optional[str]:
+        """Return company_id stripped; None stays None, whitespace-only is rejected (400)"""
+        if company_id is None:
+            return None
+
+        # Whitespace-only must not become None: on delete/update that would widen the
+        # filter from one tenant to every company that has this source_id.
+        if not company_id.strip():
+            raise HTTPException(status_code=400, detail="company_id cannot be blank when provided")
+
+        # Upload stores metadata.company stripped, so the filter must use the same value.
+        return company_id.strip()
+
     def validate_priority(self, priority: str) -> str:
         """Validate priority format (P1, P2, ...) and return it upper-cased"""
         # Previously anything starting with "P" passed (e.g. "Pxyz");

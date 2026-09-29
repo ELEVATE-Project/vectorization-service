@@ -32,8 +32,10 @@ class UpdateService(BaseDocumentOperation):
                      source_id: str = None, company_id: str = None):
         """Update existing documents by replacing all documents with the same source_id and company_id"""
         try:
-            # Validate inputs
-            self.validate_source_id(source_id)
+            # Use the normalized ids: upload stores them stripped, so the exists-check
+            # and delete must filter on the same value or a padded id returns a false 404.
+            source_id = self.validate_source_id(source_id)
+            company_id = self.normalize_company_id(company_id)
             self.validate_priority(priority)
 
             # Parse metadata string to dict
@@ -87,8 +89,10 @@ class UpdateService(BaseDocumentOperation):
                      source_id: str = None, company_id: str = None):
         """Upsert documents - update if exists, create if not"""
         try:
-            # Validate inputs
-            self.validate_source_id(source_id)
+            # Use the normalized ids: with a padded id the exists-check missed the stored
+            # chunks, so upsert re-uploaded next to them and left duplicates behind.
+            source_id = self.validate_source_id(source_id)
+            company_id = self.normalize_company_id(company_id)
             self.validate_priority(priority)
 
             # Parse metadata string to dict

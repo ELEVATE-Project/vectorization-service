@@ -12,8 +12,11 @@ logger = logging.getLogger(__name__)
 
 class MetadataService(BaseDocumentOperation):
     def _validate_metadata_update(self, source_id: str, metadata_updates: Dict, company_id: Optional[str]):
-        """Validate metadata update inputs"""
-        self.validate_source_id(source_id)
+        """Validate metadata update inputs and return the normalized (source_id, company_id)"""
+        # Upload stores both ids stripped, so the set_payload filter must use the same
+        # values; normalize first so the company check below compares stripped ids too.
+        source_id = self.validate_source_id(source_id)
+        company_id = self.normalize_company_id(company_id)
         # A JSON list/string/number would otherwise fail later as a 500
         if not isinstance(metadata_updates, dict):
             raise HTTPException(
@@ -34,12 +37,14 @@ class MetadataService(BaseDocumentOperation):
                     detail="Cannot change company_id through metadata update"
                 )
 
+        return source_id, company_id
+
     async def update_metadata(self, source_id: str, metadata_updates: Dict,
                               company_id: Optional[str] = None):
         """Update only the metadata of existing documents without reprocessing"""
         try:
-            # Validate inputs
-            self._validate_metadata_update(source_id, metadata_updates, company_id)
+            # Validate inputs; the filter, 404 message and response use the normalized ids
+            source_id, company_id = self._validate_metadata_update(source_id, metadata_updates, company_id)
 
             # Ensure collections exist
             await self.ensure_collections()
