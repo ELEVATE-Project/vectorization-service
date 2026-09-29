@@ -13,6 +13,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class Settings(BaseSettings):
+    # BaseSettings reads an env var (or .env entry) of the same name for every field, so a
+    # bare literal like `CHUNK_SIZE: int = 3000` is only the default, not a hardcoded value.
     QDRANT_HOST: str = os.getenv("QDRANT_HOST", "127.0.0.1")
     QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", 6333))
     # Every environment runs Qdrant server 1.18.2, within the client's allowed ≤1 minor-version gap,
@@ -24,6 +26,7 @@ class Settings(BaseSettings):
     LLAMA_MODEL_ID: str = os.getenv("LLAMA_MODEL_ID", "meta.llama3-70b-instruct-v1:0")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     TRANSLATION_API_URL: str = "https://demo-api.models.ai4bharat.org/inference/translation/v2"
+    # PDF chunking (pdf_processor); other file types use CHUNK_SIZE / MARKDOWN_CHUNK_SIZE
     PDF_CHUNK_SIZE: int = 3000
     PDF_CHUNK_OVERLAP: int = 500
     PAGE_TEXT_THRESHOLD: int = 20  # Minimum characters per page before OCR is triggered

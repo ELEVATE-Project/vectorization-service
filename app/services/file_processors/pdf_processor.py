@@ -102,8 +102,8 @@ class PDFProcessor(BaseFileProcessor):
 
             # Step 6: Split text into chunks
             text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=settings.CHUNK_SIZE,
-                chunk_overlap=settings.CHUNK_OVERLAP,
+                chunk_size=settings.PDF_CHUNK_SIZE,
+                chunk_overlap=settings.PDF_CHUNK_OVERLAP,
                 length_function=len,
             )
 
