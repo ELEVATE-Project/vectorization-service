@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from qdrant_client import models
 from app.core.clients.qdrant import qdrant_client, ensure_collections_exist
 from app.config import settings
+from app.constants import messages as msg
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,28 @@ class BaseDocumentOperation:
             logger.error(f"Error checking existing documents: {str(e)}")
             return False
 
+    def collect_point_ids(self, source_id: str, company_id: Optional[str] = None) -> list:
+        """Return the ids of every point stored for source_id (+ company_id); Qdrant errors propagate"""
+        scroll_filter = self.build_filter(source_id, company_id)
+        point_ids, offset = [], None
+
+        # Errors are not swallowed (unlike check_documents_exist): a failed lookup read
+        # as "no document" made upsert upload a second copy next to the existing one.
+        while True:
+            points, offset = qdrant_client.scroll(
+                collection_name=settings.COLLECTION_NAME,
+                scroll_filter=scroll_filter,
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            point_ids.extend(point.id for point in points)
+
+            # Ids only, one page at a time, until Qdrant reports no next page
+            if offset is None:
+                return point_ids
+
     def count_documents(self, source_id: str, company_id: Optional[str] = None) -> int:
         """Count documents with given source_id and company_id"""
         try:
@@ -92,7 +115,7 @@ class BaseDocumentOperation:
         if not source_id or not source_id.strip():
             raise HTTPException(
                 status_code=400,
-                detail="source_id is required and cannot be empty"
+                detail=msg.SOURCE_ID_REQUIRED
             )
 
         # Strip surrounding whitespace so padded and unpadded ids never become two documents;
@@ -105,13 +128,13 @@ class BaseDocumentOperation:
             if len(source_id) > settings.MAX_SOURCE_ID_LENGTH:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"source_id must be at most {settings.MAX_SOURCE_ID_LENGTH} characters"
+                    detail=msg.SOURCE_ID_TOO_LONG.format(max_length=settings.MAX_SOURCE_ID_LENGTH)
                 )
             # fullmatch: an env-overridden pattern without ^...$ must not accept a valid prefix
             if not re.fullmatch(settings.SOURCE_ID_PATTERN, source_id):
                 raise HTTPException(
                     status_code=400,
-                    detail=f"source_id contains invalid characters (allowed pattern: {settings.SOURCE_ID_PATTERN})"
+                    detail=msg.SOURCE_ID_INVALID_CHARACTERS.format(pattern=settings.SOURCE_ID_PATTERN)
                 )
         return source_id
 
@@ -136,7 +159,7 @@ class BaseDocumentOperation:
         if not re.fullmatch(settings.PRIORITY_PATTERN, normalized):
             raise HTTPException(
                 status_code=400,
-                detail="Invalid priority format. Must be P1, P2, P3, etc."
+                detail=msg.PRIORITY_INVALID_FORMAT
             )
         return normalized
 
@@ -151,7 +174,7 @@ class BaseDocumentOperation:
         # Work on a copy so the caller's dict is never mutated by the upload flow;
         # a non-dict metadata is rejected up front.
         if metadata is not None and not isinstance(metadata, dict):
-            raise HTTPException(status_code=400, detail="metadata must be a JSON object")
+            raise HTTPException(status_code=400, detail=msg.METADATA_NOT_JSON_OBJECT)
         metadata = dict(metadata) if metadata else {}
 
         if company_id is not None:
@@ -167,7 +190,9 @@ class BaseDocumentOperation:
         if meta_source_id is not None and str(meta_source_id).strip() != source_id:
             raise HTTPException(
                 status_code=400,
-                detail=f"metadata.source_id ({meta_source_id}) does not match source_id ({source_id})"
+                detail=msg.METADATA_SOURCE_ID_MISMATCH.format(
+                    metadata_source_id=meta_source_id, source_id=source_id
+                )
             )
 
         # Same for the tenant: metadata.company is the organization filter key, so it
@@ -178,7 +203,9 @@ class BaseDocumentOperation:
             if company_id and meta_company != company_id:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"metadata.company ({meta_company}) does not match company_id ({company_id})"
+                    detail=msg.METADATA_COMPANY_MISMATCH.format(
+                        metadata_company=meta_company, company_id=company_id
+                    )
                 )
             company_id = company_id or meta_company
 
@@ -189,7 +216,7 @@ class BaseDocumentOperation:
             if not isinstance(markdown_url, str) or not markdown_url.strip().lower().startswith(("http://", "https://")):
                 raise HTTPException(
                     status_code=400,
-                    detail="metadata.markdown_url must be an http(s) URL"
+                    detail=msg.MARKDOWN_URL_NOT_HTTP
                 )
             metadata["markdown_url"] = markdown_url.strip()
 
@@ -201,7 +228,7 @@ class BaseDocumentOperation:
         if value is None:
             return None
         if not isinstance(value, str) or not value.strip():
-            raise HTTPException(status_code=400, detail=f"{field} cannot be empty when provided")
+            raise HTTPException(status_code=400, detail=msg.FIELD_BLANK_WHEN_PROVIDED.format(field=field))
         return value.strip()
 
     @staticmethod
@@ -210,14 +237,14 @@ class BaseDocumentOperation:
         if tags is None:
             return None
         if not isinstance(tags, list):
-            raise HTTPException(status_code=400, detail="tags must be a list of strings")
+            raise HTTPException(status_code=400, detail=msg.TAGS_NOT_A_LIST)
 
         # Tags feed both the "tags" payload filter (MatchAny) and the tags embedding,
         # so blanks/non-strings are rejected and duplicates dropped (order kept).
         cleaned = []
         for tag in tags:
             if not isinstance(tag, str) or not tag.strip():
-                raise HTTPException(status_code=400, detail="tags must be non-empty strings")
+                raise HTTPException(status_code=400, detail=msg.TAGS_BLANK_OR_NON_STRING)
             tag = tag.strip()
             if tag not in cleaned:
                 cleaned.append(tag)

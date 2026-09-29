@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Depends
 from typing import Optional, Dict, Any, List
 import json
 import logging
+from app.constants import messages as msg
 from app.services.document_processor import DocumentProcessor
 from app.services.similarity_service import SimilarityService
 from app.services.prioritized_search_service import PrioritizedSearchService
@@ -34,10 +35,10 @@ def parse_metadata_form(metadata: Optional[str] = Form(default=None)) -> Optiona
     try:
         parsed = json.loads(metadata)
         if not isinstance(parsed, dict):
-            raise HTTPException(status_code=400, detail="Metadata must be a JSON object/dict")
+            raise HTTPException(status_code=400, detail=msg.METADATA_FORM_NOT_JSON_OBJECT)
         return parsed
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid metadata JSON: {str(e)}")
+        raise HTTPException(status_code=400, detail=msg.METADATA_FORM_INVALID_JSON.format(error=e))
 
 
 def parse_tags_form(tags: Optional[str] = Form(default=None)) -> Optional[List[str]]:
@@ -52,14 +53,14 @@ def parse_tags_form(tags: Optional[str] = Form(default=None)) -> Optional[List[s
         try:
             parsed = json.loads(tags)
             if not isinstance(parsed, list):
-                raise HTTPException(status_code=400, detail="Tags must be a JSON array/list")
+                raise HTTPException(status_code=400, detail=msg.TAGS_FORM_NOT_JSON_ARRAY)
             # Every tag is used as a filter value and embedded as text, so numbers,
             # nulls or blank strings inside the array are rejected here.
             if any(not isinstance(tag, str) or not tag.strip() for tag in parsed):
-                raise HTTPException(status_code=400, detail="Each tag must be a non-empty string")
+                raise HTTPException(status_code=400, detail=msg.TAGS_FORM_BLANK_OR_NON_STRING_TAG)
             return parsed
         except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid tags JSON: {str(e)}")
+            raise HTTPException(status_code=400, detail=msg.TAGS_FORM_INVALID_JSON.format(error=e))
     
     # Otherwise, treat as comma-separated string
     return [tag.strip() for tag in tags.split(',') if tag.strip()]
@@ -103,8 +104,8 @@ async def create_documents(
     )
 
 
-# Replace an existing document: delete every chunk stored under this source_id,
-# then re-ingest the uploaded file as a fresh set of chunks and embeddings.
+# Replace an existing document: ingest the uploaded file as a fresh set of chunks, then
+# delete the old chunks by id; a failed upload leaves the old version untouched.
 @router.put("/documents/{source_id}")
 async def update_documents(
         source_id: str,

@@ -9,6 +9,7 @@ from app.services.document_operations.base_operation import BaseDocumentOperatio
 from app.core.clients.qdrant import upload_to_qdrant, qdrant_client
 from app.core.clients.embedding import generate_embeddings, validate_vector
 from app.config import settings
+from app.constants import messages as msg
 from app.services.file_processors.csv_processor import CSVProcessor
 from app.services.file_processors.pdf_processor import PDFProcessor
 from app.services.file_processors.docx_processor import DOCXProcessor
@@ -47,7 +48,7 @@ class UploadService(BaseDocumentOperation):
     def validate_upload_file(self, file: UploadFile, check_type: bool = True) -> str:
         """Validate the uploaded file's name/type/declared size; returns the lowercase extension"""
         if file is None or not file.filename or not file.filename.strip():
-            raise HTTPException(status_code=400, detail="A file with a filename is required")
+            raise HTTPException(status_code=400, detail=msg.FILE_WITH_FILENAME_REQUIRED)
 
         # Reject unsupported types before reading/parsing the body, so the caller gets
         # a clear 400 instead of a late processor failure.
@@ -55,8 +56,9 @@ class UploadService(BaseDocumentOperation):
         if check_type and f".{file_extension}" not in self.processor_map:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported file type: '{file_extension or 'none'}'. "
-                       f"Supported types: {self.get_supported_file_types()}"
+                detail=msg.UNSUPPORTED_FILE_TYPE.format(
+                    extension=file_extension or "none", supported_types=self.get_supported_file_types()
+                )
             )
 
         # Fast-path size check when the server already knows the upload size;
@@ -68,7 +70,7 @@ class UploadService(BaseDocumentOperation):
     def validate_file_content(self, file_content: bytes) -> None:
         """Reject empty or oversized file bodies"""
         if not file_content:
-            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+            raise HTTPException(status_code=400, detail=msg.UPLOADED_FILE_EMPTY)
         if len(file_content) > self._max_file_size_bytes():
             raise self._file_too_large()
 
@@ -80,7 +82,7 @@ class UploadService(BaseDocumentOperation):
     def _file_too_large() -> HTTPException:
         return HTTPException(
             status_code=413,
-            detail=f"File exceeds the maximum allowed size of {settings.MAX_FILE_SIZE_MB} MB"
+            detail=msg.FILE_TOO_LARGE.format(max_size_mb=settings.MAX_FILE_SIZE_MB)
         )
 
     @staticmethod
@@ -91,25 +93,30 @@ class UploadService(BaseDocumentOperation):
             points_selector=models.PointIdsList(points=point_ids),
         )
 
-    async def _rollback_points(self, point_ids: list, source_id: str) -> bool:
-        """Delete this request's points, retrying briefly; True once they are gone"""
+    async def _rollback_points(self, point_ids: list, source_id: str,
+                               reason: str = "partial upload rollback") -> bool:
+        """Delete these point ids, retrying briefly; True once they are gone.
+
+        reason only labels the log lines (UpdateService reuses this to remove an old version).
+        """
         max_attempts = max(1, settings.UPLOAD_ROLLBACK_MAX_ATTEMPTS)
         for attempt in range(1, max_attempts + 1):
             try:
                 self._delete_points(point_ids)
-                logger.warning(f"Rolled back {len(point_ids)} points for source_id {source_id} after partial upload")
+                logger.warning(f"Deleted {len(point_ids)} points for source_id {source_id} ({reason})")
                 return True
             except Exception as exc:
                 logger.warning(
-                    f"Rollback attempt {attempt}/{max_attempts} for source_id {source_id} failed: {exc}"
+                    f"Delete attempt {attempt}/{max_attempts} for source_id {source_id} ({reason}) failed: {exc}"
                 )
                 # Qdrant just failed the upload, so give it a moment before trying again (0.5s, 1s, ...)
                 if attempt < max_attempts:
                     await asyncio.sleep(settings.UPLOAD_ROLLBACK_RETRY_WAIT_SECONDS * 2 ** (attempt - 1))
         return False
 
-    async def _background_rollback(self, point_ids: list, source_id: str) -> None:
-        """Keep retrying the rollback after the request has returned"""
+    async def _background_rollback(self, point_ids: list, source_id: str,
+                                   reason: str = "partial upload rollback") -> None:
+        """Keep retrying the delete after the request has returned"""
         for attempt in range(1, settings.UPLOAD_ROLLBACK_BACKGROUND_MAX_ATTEMPTS + 1):
             # Wait doubles each attempt, capped at the max wait (2, 4, 8, ... 60s)
             wait_seconds = min(
@@ -121,22 +128,25 @@ class UploadService(BaseDocumentOperation):
                 # The Qdrant client is synchronous; run it off the event loop
                 await asyncio.to_thread(self._delete_points, point_ids)
                 logger.warning(
-                    f"Background rollback removed {len(point_ids)} points for source_id {source_id} "
-                    f"(attempt {attempt})"
+                    f"Background delete removed {len(point_ids)} points for source_id {source_id} "
+                    f"({reason}, attempt {attempt})"
                 )
                 return
             except Exception as exc:
-                logger.warning(f"Background rollback attempt {attempt} for source_id {source_id} failed: {exc}")
+                logger.warning(
+                    f"Background delete attempt {attempt} for source_id {source_id} ({reason}) failed: {exc}"
+                )
 
         # Out of retries: the ids in this log line are what is needed to clean up by hand
         logger.error(
-            f"Background rollback gave up for source_id {source_id}; {len(point_ids)} points may "
+            f"Background delete gave up for source_id {source_id} ({reason}); {len(point_ids)} points may "
             f"remain searchable. Point IDs: {point_ids}"
         )
 
-    def _schedule_background_rollback(self, point_ids: list, source_id: str) -> None:
-        """Start the background rollback and keep a reference until it finishes"""
-        task = asyncio.create_task(self._background_rollback(list(point_ids), source_id))
+    def _schedule_background_rollback(self, point_ids: list, source_id: str,
+                                      reason: str = "partial upload rollback") -> None:
+        """Start the background delete and keep a reference until it finishes"""
+        task = asyncio.create_task(self._background_rollback(list(point_ids), source_id, reason))
         _background_rollback_tasks.add(task)
         task.add_done_callback(_background_rollback_tasks.discard)
 
@@ -146,7 +156,7 @@ class UploadService(BaseDocumentOperation):
         if upload_results.get("success_count", 0) == 0 and upload_results.get("error_count", 0) == 0:
             raise HTTPException(
                 status_code=500,
-                detail="No valid chunks could be built for upload; nothing was stored."
+                detail=msg.NO_VALID_CHUNKS_TO_UPLOAD
             )
         if upload_results.get("error_count", 0) == 0:
             return
@@ -161,10 +171,8 @@ class UploadService(BaseDocumentOperation):
         if rolled_back:
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"Upload to vector store failed for source_id {source_id}: "
-                    f"{error_count} of {total_points} points failed. "
-                    f"No partial document was kept; retry the request."
+                detail=msg.PARTIAL_UPLOAD_ROLLED_BACK.format(
+                    source_id=source_id, error_count=error_count, total_points=total_points
                 ),
             )
 
@@ -177,11 +185,9 @@ class UploadService(BaseDocumentOperation):
         self._schedule_background_rollback(point_ids, source_id)
         raise HTTPException(
             status_code=502,
-            detail=(
-                f"Upload to vector store failed for source_id {source_id}: "
-                f"{error_count} of {total_points} points failed, and removing the "
-                f"{upload_results.get('success_count', 0)} stored points also failed. Cleanup is "
-                f"retrying in the background; they may be searchable until it succeeds."
+            detail=msg.PARTIAL_UPLOAD_ROLLBACK_FAILED.format(
+                source_id=source_id, error_count=error_count, total_points=total_points,
+                stored_count=upload_results.get("success_count", 0),
             ),
         )
 
@@ -233,7 +239,7 @@ class UploadService(BaseDocumentOperation):
             if not processed_chunks:
                 raise HTTPException(
                     status_code=400,
-                    detail="No content could be extracted from the file."
+                    detail=msg.NO_CONTENT_EXTRACTED
                 )
 
             # Generate embeddings and upload
@@ -247,7 +253,7 @@ class UploadService(BaseDocumentOperation):
 
             return {
                 "status": "success",
-                "message": f"Successfully processed {len(processed_chunks)} chunks from {file.filename}",
+                "message": msg.UPLOAD_SUCCEEDED.format(chunk_count=len(processed_chunks), filename=file.filename),
                 "chunks_processed": len(processed_chunks),
                 "points_uploaded": upload_results['success_count'],
                 "upload_failures": upload_results['error_count'],
@@ -271,7 +277,7 @@ class UploadService(BaseDocumentOperation):
             raise
         except Exception as e:
             logger.error(f"Upload failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=msg.UPLOAD_FAILED.format(error=e))
 
     async def _process_file_by_type(self, file_content: bytes, filename: str,
                                     priority: str, file_extension: str):
@@ -281,8 +287,9 @@ class UploadService(BaseDocumentOperation):
         if not processor:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported file type: {file_extension}. "
-                       f"Supported types: {self.get_supported_file_types()}"
+                detail=msg.UNSUPPORTED_FILE_TYPE.format(
+                    extension=file_extension, supported_types=self.get_supported_file_types()
+                )
             )
 
         logger.info(f"Using {processor.__class__.__name__} for file {filename}")
@@ -352,7 +359,7 @@ class UploadService(BaseDocumentOperation):
             logger.error(f"Error processing URL text: {str(e)}")
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to process URL text: {str(e)}"
+                detail=msg.URL_TEXT_PROCESSING_FAILED.format(error=e)
             )
 
     def parse_tags(self, tags: str) -> list:

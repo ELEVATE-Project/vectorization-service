@@ -10,6 +10,7 @@ from langchain_core.documents import Document as LangchainDocument
 from .base_processor import BaseFileProcessor
 from app.config import settings
 from app.services.translation_service import process_chunk
+from app.constants import messages as msg
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +129,7 @@ class CSVProcessor(BaseFileProcessor):
 
             missing_columns = [col for col in expected_columns if col not in df.columns]
             if COL_SL_NO in missing_columns:
-                raise HTTPException(status_code=400, detail="Missing required column: SL NO")
+                raise HTTPException(status_code=400, detail=msg.CSV_MISSING_SL_NO_COLUMN)
 
             main_columns = [
                 COL_SL_NO, COL_SUB_CATEGORY, COL_TITLE, COL_TARGET_STAKEHOLDER,
@@ -171,4 +172,4 @@ class CSVProcessor(BaseFileProcessor):
 
         except Exception as e:
             logger.error(f"CSV processing error: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Error processing CSV: {str(e)}")
+            raise HTTPException(status_code=500, detail=msg.CSV_PROCESSING_FAILED.format(error=e))

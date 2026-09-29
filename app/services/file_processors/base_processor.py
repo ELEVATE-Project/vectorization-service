@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any
 import logging
 from app.config import settings
+from app.constants import messages as msg
 
 logger = logging.getLogger(__name__)
 
@@ -29,13 +30,14 @@ class BaseFileProcessor(ABC):
     def _validate_file_content(self, file_content: bytes, filename: str):
         """Common validation logic"""
         if not file_content:
-            raise ValueError(f"Empty file content for {filename}")
+            raise ValueError(msg.PROCESSOR_EMPTY_FILE_CONTENT.format(filename=filename))
 
         max_file_size_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
         file_size_mb = len(file_content) / (1024 * 1024)
         
         if len(file_content) > max_file_size_bytes:
             raise ValueError(
-                f"File {filename} is too large ({file_size_mb:.2f}MB). "
-                f"Maximum allowed size is {settings.MAX_FILE_SIZE_MB}MB"
+                msg.PROCESSOR_FILE_TOO_LARGE.format(
+                    filename=filename, size_mb=file_size_mb, max_size_mb=settings.MAX_FILE_SIZE_MB
+                )
             )
