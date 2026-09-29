@@ -52,8 +52,7 @@ Add these to `.env` (defaults shown match `app/config.py`, so omitting them is s
 ## Dependencies
 
 No changes. Still requires `qdrant-client[fastembed]>=1.18.0,<2.0.0` and Qdrant server
-`>=1.18` (or the pinned 1.18-client/1.12-server combination documented in `claude.md` §4,
-if that's what this environment runs).
+1.18.2 (the version every environment runs).
 
 ---
 
