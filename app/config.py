@@ -53,6 +53,18 @@ class Settings(BaseSettings):
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
 
+    # Rollback of a partially failed upload (some Qdrant batches failed): the chunks this
+    # request stored are deleted so no half document stays searchable.
+    # 1) While the request is open: try the delete this many times, waiting between tries
+    #    (the wait doubles each time: 0.5s, 1s).
+    UPLOAD_ROLLBACK_MAX_ATTEMPTS: int = int(os.getenv("UPLOAD_ROLLBACK_MAX_ATTEMPTS", 3))
+    UPLOAD_ROLLBACK_RETRY_WAIT_SECONDS: float = float(os.getenv("UPLOAD_ROLLBACK_RETRY_WAIT_SECONDS", 0.5))
+    # 2) If all of those fail, a background task keeps retrying after the 502 is returned.
+    #    Waits double from the first wait up to the max wait (2, 4, 8, 16, 32, 60, 60, 60, 60 ≈ 5 min).
+    UPLOAD_ROLLBACK_BACKGROUND_MAX_ATTEMPTS: int = int(os.getenv("UPLOAD_ROLLBACK_BACKGROUND_MAX_ATTEMPTS", 9))
+    UPLOAD_ROLLBACK_BACKGROUND_FIRST_WAIT_SECONDS: float = float(os.getenv("UPLOAD_ROLLBACK_BACKGROUND_FIRST_WAIT_SECONDS", 2))
+    UPLOAD_ROLLBACK_BACKGROUND_MAX_WAIT_SECONDS: float = float(os.getenv("UPLOAD_ROLLBACK_BACKGROUND_MAX_WAIT_SECONDS", 60))
+
     # Ingestion validation rules (POST /api/documents). source_id is the key every chunk
     # is stored/deleted/filtered by, so it must be short and unambiguous.
     MAX_SOURCE_ID_LENGTH: int = int(os.getenv("MAX_SOURCE_ID_LENGTH", 255))

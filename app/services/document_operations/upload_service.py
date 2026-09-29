@@ -1,4 +1,5 @@
 import uuid
+import asyncio
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Any
@@ -16,6 +17,10 @@ from app.services.file_processors.text_processor import TextProcessor
 from app.services.url_text_extractor import URLTextExtractor
 
 logger = logging.getLogger(__name__)
+
+# Background rollback tasks still running; asyncio keeps only weak references to tasks,
+# so each one is held here until it finishes.
+_background_rollback_tasks: set = set()
 
 
 class UploadService(BaseDocumentOperation):
@@ -78,7 +83,65 @@ class UploadService(BaseDocumentOperation):
             detail=f"File exceeds the maximum allowed size of {settings.MAX_FILE_SIZE_MB} MB"
         )
 
-    def _ensure_upload_complete(self, upload_results: dict, source_id: str) -> None:
+    @staticmethod
+    def _delete_points(point_ids: list) -> None:
+        """Delete exactly these point ids (never another request's points)"""
+        qdrant_client.delete(
+            collection_name=settings.COLLECTION_NAME,
+            points_selector=models.PointIdsList(points=point_ids),
+        )
+
+    async def _rollback_points(self, point_ids: list, source_id: str) -> bool:
+        """Delete this request's points, retrying briefly; True once they are gone"""
+        max_attempts = max(1, settings.UPLOAD_ROLLBACK_MAX_ATTEMPTS)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._delete_points(point_ids)
+                logger.warning(f"Rolled back {len(point_ids)} points for source_id {source_id} after partial upload")
+                return True
+            except Exception as exc:
+                logger.warning(
+                    f"Rollback attempt {attempt}/{max_attempts} for source_id {source_id} failed: {exc}"
+                )
+                # Qdrant just failed the upload, so give it a moment before trying again (0.5s, 1s, ...)
+                if attempt < max_attempts:
+                    await asyncio.sleep(settings.UPLOAD_ROLLBACK_RETRY_WAIT_SECONDS * 2 ** (attempt - 1))
+        return False
+
+    async def _background_rollback(self, point_ids: list, source_id: str) -> None:
+        """Keep retrying the rollback after the request has returned"""
+        for attempt in range(1, settings.UPLOAD_ROLLBACK_BACKGROUND_MAX_ATTEMPTS + 1):
+            # Wait doubles each attempt, capped at the max wait (2, 4, 8, ... 60s)
+            wait_seconds = min(
+                settings.UPLOAD_ROLLBACK_BACKGROUND_FIRST_WAIT_SECONDS * 2 ** (attempt - 1),
+                settings.UPLOAD_ROLLBACK_BACKGROUND_MAX_WAIT_SECONDS,
+            )
+            await asyncio.sleep(wait_seconds)
+            try:
+                # The Qdrant client is synchronous; run it off the event loop
+                await asyncio.to_thread(self._delete_points, point_ids)
+                logger.warning(
+                    f"Background rollback removed {len(point_ids)} points for source_id {source_id} "
+                    f"(attempt {attempt})"
+                )
+                return
+            except Exception as exc:
+                logger.warning(f"Background rollback attempt {attempt} for source_id {source_id} failed: {exc}")
+
+        # Out of retries: the ids in this log line are what is needed to clean up by hand
+        logger.error(
+            f"Background rollback gave up for source_id {source_id}; {len(point_ids)} points may "
+            f"remain searchable. Point IDs: {point_ids}"
+        )
+
+    def _schedule_background_rollback(self, point_ids: list, source_id: str) -> None:
+        """Start the background rollback and keep a reference until it finishes"""
+        task = asyncio.create_task(self._background_rollback(list(point_ids), source_id))
+        _background_rollback_tasks.add(task)
+        task.add_done_callback(_background_rollback_tasks.discard)
+
+    async def _ensure_upload_complete(self, upload_results: dict, source_id: str,
+                                      company_id: Optional[str] = None) -> None:
         """Fail the request (and roll back this request's points) on an empty or partial upload"""
         if upload_results.get("success_count", 0) == 0 and upload_results.get("error_count", 0) == 0:
             raise HTTPException(
@@ -89,24 +152,36 @@ class UploadService(BaseDocumentOperation):
             return
 
         # Some batches failed: delete the points this request did store so a half-indexed
-        # document is never left behind; the caller can safely retry the whole upload.
+        # document is never left behind. Only this request's own ids are ever deleted.
         point_ids = upload_results.get("point_ids") or []
-        try:
-            if point_ids:
-                qdrant_client.delete(
-                    collection_name=settings.COLLECTION_NAME,
-                    points_selector=models.PointIdsList(points=point_ids),
-                )
-                logger.warning(f"Rolled back {len(point_ids)} points for source_id {source_id} after partial upload")
-        except Exception as exc:
-            logger.error(f"Rollback of partial upload for source_id {source_id} failed: {exc}")
+        error_count = upload_results["error_count"]
+        total_points = upload_results.get("total_points", len(point_ids))
+        rolled_back = await self._rollback_points(point_ids, source_id) if point_ids else True
 
+        if rolled_back:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Upload to vector store failed for source_id {source_id}: "
+                    f"{error_count} of {total_points} points failed. "
+                    f"No partial document was kept; retry the request."
+                ),
+            )
+
+        # Rollback still failing: log every id for manual cleanup, keep retrying in the
+        # background, and tell the caller the truth instead of "nothing was kept".
+        logger.error(
+            f"Rollback of partial upload failed for source_id {source_id} (company_id {company_id}); "
+            f"{len(point_ids)} points may remain searchable. Point IDs: {point_ids}"
+        )
+        self._schedule_background_rollback(point_ids, source_id)
         raise HTTPException(
             status_code=502,
             detail=(
                 f"Upload to vector store failed for source_id {source_id}: "
-                f"{upload_results['error_count']} of {upload_results.get('total_points', len(point_ids))} "
-                f"points failed. No partial document was kept; retry the request."
+                f"{error_count} of {total_points} points failed, and removing the "
+                f"{upload_results.get('success_count', 0)} stored points also failed. Cleanup is "
+                f"retrying in the background; they may be searchable until it succeeds."
             ),
         )
 
@@ -168,7 +243,7 @@ class UploadService(BaseDocumentOperation):
 
             # upload_to_qdrant swallows per-batch errors and only counts them; a partial or
             # empty upload must fail the request instead of returning 201 to the caller.
-            self._ensure_upload_complete(upload_results, source_id)
+            await self._ensure_upload_complete(upload_results, source_id, company_id)
 
             return {
                 "status": "success",
