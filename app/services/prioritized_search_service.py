@@ -633,8 +633,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 {} if lexical_ranking_enabled else None
             )
 
-            # Score the pool 60/40 against the query and its expansion (see
-            # _blended_acronym_relevance). Only meaningful when an expansion
+            # Score the pool against the query and its expansion, weighted by
+            # ACRONYM_EXPANSION_SCORE_WEIGHT (see _blended_acronym_relevance). Only meaningful when an expansion
             # variant was built; a query that already spelled it out has one text.
             relevance_override = None
             if soft_acronym_ranking and len(dense_query_texts) > 1:

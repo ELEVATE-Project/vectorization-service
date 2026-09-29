@@ -184,28 +184,37 @@ class Settings(BaseSettings):
     # scripts/simulate_soft_acronym_boost.py) — tune against real expected
     # results before treating them as settled.
     #
-    # 0.2, not 0.4: measured on the SLEM fixture (see handoff/03), 0.4 lets a
-    # generic expansion phrase ("School Library...") pollute the score enough
-    # that unrelated documents sharing that vocabulary outrank a document that
-    # names the acronym literally 12 times. 0.2 keeps the content gradient
-    # among acronym-bearing documents while avoiding that pollution; 0.0 loses
-    # the gradient entirely.
-    ACRONYM_EXPANSION_SCORE_WEIGHT: float = float(os.getenv("ACRONYM_EXPANSION_SCORE_WEIGHT", "0.2"))
-    ACRONYM_BONUS_TITLE_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_TITLE_ACRONYM", "0.20"))
-    ACRONYM_BONUS_TITLE_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_TITLE_EXPANSION", "0.15"))
-    ACRONYM_BONUS_SUMMARY_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_ACRONYM", "0.10"))
-    ACRONYM_BONUS_SUMMARY_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_EXPANSION", "0.05"))
+    # 0.5 with bonuses doubled from 0.20/0.15/0.10/0.05, compared against 0.2,
+    # 0.35, 0.65, 0.8, and 0.7-with-doubled-bonuses on 19 acronyms of the local
+    # corpus (2026-09-29). At 0.2 the acronym side dominated: a nutrition
+    # document titled "Healthy Diet Guide" outranked real DIET documents
+    # (MiniLM reads "diet" as food), and documents that only spell out the
+    # expansion ranked far below their content. Above 0.5 the expansion's
+    # generic words take over ("District ... Education" pulls "District
+    # Primary Education Programme" into DIET's top 5; "School ... Committee"
+    # pushes SMC modules out of SMC's top 10). At 0.5 the doubled title bonus
+    # keeps acronym-titled documents ahead of that vocabulary: DIET's top 10 is
+    # all DIET documents, the nutrition guide and DPEP both fall below them, and
+    # every Parent Teacher Meeting document fills PTM's top 7. Known cost:
+    # thin documents with the acronym only in the title (e.g. scanned PDFs)
+    # slip below richer on-topic documents.
+    ACRONYM_EXPANSION_SCORE_WEIGHT: float = float(os.getenv("ACRONYM_EXPANSION_SCORE_WEIGHT", "0.5"))
+    ACRONYM_BONUS_TITLE_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_TITLE_ACRONYM", "0.40"))
+    ACRONYM_BONUS_TITLE_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_TITLE_EXPANSION", "0.30"))
+    ACRONYM_BONUS_SUMMARY_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_ACRONYM", "0.20"))
+    ACRONYM_BONUS_SUMMARY_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_EXPANSION", "0.10"))
 
     # A document matching several detected acronyms sums each one's own best
     # grade (AC-15: it used to just take the single best grade across all of
     # them, so a document about both SMC and DIET ranked identically to one
     # about only DIET). Summing is capped so it stays bounded -- two acronyms
-    # both hitting a full title match would otherwise sum to 0.40 (2x
+    # both hitting a full title match would otherwise sum to 0.80 (2x
     # ACRONYM_BONUS_TITLE_ACRONYM), letting the multiplier run away for a
-    # query naming several acronyms at once. 0.35 gives a genuinely higher
-    # ceiling than a single match's 0.20 (multiplier up to 1.35x vs 1.2x) --
-    # a visible reward for matching more -- without approaching 2x.
-    ACRONYM_BONUS_MULTI_MATCH_CAP: float = float(os.getenv("ACRONYM_BONUS_MULTI_MATCH_CAP", "0.35"))
+    # query naming several acronyms at once. 0.60 gives a genuinely higher
+    # ceiling than a single match's 0.40 (multiplier up to 1.6x vs 1.4x) --
+    # a visible reward for matching more -- without approaching 2x. Doubled
+    # along with the grades above, keeping the same ratio to them.
+    ACRONYM_BONUS_MULTI_MATCH_CAP: float = float(os.getenv("ACRONYM_BONUS_MULTI_MATCH_CAP", "0.60"))
 
     # _blended_acronym_relevance rescores the retrieved pool against the query
     # and the expansion separately (see above) -- a second and third Qdrant

@@ -522,10 +522,10 @@ class AcronymRankingMixin:
     ) -> float:
         """The proportional bonus a document earns: the best that applies of
 
-            acronym in title       ACRONYM_BONUS_TITLE_ACRONYM      (0.20)
-            expansion in title     ACRONYM_BONUS_TITLE_EXPANSION    (0.15)
-            acronym in summary     ACRONYM_BONUS_SUMMARY_ACRONYM    (0.10)
-            expansion in summary   ACRONYM_BONUS_SUMMARY_EXPANSION  (0.05)
+            acronym in title       ACRONYM_BONUS_TITLE_ACRONYM      (0.40)
+            expansion in title     ACRONYM_BONUS_TITLE_EXPANSION    (0.30)
+            acronym in summary     ACRONYM_BONUS_SUMMARY_ACRONYM    (0.20)
+            expansion in summary   ACRONYM_BONUS_SUMMARY_EXPANSION  (0.10)
 
         applied as relevance x (1 + bonus). The four grades are the old tiers
         4/2/3/1, but a grade now scales a document's relevance instead of
