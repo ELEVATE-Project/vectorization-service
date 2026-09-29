@@ -403,6 +403,22 @@ class UploadService(BaseDocumentOperation):
         
         return embeddings
 
+    @staticmethod
+    def _validate_chunks(processed_chunks: List[dict]) -> None:
+        """Reject processor output with a malformed chunk before anything is embedded or stored"""
+        invalid = [
+            idx for idx, chunk in enumerate(processed_chunks)
+            if not isinstance(chunk, dict) or not {"id", "text", "metadata"} <= chunk.keys()
+        ]
+        if invalid:
+            logger.error(f"Processor returned {len(invalid)} malformed chunks at positions {invalid}")
+            raise HTTPException(
+                status_code=500,
+                detail=msg.INVALID_CHUNKS.format(
+                    invalid_count=len(invalid), chunk_count=len(processed_chunks)
+                ),
+            )
+
     def _prepare_chunk_metadata(self, chunk: dict, additional_metadata: dict, 
                                 source_id: str, company_id: str, 
                                 title: str, summary: str, tags: List[str]):
@@ -471,6 +487,10 @@ class UploadService(BaseDocumentOperation):
                              source_id: str, company_id: str = None,
                              title: str = None, summary: str = None, tags: List[str] = None):
         """Generate embeddings and upload chunks to Qdrant with separate embeddings for title, summary, and text"""
+        # Skipping a bad chunk would store the document with a silent gap and still report
+        # success, so fail the whole request before anything is embedded or written.
+        self._validate_chunks(processed_chunks)
+
         logger.info(f"Generating embeddings for {len(processed_chunks)} chunks")
         text_embeddings = generate_embeddings([chunk["text"] for chunk in processed_chunks])
 
@@ -499,16 +519,10 @@ class UploadService(BaseDocumentOperation):
                 )
                 sparse_vectors = []
 
+        # One point per chunk; strict zip raises on an embedding-count mismatch instead of
+        # silently dropping the tail, so total_points always equals chunks_processed.
         points = []
-        for idx, (chunk, text_embedding) in enumerate(zip(processed_chunks, text_embeddings)):
-            if not isinstance(chunk, dict):
-                logger.error(f"Invalid chunk type: {type(chunk)}")
-                continue
-
-            if "id" not in chunk or "text" not in chunk or "metadata" not in chunk:
-                logger.error(f"Chunk missing required fields: {chunk.keys()}")
-                continue
-
+        for idx, (chunk, text_embedding) in enumerate(zip(processed_chunks, text_embeddings, strict=True)):
             chunk_id = str(chunk["id"])
             chunk_metadata = self._prepare_chunk_metadata(
                 chunk, additional_metadata, source_id, company_id, title, summary, tags

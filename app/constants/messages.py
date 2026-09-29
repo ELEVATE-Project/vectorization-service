@@ -75,6 +75,10 @@ URL_TEXT_PROCESSING_FAILED = "Failed to process URL text: {error}"
 
 # Storing the chunks in Qdrant (a partial upload is rolled back)
 NO_VALID_CHUNKS_TO_UPLOAD = "No valid chunks could be built for upload; nothing was stored."
+INVALID_CHUNKS = (
+    "Could not build {invalid_count} of {chunk_count} chunks for upload "
+    "(missing id, text or metadata); nothing was stored."
+)
 PARTIAL_UPLOAD_ROLLED_BACK = (
     "Upload to vector store failed for source_id {source_id}: "
     "{error_count} of {total_points} points failed. "
