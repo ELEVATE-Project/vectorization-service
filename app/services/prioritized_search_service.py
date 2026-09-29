@@ -2111,7 +2111,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 considered.add(sid)
                 floor_candidates.append({"payload": point.payload})
             floor_body_sources = self._sources_with_acronym_in_body(
-                self._sources_claiming_acronym(floor_candidates, acronyms_detected)
+                self._sources_claiming_acronym(floor_candidates, acronyms_detected),
+                acronyms_detected=acronyms_detected,
             )
 
         # Step 3: Deduplicate matching points in-memory.

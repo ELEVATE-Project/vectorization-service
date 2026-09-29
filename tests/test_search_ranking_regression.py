@@ -513,7 +513,7 @@ class TestFieldMatchInjection:
         per-acronym mapping only ever needs the one "DIET" key."""
         monkeypatch.setattr(
             PrioritizedSearchService, "_sources_with_acronym_in_body",
-            lambda self, candidates: {"DIET": set(backed)})
+            lambda self, candidates, acronyms_detected=None: {"DIET": set(backed)})
         boosts = (
             (settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST)
             if field == "title"
@@ -897,7 +897,7 @@ class TestAcronymBonusFollowsLexicalRanking:
         # Content check: this document's content doesn't mention DIET.
         monkeypatch.setattr(
             PrioritizedSearchService, "_sources_with_acronym_in_body",
-            lambda self, candidates: {})
+            lambda self, candidates, acronyms_detected=None: {})
 
         injected = service._fetch_field_match_docs(
             ["Z"], {"Z": "partial"}, "title",
@@ -963,3 +963,85 @@ class TestAcronymBonusFollowsLexicalRanking:
             PrioritizedSearchService, "_process_and_filter_results", spy)
         self._run(service, monkeypatch, "hybrid")
         assert seen["acronyms_detected"] == dict(ACR)
+
+
+# ── Expansion in the body backs a title/summary acronym claim ─────────────
+
+class TestExpansionInBodyBacksAcronymClaim:
+    """A document titled with the acronym whose body spells out the expansion
+    but never repeats the bare acronym ("PTM Handbook" / "Parent Teacher
+    Meeting" throughout) is backed, so it keeps the title grade. A body that
+    only shares some expansion words is not."""
+
+    def _stub_qdrant(self, monkeypatch, acronym_hits, chunk_text):
+        """acronym_hits: sources the bare-acronym BM25 query finds.
+        chunk_text: source -> body text returned for the expansion query."""
+        calls = {"acronym": 0, "expansion": 0}
+
+        def fake_groups(**kwargs):
+            wanted = set(kwargs["query_filter"].must[0].match.any)
+            if kwargs["with_payload"] is False:
+                calls["acronym"] += 1
+                ids = [s for s in acronym_hits if s in wanted]
+                return types.SimpleNamespace(groups=[
+                    types.SimpleNamespace(id=s, hits=[]) for s in ids])
+            calls["expansion"] += 1
+            return types.SimpleNamespace(groups=[
+                types.SimpleNamespace(id=s, hits=[
+                    types.SimpleNamespace(payload={"text": chunk_text[s]})])
+                for s in chunk_text if s in wanted])
+
+        monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", True)
+        monkeypatch.setattr(
+            "app.services.acronym_ranking.qdrant_client.query_points_groups", fake_groups)
+        monkeypatch.setattr(
+            "app.core.clients.sparse_encoder.generate_sparse_vector",
+            lambda text: ([1], [1.0]))
+        return calls
+
+    def test_spelled_out_expansion_backs_the_title_claim(self, service, monkeypatch):
+        self._stub_qdrant(monkeypatch, acronym_hits=[], chunk_text={
+            "A": "Each District Institute of Education and Training runs in-service courses."})
+        backed = service._sources_with_acronym_in_body({"DIET": {"A"}}, acronyms_detected=ACR)
+        assert backed == {"DIET": {"A"}}
+        assert service._acronym_bonus("DIET Handbook", None, ACR, {"DIET"}) == \
+            settings.ACRONYM_BONUS_TITLE_ACRONYM
+
+    def test_expansion_variant_in_body_still_counts(self, service, monkeypatch):
+        self._stub_qdrant(monkeypatch, acronym_hits=[], chunk_text={
+            "A": "Visits to District Institutes for Education & Training across the state."})
+        assert service._sources_with_acronym_in_body(
+            {"DIET": {"A"}}, acronyms_detected=ACR) == {"DIET": {"A"}}
+
+    def test_near_miss_body_does_not_back_the_claim(self, service, monkeypatch):
+        # Shares district + education + training, but not "institute": a
+        # different programme, the DPEP case the phrase rule exists to reject.
+        self._stub_qdrant(monkeypatch, acronym_hits=[], chunk_text={
+            "A": "District Primary Education Programme teacher training schedule."})
+        assert service._sources_with_acronym_in_body(
+            {"DIET": {"A"}}, acronyms_detected=ACR) == {"DIET": set()}
+
+    def test_unrelated_body_does_not_back_the_claim(self, service, monkeypatch):
+        self._stub_qdrant(monkeypatch, acronym_hits=[], chunk_text={
+            "A": "Check tyre pressure weekly and lubricate the bicycle chain."})
+        assert service._sources_with_acronym_in_body(
+            {"DIET": {"A"}}, acronyms_detected=ACR) == {"DIET": set()}
+
+    def test_bare_acronym_hit_skips_the_expansion_query(self, service, monkeypatch):
+        calls = self._stub_qdrant(monkeypatch, acronym_hits=["A"], chunk_text={"A": ""})
+        assert service._sources_with_acronym_in_body(
+            {"DIET": {"A"}}, acronyms_detected=ACR) == {"DIET": {"A"}}
+        assert calls == {"acronym": 1, "expansion": 0}
+
+    def test_only_unbacked_sources_are_checked_for_the_expansion(self, service, monkeypatch):
+        calls = self._stub_qdrant(monkeypatch, acronym_hits=["A"], chunk_text={
+            "A": "", "B": "District Institute of Education and Training faculty list."})
+        assert service._sources_with_acronym_in_body(
+            {"DIET": {"A", "B"}}, acronyms_detected=ACR) == {"DIET": {"A", "B"}}
+        assert calls["expansion"] == 1
+
+    def test_without_expansions_behaviour_is_unchanged(self, service, monkeypatch):
+        calls = self._stub_qdrant(monkeypatch, acronym_hits=[], chunk_text={
+            "A": "District Institute of Education and Training"})
+        assert service._sources_with_acronym_in_body({"DIET": {"A"}}) == {"DIET": set()}
+        assert calls["expansion"] == 0

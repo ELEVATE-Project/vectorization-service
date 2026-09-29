@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 # call showed up.
 _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 
+# Chunks per source whose text _sources_with_expansion_in_body reads. The chunk
+# that really contains the expansion ranks at or near the top on BM25 for its
+# words, but not always first (a chunk repeating "parent" can outrank the one
+# saying "Parent Teacher Meeting"), so a few rather than one.
+_EXPANSION_BODY_CHECK_CHUNKS = 3
+
 
 class FieldMatchQuery(NamedTuple):
     """One title/summary check to run, and how strictly to run it.
@@ -384,7 +390,9 @@ class AcronymRankingMixin:
         return sources_by_acronym
 
     def _sources_with_acronym_in_body(
-        self, sources_by_acronym: Dict[str, Set[str]]
+        self,
+        sources_by_acronym: Dict[str, Set[str]],
+        acronyms_detected: Optional[Dict[str, List[str]]] = None,
     ) -> Optional[Dict[str, Set[str]]]:
         """Which of the candidate sources mention THEIR OWN acronym in the body,
         kept separate per acronym.
@@ -404,6 +412,14 @@ class AcronymRankingMixin:
         each acronym's set here only ever contains sources verified for THAT
         acronym specifically.
 
+        A source whose body never uses the bare acronym but spells out its
+        expansion ("PTM Handbook" whose content says "Parent Teacher Meeting"
+        throughout) is backed too, when acronyms_detected supplies the
+        expansions — see _sources_with_expansion_in_body. The expansion is the
+        stronger evidence of the two; without this, such a document lost the
+        title grade its content fully supports (measured: rank 15 instead of
+        about 5 for "PTM").
+
         Returns None when BM25 can't answer (sparse search disabled, the encoder
         unavailable, or the query failed) so the caller falls back rather than
         treating "couldn't check" as "checked and absent". About 12 ms per
@@ -418,28 +434,84 @@ class AcronymRankingMixin:
 
             backed: Dict[str, Set[str]] = {}
             for acronym, sources in sources_by_acronym.items():
+                found: Set[str] = set()
                 indices, values = generate_sparse_vector(acronym)
-                if not indices:
-                    continue
-                response = qdrant_client.query_points_groups(
-                    collection_name=self.collection_name,
-                    query=models.SparseVector(indices=indices, values=values),
-                    using=settings.SPARSE_VECTOR_NAME,
-                    query_filter=models.Filter(must=[models.FieldCondition(
-                        key="source_id", match=models.MatchAny(any=sorted(sources)),
-                    )]),
-                    group_by="source_id",
-                    group_size=1,
-                    limit=len(sources),
-                    with_payload=False,
-                )
-                backed[acronym] = {str(group.id) for group in response.groups}
+                if indices:
+                    response = qdrant_client.query_points_groups(
+                        collection_name=self.collection_name,
+                        query=models.SparseVector(indices=indices, values=values),
+                        using=settings.SPARSE_VECTOR_NAME,
+                        query_filter=models.Filter(must=[models.FieldCondition(
+                            key="source_id", match=models.MatchAny(any=sorted(sources)),
+                        )]),
+                        group_by="source_id",
+                        group_size=1,
+                        limit=len(sources),
+                        with_payload=False,
+                    )
+                    found = {str(group.id) for group in response.groups}
+                # Only the sources the bare acronym didn't already back, so the
+                # common case (acronym in the body) costs no extra query.
+                unbacked = sources - found
+                if unbacked and acronyms_detected and acronyms_detected.get(acronym):
+                    found |= self._sources_with_expansion_in_body(
+                        unbacked, acronyms_detected[acronym]
+                    )
+                backed[acronym] = found
             return backed
         except Exception as exc:
             logger.warning(
                 f"Acronym body check failed, falling back to pool membership: {exc}"
             )
             return None
+
+    def _sources_with_expansion_in_body(
+        self, sources: Set[str], expansions: List[str]
+    ) -> Set[str]:
+        """Which of `sources` spell out one of `expansions` in their body.
+
+        BM25 on the expansion's content words narrows each source to its few
+        best-matching chunks (_EXPANSION_BODY_CHECK_CHUNKS); those chunks' text
+        then has to pass _phrase_in_text — the same all-content-words rule
+        the expansion title/summary grades use. The BM25 hit alone is never
+        enough: it matches any chunk containing "education" or "district", and
+        "District Primary Education Programme" is exactly the near-miss the
+        phrase rule exists to reject.
+
+        Raises on a Qdrant/encoder failure; the caller's handler treats that the
+        same as a failed bare-acronym check.
+        """
+        from app.core.clients.sparse_encoder import generate_sparse_vector
+
+        found: Set[str] = set()
+        for expansion in expansions:
+            remaining = sources - found
+            if not remaining:
+                break
+            indices, values = generate_sparse_vector(
+                " ".join(self._expansion_content_words(expansion))
+            )
+            if not indices:
+                continue
+            response = qdrant_client.query_points_groups(
+                collection_name=self.collection_name,
+                query=models.SparseVector(indices=indices, values=values),
+                using=settings.SPARSE_VECTOR_NAME,
+                query_filter=models.Filter(must=[models.FieldCondition(
+                    key="source_id", match=models.MatchAny(any=sorted(remaining)),
+                )]),
+                group_by="source_id",
+                group_size=_EXPANSION_BODY_CHECK_CHUNKS,
+                limit=len(remaining),
+                with_payload=["text"],
+            )
+            for group in response.groups:
+                if any(
+                    self._phrase_in_text(expansion, (hit.payload or {}).get("text"))
+                    for hit in group.hits
+                ):
+                    found.add(str(group.id))
+        return found
 
     def _acronym_bonus(
         self,
@@ -471,7 +543,8 @@ class AcronymRankingMixin:
 
         backed_acronyms is per-DOCUMENT, not a single flag: it's the subset of
         acronyms_detected whose body content was actually verified for THIS
-        document. A query naming several acronyms (e.g. "DIET SMC") must not
+        document — by the bare acronym or by its spelled-out expansion (see
+        _sources_with_acronym_in_body). A query naming several acronyms (e.g. "DIET SMC") must not
         let body evidence for one acronym count as evidence for another — a
         document titled "DIET Handbook" whose body only ever says "SMC" earns
         the DIET title grade only if "DIET" is itself in backed_acronyms, not
@@ -543,7 +616,8 @@ class AcronymRankingMixin:
         # unavailable for this request.
         if any((r.get('field_scores') or {}).get(settings.SPARSE_VECTOR_NAME) for r in rows):
             body_sources = self._sources_with_acronym_in_body(
-                self._sources_claiming_acronym(rows, acronyms_detected)
+                self._sources_claiming_acronym(rows, acronyms_detected),
+                acronyms_detected=acronyms_detected,
             )
         by_source: Dict[str, float] = {}
         for r in rows:
