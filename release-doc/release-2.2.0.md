@@ -100,10 +100,10 @@ No changes. Still requires `qdrant-client[fastembed]>=1.18.0,<2.0.0` and Qdrant 
    the previous code version is still serving traffic.
    ```bash
    # Dry run first — reports scanned/cleaned/backfilled counts, writes nothing
-   PYTHONPATH=. .vector-env/bin/python3 scripts/cleanup_metadata_duplicates.py --dry-run
+   PYTHONPATH=. .vector-env/bin/python3 scripts/release_2.2.0/cleanup_metadata_duplicates.py --dry-run
 
    # Real run
-   PYTHONPATH=. .vector-env/bin/python3 scripts/cleanup_metadata_duplicates.py
+   PYTHONPATH=. .vector-env/bin/python3 scripts/release_2.2.0/cleanup_metadata_duplicates.py
    ```
 
 6. Restart the service.

@@ -10,8 +10,8 @@ For each point:
 Vectors are not touched.
 
 Usage (from the vectorization-service root):
-    PYTHONPATH=. .vector-env/bin/python3 scripts/cleanup_metadata_duplicates.py --dry-run
-    PYTHONPATH=. .vector-env/bin/python3 scripts/cleanup_metadata_duplicates.py
+    PYTHONPATH=. .vector-env/bin/python3 scripts/release_2.2.0/cleanup_metadata_duplicates.py --dry-run
+    PYTHONPATH=. .vector-env/bin/python3 scripts/release_2.2.0/cleanup_metadata_duplicates.py
 """
 import argparse
 import logging

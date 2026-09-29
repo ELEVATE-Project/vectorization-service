@@ -10,6 +10,7 @@ from app.core.clients.qdrant import upload_to_qdrant, qdrant_client
 from app.core.clients.embedding import generate_embeddings, validate_vector
 from app.config import settings
 from app.constants import messages as msg
+from app.constants import constants as const
 from app.services.file_processors.csv_processor import CSVProcessor
 from app.services.file_processors.pdf_processor import PDFProcessor
 from app.services.file_processors.docx_processor import DOCXProcessor
@@ -94,7 +95,7 @@ class UploadService(BaseDocumentOperation):
         )
 
     async def _rollback_points(self, point_ids: list, source_id: str,
-                               reason: str = "partial upload rollback") -> bool:
+                               reason: str = const.ROLLBACK_REASON_PARTIAL_UPLOAD) -> bool:
         """Delete these point ids, retrying briefly; True once they are gone.
 
         reason only labels the log lines (UpdateService reuses this to remove an old version).
@@ -115,7 +116,7 @@ class UploadService(BaseDocumentOperation):
         return False
 
     async def _background_rollback(self, point_ids: list, source_id: str,
-                                   reason: str = "partial upload rollback") -> None:
+                                   reason: str = const.ROLLBACK_REASON_PARTIAL_UPLOAD) -> None:
         """Keep retrying the delete after the request has returned"""
         for attempt in range(1, settings.UPLOAD_ROLLBACK_BACKGROUND_MAX_ATTEMPTS + 1):
             # Wait doubles each attempt, capped at the max wait (2, 4, 8, ... 60s)
@@ -144,7 +145,7 @@ class UploadService(BaseDocumentOperation):
         )
 
     def _schedule_background_rollback(self, point_ids: list, source_id: str,
-                                      reason: str = "partial upload rollback") -> None:
+                                      reason: str = const.ROLLBACK_REASON_PARTIAL_UPLOAD) -> None:
         """Start the background delete and keep a reference until it finishes"""
         task = asyncio.create_task(self._background_rollback(list(point_ids), source_id, reason))
         _background_rollback_tasks.add(task)

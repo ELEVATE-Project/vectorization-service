@@ -4,11 +4,9 @@ from typing import Optional
 from fastapi import HTTPException, UploadFile
 from app.services.document_operations.base_operation import BaseDocumentOperation
 from app.services.document_operations.upload_service import UploadService
+from app.constants import constants as const
 
 logger = logging.getLogger(__name__)
-
-# Labels the delete/retry log lines so they are not read as a partial-upload rollback
-_OLD_VERSION_CLEANUP = "old version cleanup after replace"
 
 
 class UpdateService(BaseDocumentOperation):
@@ -58,8 +56,11 @@ class UpdateService(BaseDocumentOperation):
 
     async def _delete_old_version(self, old_ids: list, source_id: str, company_id: Optional[str]):
         """Remove the replaced chunks, retrying; 502 if they are still there afterwards"""
-        # Same in-request retries as a partial-upload rollback (UPLOAD_ROLLBACK_* settings)
-        if await self.upload_service._rollback_points(old_ids, source_id, reason=_OLD_VERSION_CLEANUP):
+        # Same in-request retries as a partial-upload rollback (UPLOAD_ROLLBACK_* settings);
+        # the reason label keeps these log lines from reading as a failed upload.
+        if await self.upload_service._rollback_points(
+            old_ids, source_id, reason=const.ROLLBACK_REASON_OLD_VERSION_CLEANUP
+        ):
             return
 
         # The new version is stored but the old one could not be removed: log every id for
@@ -68,7 +69,9 @@ class UpdateService(BaseDocumentOperation):
             f"Could not remove the old version of source_id {source_id} (company_id {company_id}) after "
             f"storing the new one; {len(old_ids)} old points may remain searchable. Point IDs: {old_ids}"
         )
-        self.upload_service._schedule_background_rollback(old_ids, source_id, reason=_OLD_VERSION_CLEANUP)
+        self.upload_service._schedule_background_rollback(
+            old_ids, source_id, reason=const.ROLLBACK_REASON_OLD_VERSION_CLEANUP
+        )
 
         # A retry is safe: it snapshots old + new ids, stores another copy, then deletes both
         raise HTTPException(
