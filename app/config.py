@@ -42,11 +42,49 @@ class Settings(BaseSettings):
     MAX_CACHE_RESULTS: int = 1
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
+    REDIS_DB: int = int(os.getenv("REDIS_DB", 0))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+    # Small on purpose: redis-py has no default timeout, and a blackholed
+    # connection (packets silently dropped) would hang cache reads for minutes,
+    # stalling search instead of falling back to Postgres.
+    REDIS_SOCKET_CONNECT_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", 1))
+    REDIS_SOCKET_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_TIMEOUT", 1))
     REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", 86400))  # 24 hours in seconds
+    # Shorter than REDIS_CACHE_TTL: caches "this word isn't an acronym" so ordinary
+    # non-acronym words in a query don't re-hit Postgres on every request. A newly
+    # bulk-uploaded acronym overwrites any stale negative entry immediately (warm_cache()
+    # runs after every upload), so this TTL only bounds staleness for the rare case that
+    # invariant doesn't hold — not load-bearing correctness.
+    REDIS_NEGATIVE_CACHE_TTL: int = int(os.getenv("REDIS_NEGATIVE_CACHE_TTL", 3600))  # 1 hour
+    # Shorter than REDIS_NEGATIVE_CACHE_TTL: this caches a DB-error miss, not a
+    # genuine "not an acronym" miss. DB outages are often transient — caching
+    # "not found" for a full hour would hide real acronyms after Postgres recovers.
+    REDIS_DB_ERROR_CACHE_TTL: int = int(os.getenv("REDIS_DB_ERROR_CACHE_TTL", 30))
     REDIS_MAX_CACHE_SIZE: int = int(os.getenv("REDIS_MAX_CACHE_SIZE", 1000))
     DATABASE_URL: str = os.getenv("POSTGRES_DATABASE_URI", "postgresql://anuj:1234@localhost:5432/ai_vector_service")
+    # psycopg2 defaults to no connect timeout at all — a blackholed Postgres host
+    # (network silently drops packets, unlike a clean "connection refused") makes
+    # a connection attempt hang until the OS-level TCP timeout, which can be
+    # minutes. Confirmed live with a real local "black hole" TCP server: an
+    # unbounded psycopg2.connect() hung past 15s with no sign of returning.
+    POSTGRES_CONNECT_TIMEOUT: int = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", 3))
+    # connect_timeout above only bounds opening a connection — once one is
+    # established, nothing bounded how long a QUERY running on it could take.
+    # A Postgres that accepts new connections fine but is unresponsive to
+    # queries (stuck lock, frozen backend) hung every request touching it
+    # indefinitely instead of failing; found live via a pause test. Every
+    # query this service issues is a small indexed lookup (acronym_mapping,
+    # a few hundred rows; translations by chunk_id) with no legitimate reason
+    # to run anywhere near this long, so 5s is generous headroom, not a tight
+    # squeeze — it will essentially never fire against a healthy database.
+    POSTGRES_STATEMENT_TIMEOUT_MS: int = int(os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
     REDIS_CACHE_ENABLED: bool = False
+
+    # Shared secret for internal-only endpoints (e.g. acronym bulk upload), checked
+    # against the X-Internal-Token request header. No default — must be set explicitly.
+    INTERNAL_API_TOKEN: str = os.getenv("INTERNAL_API_TOKEN", "")
+    # some api endpoints are more sensitive than others (e.g. acronym bulk upload) — require a second, stricter shared secret for those. No default — must be set explicitly.
+    ADMIN_API_TOKEN: str = os.getenv("ADMIN_API_TOKEN", "")
 
     # URL extraction settings
     URL_EXTRACTION_CHUNK_SIZE: int = 1500
@@ -55,6 +93,9 @@ class Settings(BaseSettings):
 
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
+    # Acronym bulk-upload CSVs are small tabular text, not documents —
+    # a much lower cap than MAX_FILE_SIZE_MB.
+    ACRONYM_BULK_UPLOAD_MAX_SIZE_MB: int = int(os.getenv("ACRONYM_BULK_UPLOAD_MAX_SIZE_MB", 5))
 
 
     # Prioritized Search Configuration
@@ -87,6 +128,116 @@ class Settings(BaseSettings):
     # Queries shorter than this word count skip spaCy stop-word removal
     SHORT_QUERY_THRESHOLD: int = int(os.getenv("SHORT_QUERY_THRESHOLD", "3"))
     RRF_K: int = int(os.getenv("RRF_K", "60"))  # standard Reciprocal Rank Fusion constant
+
+    # Expansion words match by prefix so inflections line up: institute /
+    # institutes, program / programme. But a prefix only means something once the
+    # shorter side is a word stem — below that, a single letter is a prefix of
+    # anything starting with it, so "s" stands in for "school" and "S M C
+    # Handbook" reads as "School Management Committee", "R.E.A.D" as "Right to
+    # Education". Four characters is where a prefix stops being an initial and
+    # starts being a stem.
+    #
+    # This is the minimum STEM length for matching an expansion's words against a
+    # document. It is NOT a limit on how long an acronym may be — that is the
+    # acronym_mapping column width (32), read off the model in acronym_service so
+    # the two can never drift apart. Lives here rather than in constants.py so it
+    # can be retuned per deployment without a code change, like every other
+    # ranking knob above.
+    ACRONYM_MIN_PREFIX_MATCH_LEN: int = int(os.getenv("ACRONYM_MIN_PREFIX_MATCH_LEN", "4"))
+
+    # ACRONYM_MIN_PREFIX_MATCH_LEN alone can't tell a real inflection ("test" ~
+    # "tests") apart from an unrelated word that happens to share a prefix
+    # ("test" ~ "testimony"). Genuine inflections almost always add a handful
+    # of characters; unrelated words tend to add far more. This caps how many
+    # EXTRA characters the longer word may have over the shorter one for a
+    # prefix match to count — verified against the live acronym dictionary to
+    # keep standard plural/tense inflections working while blocking most
+    # coincidental prefix collisions on short, common expansion words (e.g.
+    # "post", "work", "home", "master").
+    ACRONYM_PREFIX_SUFFIX_CAP: int = int(os.getenv("ACRONYM_PREFIX_SUFFIX_CAP", "3"))
+
+    # AC-11: an ambiguous acronym (SSC = Staff Selection Commission OR Sainik
+    # School Society) used to only ever get a dense variant for its FIRST
+    # listed expansion — semantic search never explored the other meaning at
+    # all, while the sparse/BM25 query mixed both meanings' words together
+    # regardless. Now one dense variant is built per expansion (capped by
+    # this setting, total dense texts including the original query), so
+    # semantic search genuinely considers each registered meaning. Only 3
+    # dictionary entries are ever ambiguous today (SSC, DM, MIP), so this
+    # rarely adds more than one extra variant in practice.
+    ACRONYM_MAX_DENSE_VARIANTS: int = int(os.getenv("ACRONYM_MAX_DENSE_VARIANTS", "3"))
+
+    # Soft acronym ranking — replaces the hard tiers. On an acronym query:
+    #   relevance = (1 - W) x score_against_query + W x score_against_expansion
+    # each side being the usual 70/30 dense/sparse fusion, then
+    #   final = relevance x (1 + bonus)
+    # with the best bonus that applies below. A title can therefore close at most
+    # a (bonus) relative gap; it can never lift a weak document over a much
+    # stronger one, which is what the tiers did. The acronym bonuses additionally
+    # require the document's content to mention the acronym (BM25), so a title
+    # alone never earns them.
+    #
+    # W: the expansion phrase is both specific ("Parent Teacher Meeting") and
+    # generic ("District Institute of Education and Training") depending on the
+    # acronym, so it counts for part of the score, not all of it or none.
+    # Defaults chosen by simulation on the local corpus (DIET/PTM/SMC/SSC,
+    # scripts/simulate_soft_acronym_boost.py) — tune against real expected
+    # results before treating them as settled.
+    #
+    # 0.5 with bonuses doubled from 0.20/0.15/0.10/0.05, compared against 0.2,
+    # 0.35, 0.65, 0.8, and 0.7-with-doubled-bonuses on 19 acronyms of the local
+    # corpus (2026-09-29). At 0.2 the acronym side dominated: a nutrition
+    # document titled "Healthy Diet Guide" outranked real DIET documents
+    # (MiniLM reads "diet" as food), and documents that only spell out the
+    # expansion ranked far below their content. Above 0.5 the expansion's
+    # generic words take over ("District ... Education" pulls "District
+    # Primary Education Programme" into DIET's top 5; "School ... Committee"
+    # pushes SMC modules out of SMC's top 10). At 0.5 the doubled title bonus
+    # keeps acronym-titled documents ahead of that vocabulary: DIET's top 10 is
+    # all DIET documents, the nutrition guide and DPEP both fall below them, and
+    # every Parent Teacher Meeting document fills PTM's top 7. Known cost:
+    # thin documents with the acronym only in the title (e.g. scanned PDFs)
+    # slip below richer on-topic documents.
+    ACRONYM_EXPANSION_SCORE_WEIGHT: float = float(os.getenv("ACRONYM_EXPANSION_SCORE_WEIGHT", "0.5"))
+    ACRONYM_BONUS_TITLE_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_TITLE_ACRONYM", "0.40"))
+    ACRONYM_BONUS_TITLE_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_TITLE_EXPANSION", "0.30"))
+    ACRONYM_BONUS_SUMMARY_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_ACRONYM", "0.20"))
+    ACRONYM_BONUS_SUMMARY_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_EXPANSION", "0.10"))
+
+    # A document matching several detected acronyms sums each one's own best
+    # grade (AC-15: it used to just take the single best grade across all of
+    # them, so a document about both SMC and DIET ranked identically to one
+    # about only DIET). Summing is capped so it stays bounded -- two acronyms
+    # both hitting a full title match would otherwise sum to 0.80 (2x
+    # ACRONYM_BONUS_TITLE_ACRONYM), letting the multiplier run away for a
+    # query naming several acronyms at once. 0.60 gives a genuinely higher
+    # ceiling than a single match's 0.40 (multiplier up to 1.6x vs 1.4x) --
+    # a visible reward for matching more -- without approaching 2x. Doubled
+    # along with the grades above, keeping the same ratio to them.
+    ACRONYM_BONUS_MULTI_MATCH_CAP: float = float(os.getenv("ACRONYM_BONUS_MULTI_MATCH_CAP", "0.60"))
+
+    # _blended_acronym_relevance rescores the retrieved pool against the query
+    # and the expansion separately (see above) -- a second and third Qdrant
+    # round trip on top of the initial retrieval call. Uncapped, this doubled
+    # to nearly quadrupled search latency (+115% at top_k=10, +297% at
+    # top_k=1000, measured). Capping to the top N candidates by the already-
+    # computed retrieval score keeps the cost bounded. Blending only reweights
+    # between two relevance signals the pool is already ranked by, so a
+    # document far down that ranking is not going to leapfrog into the top
+    # results after blending; those are left at their retrieval score instead
+    # of being rescored.
+    ACRONYM_RESCORE_POOL_LIMIT: int = int(os.getenv("ACRONYM_RESCORE_POOL_LIMIT", "200"))
+
+    # Acronym Search — on by default, matching .env.sample and the 2.1.0 release
+    # note, which both already described it that way while the code still defaulted
+    # to false. Set ACRONYM_SEARCH_ENABLED=false to disable the whole
+    # detect -> expand -> tiered-rank path; retrieval and ranking then behave
+    # exactly as they did before the feature (non-acronym queries are byte-identical
+    # either way, which TestFusionFormulaHasNoAcronymBranch and the offline
+    # comparison both pin).
+    ACRONYM_SEARCH_ENABLED: bool = os.getenv("ACRONYM_SEARCH_ENABLED", "true").lower() == "true"
+    # explicitly enable/disable caching of redis results (default true)
+    CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").lower() == "true"
 
     # Sparse Vector Configuration (Phase 2 — requires qdrant-client>=1.9.0)
     SPARSE_VECTOR_NAME: str = os.getenv("SPARSE_VECTOR_NAME", "bm25")
