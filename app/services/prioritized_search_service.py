@@ -210,6 +210,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 for key in INTERNAL_SCORE_KEYS:
                     field_scores.pop(key, None)
 
+                # Acronym fields only for rows that went through acronym scoring; injected
+                # rows on ordinary queries also carry a floor relevance and a 0.0 bonus.
+                acronym_debug = include_scoring_debug and result_data.get('acronym_grades') is not None
+
                 result_items.append(SearchResultItem(
                     id=str(result_data['id']),
                     text=result_data['payload'].get('text', ''),
@@ -246,13 +250,13 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     title_multiplier=result_data.get('title_multiplier', 1.0) if include_scoring_debug else None,
                     summary_multiplier=result_data.get('summary_multiplier', 1.0) if include_scoring_debug else None,
                     # No default: None means "not an acronym query", unlike 0.0.
-                    acronym_bonus=result_data.get('acronym_bonus') if include_scoring_debug else None,
+                    acronym_bonus=result_data.get('acronym_bonus') if acronym_debug else None,
                     # Real relevance of a re-injected document; None if never measured.
                     measured_relevance=result_data.get('measured_relevance') if include_scoring_debug else None,
                     # Acronym queries only: why this document got its bonus.
-                    relevance=result_data.get('relevance') if include_scoring_debug else None,
-                    acronym_grades=result_data.get('acronym_grades') if include_scoring_debug else None,
-                    body_backed=result_data.get('body_backed') if include_scoring_debug else None,
+                    relevance=result_data.get('relevance') if acronym_debug else None,
+                    acronym_grades=result_data.get('acronym_grades') if acronym_debug else None,
+                    body_backed=result_data.get('body_backed') if acronym_debug else None,
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")

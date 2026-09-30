@@ -1072,6 +1072,34 @@ class TestPerDocumentAcronymBreakdown:
                    for r in response.results)
 
 
+# ── Acronym debug fields stay null on ordinary queries ────────────────────
+
+class TestAcronymDebugFieldsOnlyOnAcronymPath:
+    """Injected keyword matches carry a floor relevance and a 0.0 bonus on every
+    query; only rows that went through acronym scoring may expose them."""
+
+    @staticmethod
+    def _row(**extra):
+        return {"id": "p1", "payload": {"source_id": "S", "title": "T", "text": "x"},
+                "field_scores": {}, "weighted_score": 0.8,
+                "match_source": "title_keyword_match", **extra}
+
+    def test_ordinary_injected_row_hides_acronym_fields(self, service):
+        item = service._build_result_items(
+            [self._row(relevance=0.8, acronym_bonus=0.0)], True)[0]
+        assert item.relevance is None and item.acronym_bonus is None
+        assert item.acronym_grades is None and item.body_backed is None
+        assert item.match_source == "title_keyword_match"
+
+    def test_acronym_injected_row_keeps_acronym_fields(self, service):
+        item = service._build_result_items([self._row(
+            weighted_score=0.8 * 1.4, relevance=0.8, acronym_bonus=0.4,
+            acronym_grades={"DIET": "title_acronym"}, body_backed={"DIET": "acronym"})], True)[0]
+        assert item.relevance == 0.8 and item.acronym_bonus == 0.4
+        assert item.acronym_grades == {"DIET": "title_acronym"}
+        assert item.score == pytest.approx(item.relevance * (1 + item.acronym_bonus))
+
+
 # ── The acronym rescore cap is skipped in RRF mode ────────────────────────
 
 class TestRescoreCapFollowsFusionMethod:
