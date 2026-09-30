@@ -655,8 +655,18 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 # the capped subset's rescore lands on the same scale as the
                 # untouched remainder, instead of being stretched to fill [0, 1]
                 # against just its own narrower range.
+                #
+                # RRF mode is never capped: its score comes from each point's
+                # RANK within the list it is given and ignores
+                # normalization_reference, so a capped subset would be ranked
+                # against itself (its 200th point normalizing to 0) while the
+                # untouched remainder kept full-pool scores — two incompatible
+                # scales meeting at the cutoff, reordering it and skewing
+                # filter_score there. Rescoring the full pool costs more Qdrant
+                # work, but only in RRF mode.
                 normalization_reference: Optional[Dict[str, float]] = None
-                if len(pool_ids) > settings.ACRONYM_RESCORE_POOL_LIMIT:
+                if (settings.HYBRID_FUSION_METHOD != "rrf"
+                        and len(pool_ids) > settings.ACRONYM_RESCORE_POOL_LIMIT):
                     full_pool_context: Dict[str, Any] = {}
                     prelim_ranked = self._rank_results(
                         all_results, field_scores, weights, search_fields,
@@ -1904,7 +1914,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
 
             multiplier = exact_boost if match_type == "exact" else partial_boost
             original = result["weighted_score"]
-            boosted = min(original * multiplier, 1.0)
+            # A neutral multiplier (the soft acronym path) must leave the score
+            # untouched: relevance x (1 + bonus) can legitimately exceed 1.0, and
+            # clamping it here would collapse distinct high scores into ties.
+            boosted = original if multiplier == 1.0 else min(original * multiplier, 1.0)
             result["weighted_score"] = boosted
             result["field_scores"][match_key] = match_type
             result[mult_key] = multiplier
@@ -2212,7 +2225,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
         query: str,
         filter_conditions: Optional[models.Filter],
     ) -> Dict[str, str]:
-        return self._get_field_match_sources([query], filter_conditions, "title")
+        return self._get_field_match_sources(
+            [FieldMatchQuery(query, query, "substring")], filter_conditions, "title"
+        )
 
     def _apply_title_boost(
         self,

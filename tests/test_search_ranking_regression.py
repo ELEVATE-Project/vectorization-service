@@ -965,6 +965,39 @@ class TestAcronymBonusFollowsLexicalRanking:
         assert seen["acronyms_detected"] == dict(ACR)
 
 
+# ── The acronym rescore cap is skipped in RRF mode ────────────────────────
+
+class TestRescoreCapFollowsFusionMethod:
+    """RRF scores a point by its rank within the list it is given and ignores
+    normalization_reference, so a capped subset would be ranked against itself
+    while the remainder kept full-pool scores. RRF mode therefore rescores the
+    whole pool; weighted mode keeps the cap."""
+
+    def _rescored_pool(self, service, monkeypatch, fusion_method):
+        seen = {}
+
+        def spy(self, pool_ids, *args, **kwargs):
+            seen["pool_ids"] = list(pool_ids)
+            seen["normalization_reference"] = kwargs.get("normalization_reference")
+            return {}
+
+        monkeypatch.setattr(settings, "HYBRID_FUSION_METHOD", fusion_method)
+        monkeypatch.setattr(settings, "ACRONYM_RESCORE_POOL_LIMIT", 1)
+        monkeypatch.setattr(PrioritizedSearchService, "_blended_acronym_relevance", spy)
+        TestAcronymBonusFollowsLexicalRanking()._run(service, monkeypatch, "hybrid")
+        return seen
+
+    def test_weighted_mode_caps_the_pool(self, service, monkeypatch):
+        seen = self._rescored_pool(service, monkeypatch, "weighted")
+        assert len(seen["pool_ids"]) == 1
+        assert seen["normalization_reference"] is not None
+
+    def test_rrf_mode_rescores_the_full_pool(self, service, monkeypatch):
+        seen = self._rescored_pool(service, monkeypatch, "rrf")
+        assert sorted(seen["pool_ids"]) == ["pt-A", "pt-B"]
+        assert seen["normalization_reference"] is None
+
+
 # ── Expansion in the body backs a title/summary acronym claim ─────────────
 
 class TestExpansionInBodyBacksAcronymClaim:
@@ -974,29 +1007,33 @@ class TestExpansionInBodyBacksAcronymClaim:
     only shares some expansion words is not."""
 
     def _stub_qdrant(self, monkeypatch, acronym_hits, chunk_text):
-        """acronym_hits: sources the bare-acronym BM25 query finds.
+        """acronym_hits: source -> body text the bare-acronym BM25 query returns
+        (a list is shorthand for chunks that use "DIET" in capitals).
         chunk_text: source -> body text returned for the expansion query."""
+        if not isinstance(acronym_hits, dict):
+            acronym_hits = {s: "The DIET faculty met." for s in acronym_hits}
         calls = {"acronym": 0, "expansion": 0}
+        acronym_index, expansion_index = 1, 2
 
         def fake_groups(**kwargs):
             wanted = set(kwargs["query_filter"].must[0].match.any)
-            if kwargs["with_payload"] is False:
+            if kwargs["query"].indices == [acronym_index]:
                 calls["acronym"] += 1
-                ids = [s for s in acronym_hits if s in wanted]
-                return types.SimpleNamespace(groups=[
-                    types.SimpleNamespace(id=s, hits=[]) for s in ids])
-            calls["expansion"] += 1
+                texts = acronym_hits
+            else:
+                calls["expansion"] += 1
+                texts = chunk_text
             return types.SimpleNamespace(groups=[
                 types.SimpleNamespace(id=s, hits=[
-                    types.SimpleNamespace(payload={"text": chunk_text[s]})])
-                for s in chunk_text if s in wanted])
+                    types.SimpleNamespace(payload={"text": texts[s]})])
+                for s in texts if s in wanted])
 
         monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", True)
         monkeypatch.setattr(
             "app.services.acronym_ranking.qdrant_client.query_points_groups", fake_groups)
         monkeypatch.setattr(
             "app.core.clients.sparse_encoder.generate_sparse_vector",
-            lambda text: ([1], [1.0]))
+            lambda text: ([acronym_index if text in ACR else expansion_index], [1.0]))
         return calls
 
     def test_spelled_out_expansion_backs_the_title_claim(self, service, monkeypatch):
@@ -1045,3 +1082,42 @@ class TestExpansionInBodyBacksAcronymClaim:
             "A": "District Institute of Education and Training"})
         assert service._sources_with_acronym_in_body({"DIET": {"A"}}) == {"DIET": set()}
         assert calls["expansion"] == 0
+
+
+# ── A bare-acronym BM25 hit must be the acronym, not the everyday word ────
+
+class TestBareAcronymHitMustUseCapitals:
+    """BM25 folds case, so "diet" in a food article matched a DIET query and
+    backed a "DIET Handbook" title. The hit now has to use the acronym in
+    capitals in one of the returned chunks."""
+
+    _stub_qdrant = TestExpansionInBodyBacksAcronymClaim._stub_qdrant
+
+    @pytest.mark.parametrize("body", [
+        "The DIET faculty met on Monday.",
+        "Two DIETs in the district ran the course.",
+        "All DIETS reported enrolment.",
+        "(DIET) coordinators, 2024 cohort.",
+    ])
+    def test_acronym_in_capitals_backs_the_claim(self, service, monkeypatch, body):
+        self._stub_qdrant(monkeypatch, acronym_hits={"A": body}, chunk_text={})
+        assert service._sources_with_acronym_in_body({"DIET": {"A"}}) == {"DIET": {"A"}}
+
+    @pytest.mark.parametrize("body", [
+        "Eat a balanced diet with plenty of vegetables.",
+        "Diet and exercise both matter.",
+        "Dietary fibre helps digestion.",
+    ])
+    def test_everyday_word_does_not_back_the_claim(self, service, monkeypatch, body):
+        self._stub_qdrant(monkeypatch, acronym_hits={"A": body}, chunk_text={})
+        assert service._sources_with_acronym_in_body({"DIET": {"A"}}) == {"DIET": set()}
+
+    def test_everyday_word_still_falls_through_to_the_expansion_check(
+            self, service, monkeypatch):
+        calls = self._stub_qdrant(
+            monkeypatch,
+            acronym_hits={"A": "A healthy diet for trainees."},
+            chunk_text={"A": "District Institute of Education and Training timetable."})
+        assert service._sources_with_acronym_in_body(
+            {"DIET": {"A"}}, acronyms_detected=ACR) == {"DIET": {"A"}}
+        assert calls == {"acronym": 1, "expansion": 1}
