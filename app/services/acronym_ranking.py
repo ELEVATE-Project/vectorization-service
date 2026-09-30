@@ -39,12 +39,19 @@ _EXPANSION_BODY_CHECK_CHUNKS = 3
 
 @lru_cache(maxsize=1024)
 def _acronym_use_pattern(acronym: str) -> "re.Pattern[str]":
-    """Case-SENSITIVE whole-word pattern for an acronym as it is written when
-    it IS the acronym: "DIET", "DIETs"/"DIETS", "PTM2024", "RTE  Act" words
-    joined by any whitespace. Lowercase "diet" does not match — that is the
-    everyday word, not the District Institute of Education and Training."""
+    """Whole-word pattern for an acronym as it is written when it IS the
+    acronym: "DIET", "DIETs"/"DIETS", "PTM2024"; multi-word keys with their
+    words joined by any whitespace.
+
+    A single-word key is case-SENSITIVE: lowercase "diet" does not match —
+    that is the everyday word, not the District Institute of Education and
+    Training. A multi-word key matches in any case ("RTE Act", "NIPUN Bharat",
+    "board exam"): such keys are normally written in mixed case, many contain
+    no abbreviation at all, and the phrase itself is already specific enough
+    not to collide with ordinary text."""
     words = r"\s+".join(re.escape(w) for w in acronym.split())
-    return re.compile(rf"(?<![A-Za-z0-9]){words}[sS]?(?![A-Za-z])")
+    flags = re.IGNORECASE if " " in acronym.strip() else 0
+    return re.compile(rf"(?<![A-Za-z0-9]){words}[sS]?(?![A-Za-z])", flags)
 
 
 class FieldMatchQuery(NamedTuple):
@@ -474,6 +481,15 @@ class AcronymRankingMixin:
                             for hit in group.hits
                         )
                     }
+                    # The top chunks are the ones with the MOST "diet"s, not the
+                    # ones in capitals, so a source whose "DIET" sits in a
+                    # lower-ranked chunk was rejected here (measured: a real
+                    # DIET framework, 47 chunks). A BM25 hit that failed the
+                    # capitals check is ambiguous, so read all of its chunks
+                    # before deciding. Only these few sources pay for it.
+                    rejected = {str(group.id) for group in response.groups} - found
+                    if rejected:
+                        found |= self._sources_using_acronym_in_any_chunk(rejected, pattern)
                 # Only the sources the bare acronym didn't already back, so the
                 # common case (acronym in the body) costs no extra query.
                 unbacked = sources - found
@@ -488,6 +504,36 @@ class AcronymRankingMixin:
                 f"Acronym body check failed, falling back to pool membership: {exc}"
             )
             return None
+
+    def _sources_using_acronym_in_any_chunk(
+        self, sources: Set[str], pattern: "re.Pattern[str]"
+    ) -> Set[str]:
+        """Which of `sources` have at least one chunk matching `pattern`,
+        reading every chunk of each source (paged scroll on the indexed
+        source_id). Stops paging once every source is settled.
+
+        Raises on a Qdrant failure; the caller's handler treats that the same
+        as a failed bare-acronym check.
+        """
+        found: Set[str] = set()
+        offset = None
+        while True:
+            points, offset = qdrant_client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=models.Filter(must=[models.FieldCondition(
+                    key="source_id", match=models.MatchAny(any=sorted(sources - found)),
+                )]),
+                limit=256,
+                offset=offset,
+                with_payload=["source_id", "text"],
+                with_vectors=False,
+            )
+            for point in points:
+                payload = point.payload or {}
+                if pattern.search(payload.get("text") or ""):
+                    found.add(str(payload.get("source_id")))
+            if offset is None or found == sources:
+                return found
 
     def _sources_with_expansion_in_body(
         self, sources: Set[str], expansions: List[str]

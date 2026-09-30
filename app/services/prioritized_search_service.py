@@ -671,6 +671,11 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     prelim_ranked = self._rank_results(
                         all_results, field_scores, weights, search_fields,
                         scoring_context_out=full_pool_context,
+                        # Same hybrid decision as the rescore: without it, a BM25
+                        # query that was sent but matched nothing ranks here as
+                        # dense-only, records no min/max, and the capped subset
+                        # self-normalizes against its own range.
+                        sparse_issued=sparse_issued,
                     )
                     pool_ids = [r['id'] for r in prelim_ranked[:settings.ACRONYM_RESCORE_POOL_LIMIT]]
                     normalization_reference = {

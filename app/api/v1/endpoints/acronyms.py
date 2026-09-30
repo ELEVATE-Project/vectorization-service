@@ -70,8 +70,10 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
     is_active (optional, "true"/"false" — defaults to active if omitted).
     A bad row is reported in `errors`, not a batch failure — the rest commits.
     """
-    raw = await file.read()
     max_bytes = settings.ACRONYM_BULK_UPLOAD_MAX_SIZE_MB * 1024 * 1024
+    # One byte past the limit is enough to know it's too big, without pulling
+    # an oversized upload into worker memory first.
+    raw = await file.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise HTTPException(
             status_code=413,
@@ -127,7 +129,12 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
                 cache_refreshed = await run_in_threadpool(mark_deactivated_in_cache, deactivated)
         except Exception as e:
             logger.warning(f"Cache refresh failed after bulk upload, invalidating instead: {e}")
-            cache_refreshed = await run_in_threadpool(invalidate_cache, created + updated)
+            # Active keys are deleted so the next lookup reloads them. Deactivated
+            # keys still get their marker, not a delete: an empty key would let a
+            # lookup that read the old active row write it back for the full TTL.
+            invalidated = await run_in_threadpool(invalidate_cache, active_batch)
+            marked = await run_in_threadpool(mark_deactivated_in_cache, deactivated)
+            cache_refreshed = invalidated and marked
 
     if not cache_refreshed:
         logger.warning(
