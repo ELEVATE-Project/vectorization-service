@@ -1,9 +1,11 @@
 import uvicorn
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
+from starlette.concurrency import run_in_threadpool
 from app.api.v1.api import api_router
 from app.core.clients.qdrant import ensure_collections_exist
 from app.core.clients.embedding import EmbeddingError
+from app.services.acronym_service import load_acronym_cache
 from app.utils.json_handler import CustomJSONResponse
 from app.config import settings
 import logging
@@ -16,10 +18,24 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     try:
         await ensure_collections_exist()
-        logger.info("Application startup completed")
     except Exception as e:
         logger.error(f"Startup failed: {str(e)}")
         raise
+
+    try:
+        # load_acronym_cache() is synchronous (blocking Postgres + Redis I/O) —
+        # must run in a thread, not be awaited directly, or it stalls the event
+        # loop (and every other in-flight request) for its full duration.
+        await run_in_threadpool(load_acronym_cache)
+    except Exception as e:
+        # Not fatal: get_expansions_batch() already falls back to Postgres per lookup,
+        # so a failed warm-up only costs a few extra DB round-trips on first
+        # touch — it must not take down the whole service (e.g. a fresh
+        # deploy where the migration hasn't run yet, or a transient Redis
+        # blip, would otherwise prevent boot entirely).
+        logger.warning(f"Acronym cache warm-up failed, continuing without it: {str(e)}")
+
+    logger.info("Application startup completed")
 
     yield
 

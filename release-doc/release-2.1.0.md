@@ -1,0 +1,178 @@
+# Release 2.1.0 — Acronym-Aware Search & Advanced Search Filtering
+
+**Service:** vectorization-service
+
+> ⚠️ **Run the migration before starting the service on a fresh deploy.** The acronym cache warms at startup by querying `acronym_mapping` — if that table doesn't exist yet, warm-up fails (non-fatal, logged, service still boots) and acronym detection silently returns nothing until the migration runs and the cache is repopulated.
+
+---
+
+## Table of Contents
+
+- [What's New](#whats-new)
+- [Acronym Search Architecture](#acronym-search-architecture)
+- [Advanced Search Filtering](#advanced-search-filtering)
+- [Dependencies](#dependencies)
+- [Deployment](#deployment)
+- [Rollback](#rollback)
+
+---
+
+## What's New
+
+- **Acronym detection in search queries** — a query containing a known acronym (e.g. `"SSC"`, `"PTM"`) is detected and expanded before retrieval, so a search for the acronym also matches documents that only spell out its full meaning, and vice versa. Gated by `ACRONYM_SEARCH_ENABLED` (defaults to `true` this release — validated on real traffic).
+- **Acronym dictionary** — new `acronym_mapping` Postgres table (multi-expansion aware: one acronym can map to more than one meaning, e.g. `SSC` → "Staff Selection Commission" / "Sainik School Society"), backed by a Redis cache-aside layer (`get_expansions_batch`) so repeat lookups don't hit Postgres. Primary key is `code` (UUID, server-generated via `gen_random_uuid()`) rather than an auto-incrementing integer — nothing in the app reads it, every query filters by the `acronym` business key instead, which is unique (`uq_acronym`). There is no separate auto-increment `id` column. A CHECK constraint (`ck_acronym_expansions_array`) keeps `expansions` a JSON array.
+- **Bulk upload endpoint** — `POST /api/acronyms/bulk`, gated by **two** headers, `internal_access_token` and `admin_auth_token` (both required — see [Deployment](#deployment)), CSV upload to create/update/**enable or disable** acronyms in batch. See [CSV format](#bulk-upload-csv-format) below.
+- **Stopword-aware detection** — a multi-word query's filler tokens (`THE`, `AND`, `ON`, …) are pulled out of the ordinary candidate list, but a stripped word is checked against the dictionary too, not just discarded — so a genuine acronym that's also a stopword (`BE`, `ME`, `SO`) still gets found. Reuses spaCy's built-in stopword list — no new dependency, no extra model download. Also detects multi-word entries (`RTE ACT`, `PM SHRI`) via 2-4 word phrase windows, and recovers plurals (`DIETS`) and punctuation-mangled text (`D.I.E.T.` arriving as `d i e t`, once the caller replaces every `.` with a space).
+- **`acronym_info` in the search response** — when an acronym is detected, the response now includes `{"detected": true, "mapping": {"SSC": ["Staff Selection Commission", "Sainik School Society"]}}`; `null` when nothing was detected.
+- **`CACHE_ENABLED` flag** — Redis was already non-mandatory for acronym lookups (any cache error already fell back to Postgres); this flag lets an operator skip Redis outright (no connection attempt at all) instead of paying a per-lookup timeout tax. Defaults to `true`.
+- **Exclusion filters** — `exclude_organizations` / `exclude_file_type` on `POST /documents/search` drop any document matching the listed values (Qdrant `must_not`), AND'ed with the existing positive filters. Unrelated to acronym search — merged in from the same `release-2.1.0` branch via PR #8.
+- **`any_of` advanced filtering** — a list of OR'd filter alternatives (`FilterBlock`), AND'ed against the top-level filters, for conditions like "PDFs from shikshalokam, or DOCX from csf" that a single flat filter list can't express. See [Advanced Search Filtering](#advanced-search-filtering).
+- **Request-body logging** — `POST /documents/search` and text-embedding search now log the incoming query/request body.
+
+---
+
+## Acronym Search Architecture
+
+<details>
+<summary>Detect → expand → retrieve flow</summary>
+
+1. **Detect** (`acronym_query_service.detect_acronyms`) — tokenizes the query; **every** token of 2+ letters is checked against the dictionary, whatever its case, and so is every contiguous 2-4 word phrase window (so multi-word entries like `RTE ACT` or `PM SHRI` are detected too, not just single words). Matching is case-insensitive: the commons media API lowercases the query before forwarding it, so an uppercase-only rule silently disabled acronym search for every multi-word query reaching this service. The dictionary itself is the precision filter — a lowercase token that isn't a registered acronym resolves to nothing. Stopwords (`THE`, `AND`, `ON`, …) are still stripped out of the ordinary candidate list in a multi-word query, but a stripped word isn't just discarded — it's checked against the dictionary separately, so a genuine acronym that happens to also be a stopword (`BE`, `ME`, `SO`) is still found; single-word queries were never affected by stripping in the first place. Two more recovery passes handle text commons has already mangled by replacing every punctuation character with a space: a plural retry (`DIETS` → `DIET`, only on a miss) and single-letter-run gluing (`D.I.E.T.` arrives as `d i e t`, which gets glued back into `DIET`).
+2. **Look up** (`acronym_service.get_expansions_batch`) — one batched Redis round-trip for every candidate token in the query, falling back to Postgres (and writing through to Redis) for whatever's still missing. Never one round-trip per token.
+3. **Expand and retrieve** (inline in `PrioritizedSearchService.search()`) — a detected acronym produces up to 3 dense embeddings (`ACRONYM_MAX_DENSE_VARIANTS`, default 3): the original query plus one variant per expansion meaning, each with the acronym substituted by that expansion, never concatenated into one string. Only the first substituted variant feeds the ranking blend below; the others widen retrieval. It also produces 1 combined sparse/BM25 query (original text plus **every** expansion's words appended). `_parallel_batch_search`/`_hybrid_batch_search` accept a list of embeddings and merge per-field with `max()`.
+
+</details>
+
+<details>
+<summary>Acronym-aware ranking</summary>
+
+Hard tiering is gone. For an acronym-detected query, the real relevance score is kept and multiplied by a bonus instead of being replaced by a tier band: `weighted_score = relevance * (1.0 + acronym_bonus)`. The bonus grades are title acronym **0.40**, title expansion **0.30**, summary acronym **0.20**, summary expansion **0.10**, and the combined bonus is capped at `ACRONYM_BONUS_MULTI_MATCH_CAP` (**0.60**), so it can lift a document by at most **1.6x** — a title match can close a relevance gap, but it can never lift a much weaker document over a much stronger one, which is what the old hard tiers did. Because of the bonus, an acronym result's score can be above 1.0. The bonus itself requires the document's own body to back the acronym, so a title match alone never earns it: a BM25 check must find the acronym written in capitals in one of the document's top chunks (so the everyday word "diet" does not back a "DIET" title), or find the full expansion spelled out in the body.
+
+`relevance` for an acronym query is a blend of the score against the literal query and the score against the acronym's expansion — `(1 - W) * query_score + W * expansion_score`, `W` = `ACRONYM_EXPANSION_SCORE_WEIGHT` (default **0.5**, an even blend). To keep this fast, only the top `ACRONYM_RESCORE_POOL_LIMIT` (default 200) candidates are rescored; the rest keep their retrieval score. With `HYBRID_FUSION_METHOD=rrf` the whole pool is rescored instead, because RRF scores are not comparable across a capped subset. The bonus is applied after the relevance threshold (so `filter_score` always judges real relevance) and before dedup and the `top_k` cap (so a bonus can still lift a document onto the page).
+
+This is a lexical signal, so it rides the same switch as the title/summary boost: only when `HYBRID_SEARCH_ENABLED` is on and `search_mode` is not `"semantic"`. Retrieval is deliberately **not** gated: the expanded dense and sparse queries still run in semantic mode, so an acronym keeps widening *which* documents are found; only their order falls back to pure similarity. Ranking for non-acronym queries is unchanged either way.
+
+</details>
+
+<details>
+<summary>Cache-aside layer</summary>
+
+- `get_expansions_batch` — cache-aside read: Redis hit returns immediately; miss falls back to Postgres and writes through. Negative-caches "not an acronym" (`REDIS_NEGATIVE_CACHE_TTL`) and DB-outage misses (`REDIS_DB_ERROR_CACHE_TTL`, shorter — a DB outage is usually transient). The write-through only fills keys that are still empty (Redis `SET NX`), so a lookup that read Postgres just before a bulk upload committed cannot overwrite what the upload wrote.
+- `refresh_cache` — re-caches exactly the active acronyms touched by a bulk upload.
+- `mark_deactivated_in_cache` — for a row set inactive, writes a short-lived (30 s) "not an acronym" marker instead of deleting the key, so disabling takes effect immediately and an in-flight lookup cannot bring the old value back. It re-reads Postgres first and skips any acronym a newer upload has already reactivated.
+- `invalidate_cache` — batched delete (single Redis `DEL` for N keys), used as the fallback if `refresh_cache` itself fails.
+- `load_acronym_cache` — warms the whole dictionary at startup only, in one pipelined Redis write. It is all or nothing: if the write fails, the service logs a warning and boots with a cold cache.
+- **`CACHE_ENABLED=false`** — every function above short-circuits before touching Redis (no connection attempt), falling straight to Postgres. `load_acronym_cache` logs `"Acronym cache warm-up skipped (CACHE_ENABLED=false)"` at startup instead of the usual "Acronym cache warmed: N" line.
+
+</details>
+
+<details>
+<summary>Bulk upload CSV format</summary>
+
+| Column | Required | Notes |
+|---|---|---|
+| `acronym` | Yes | Case-insensitive, stored uppercase. Max 32 chars. Letters only, 1–4 space-separated words, because detection removes digits and punctuation from query words; a key that depends on them (`G20`, `10+2`, `COVID-19`) cannot be registered, while punctuated spellings map to their letters (`B.Ed` in a query is found as `BED`). |
+| `expansions` | Yes | Pipe-separated if more than one meaning, e.g. `Staff Selection Commission\|Sainik School Society`. |
+| `description` | No | Free text. |
+| `is_active` | No | `true`/`false`, case-insensitive. Missing/empty defaults to active (backward-compatible with CSVs from before this column existed). Any other value is rejected as a per-row error. |
+
+One invalid or duplicate-in-batch row doesn't fail the whole upload — it's reported in the response's `errors` list while the rest of the batch still commits.
+
+</details>
+
+---
+
+## Advanced Search Filtering
+
+<details>
+<summary>Exclusion filters</summary>
+
+`exclude_organizations` / `exclude_file_type` on `PrioritizedSearchRequest` mirror the existing `organizations` / `file_type` fields but drop matches instead of requiring them (Qdrant `must_not` on `metadata.company` / `metadata.type`). They combine with every other filter as AND — e.g. `organizations: ["shikshalokam"], exclude_file_type: ["pdf"]` returns shikshalokam documents that are **not** PDFs.
+
+</details>
+
+<details>
+<summary><code>any_of</code> — OR across fields</summary>
+
+`any_of` takes a list of `FilterBlock` alternatives, at least one of which must match: `TOP-LEVEL AND (any_of[0] OR any_of[1] OR ...)`. Each block accepts the same fields as the top-level request (`categories`, `organizations`, `resource_type`, `file_type`, `exclude_organizations`, `exclude_file_type`).
+
+Use it only for an OR that spans *different* fields, e.g. "PDFs from shikshalokam, or DOCX from csf":
+
+```json
+{
+  "query": "teacher training",
+  "any_of": [
+    {"organizations": ["shikshalokam"], "file_type": ["pdf"]},
+    {"organizations": ["csf"], "file_type": ["docx"]}
+  ]
+}
+```
+
+An OR between values of a single field is just a longer list on that field (no `any_of` needed); an exclusion is `exclude_organizations`/`exclude_file_type` directly. Two validation rules keep the payload unambiguous — one way to write any given condition:
+
+- An `any_of` list needs **2+** alternatives; a single block is rejected (422) — that's just the top-level filter fields.
+- An empty block (no filter values set) is rejected (422) instead of silently matching every document.
+- Blocks don't nest — a block containing its own `any_of` is rejected (`extra="forbid"`).
+
+</details>
+
+---
+
+## Dependencies
+
+- **No new packages.** `alembic`, `sqlalchemy`, `psycopg2-binary` were already in `requirements.txt` from the earlier PRs in this stack (schema/cache work); `spacy>=3.7.0` was already required for existing query preprocessing.
+- **No new model download.** The stopword filter uses `spacy.lang.en.stop_words.STOP_WORDS` — a static list bundled with the `spacy` package itself, distinct from the `en_core_web_sm` pipeline model already required elsewhere (that one *is* a separate download, unrelated to this release).
+- **`data/acronyms.csv`** (486 seed acronyms) is committed in the repo — the migration reads it directly, no separate upload step needed for the initial seed.
+
+---
+
+## Deployment
+
+### Pre-deploy checklist
+
+1. **Verify Postgres is reachable** — `acronym_mapping` is a new table; the existing `translations` table is untouched.
+2. **Set `INTERNAL_API_TOKEN` and `ADMIN_API_TOKEN`** in `.env` to two different real secrets — `POST /api/acronyms/bulk` now requires **both** headers (`internal_access_token` and `admin_auth_token`). No defaults; either one missing or wrong rejects the request (not a soft-fail). Kept as two separate secrets deliberately — `INTERNAL_API_TOKEN` may end up shared with other services that only need to call some other internal-only endpoint, and shouldn't thereby also gain write access to this dictionary.
+
+### Deploy steps
+
+3. Add/confirm the new env keys in `.env` (see `.env.sample`):
+   ```dotenv
+   ACRONYM_SEARCH_ENABLED=true
+   ACRONYM_BULK_UPLOAD_MAX_SIZE_MB=5
+   INTERNAL_API_TOKEN=<generate-a-real-secret>
+   ADMIN_API_TOKEN=<generate-a-different-real-secret>
+   ```
+   Optional, sensible defaults if omitted: `CACHE_ENABLED=true`, `REDIS_CACHE_TTL=86400`, `REDIS_NEGATIVE_CACHE_TTL=3600`, `REDIS_DB_ERROR_CACHE_TTL=30`, `REDIS_SOCKET_CONNECT_TIMEOUT=1`, `REDIS_SOCKET_TIMEOUT=1`.
+
+4. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+5. **Run the migration** — creates `acronym_mapping` and seeds it from `data/acronyms.csv` in one step. Idempotent (`ON CONFLICT DO UPDATE`) — safe to re-run:
+   ```bash
+   alembic upgrade head
+   ```
+
+6. **Start the service.** The acronym cache warms automatically at startup — check the log line:
+   ```
+   Acronym cache warmed: 486 active acronym(s)
+   ```
+   The count is the number of active rows, so it is higher if acronyms were added through the bulk endpoint since the seed. If this logs a warning instead ("Acronym cache warm-up failed for N acronym(s), continuing with a cold cache") the service still boots — acronym detection just falls back to per-lookup Postgres queries until the cache naturally repopulates.
+
+7. **(Optional) Upload or update additional acronyms** later via the bulk endpoint:
+   ```bash
+   curl -X POST "http://<HOST>:<PORT>/api/acronyms/bulk" \
+     -H "internal_access_token: <INTERNAL_API_TOKEN>" \
+     -H "admin_auth_token: <ADMIN_API_TOKEN>" \
+     -F "file=@acronyms.csv;type=text/csv"
+   ```
+
+---
+
+## Rollback
+
+**Fastest option — flag off, no code/schema revert:** set `ACRONYM_SEARCH_ENABLED=false` and restart. Detection never runs; `search()` falls through to exactly its pre-acronym-feature behavior (dense_query_texts/sparse_query_text stay single-string, no reweighting, `acronym_info` is always `null`).
+
+**Full schema rollback** (only if the table itself needs to go): `alembic downgrade -1` drops `acronym_mapping` entirely. ⚠️ **Destructive** — any acronym added or edited via the bulk endpoint after the initial seed is lost, not just reverted to the seed state. Take a Postgres backup first if that data matters.
+
+A code revert of this branch is not expected to be necessary on its own — the retrieval-layer changes (merging the acronym multi-embedding fan-out into the existing search methods) were verified byte-identical to pre-existing behavior for the non-acronym path, independent of the feature flag.

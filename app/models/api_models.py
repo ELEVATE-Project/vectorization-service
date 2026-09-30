@@ -1,3 +1,4 @@
+from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Optional, List, Dict, Any, Literal
 from app.config import settings
@@ -258,6 +259,45 @@ class SearchResultItem(BaseModel):
                     "Applied after title_multiplier, each capped at 1.0. "
                     "Debug-only (include_scoring_debug=true)."
     )
+    acronym_bonus: Optional[float] = Field(
+        default=None,
+        description="Proportional bonus from the acronym/expansion match in title or "
+                    "summary (see the four ACRONYM_BONUS_* settings), applied as "
+                    "score = relevance x (1 + acronym_bonus). 0.0 means no bonus applied "
+                    "(neutral, not a phantom bonus) — this is the actual mechanism behind "
+                    "the boost on acronym queries; title_multiplier/summary_multiplier are "
+                    "neutralized to 1.0 there to avoid double-counting the same signal. "
+                    "None when the query wasn't an acronym query at all. "
+                    "Debug-only (include_scoring_debug=true)."
+    )
+    measured_relevance: Optional[float] = Field(
+        default=None,
+        description="The real relevance the pipeline measured for this document before "
+                    "the search threshold dropped it and it was re-added as a keyword "
+                    "match (see match_source). weighted_score/relevance for a reused "
+                    "document are still the synthetic floor score, same as any other "
+                    "injected result — this field is only where the original, fully "
+                    "measured number is kept so it isn't lost. None both when debug is "
+                    "off and when the document was never actually measured (a genuinely "
+                    "new keyword match, or a normal non-injected result)."
+    )
+    relevance: Optional[float] = Field(
+        default=None,
+        description="Acronym queries only (debug): the score before the acronym bonus, "
+                    "so score = relevance x (1 + acronym_bonus). None otherwise."
+    )
+    acronym_grades: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description="Acronym queries only (debug): the bonus grade each detected acronym "
+                    "earned: title_acronym, title_expansion, summary_acronym, "
+                    "summary_expansion, or null for none."
+    )
+    body_backed: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description="Acronym queries only (debug): how the document's body backs each "
+                    "acronym: acronym (used in capitals), expansion (spelled out), "
+                    "dense_fallback (BM25 unavailable), or null (not backed)."
+    )
     title_match: Optional[str] = Field(
         default=None,
         description="Title match type: 'exact', 'partial', or None if no title match"
@@ -275,6 +315,10 @@ class PrioritizedSearchResponse(BaseModel):
     search_config: Dict[str, Any] = Field(
         default_factory=dict,
         description="Configuration used for this search"
+    )
+    acronym_info: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Detected acronym(s) and their expansions, if any were found in the query"
     )
 
 class TextSearchRequest(BaseModel):
@@ -302,3 +346,37 @@ class SourceVerificationResponse(BaseModel):
     not_found: List[str] = Field(..., description="List of source IDs that don't exist in Qdrant")
     found_count: int = Field(..., description="Count of found source IDs")
     not_found_count: int = Field(..., description="Count of not found source IDs")
+
+class AcronymUploadError(BaseModel):
+    index: int = Field(..., description="0-based index of the row in the CSV (0 = first data row, header excluded)")
+    acronym: Optional[str] = Field(None, description="Acronym value, if present on the row")
+    reason: str
+
+class AcronymBulkUploadResponse(BaseModel):
+    received: int
+    created: int
+    updated: int
+    # Rows in this batch whose is_active was set to false. A SUBSET of
+    # created + updated, not a separate category — without it a batch that
+    # disables 30 acronyms is indistinguishable from one that edits them.
+    deactivated: int
+    # False means the rows committed but the cache could not be updated, so
+    # stale expansions may still be served until their TTL expires (up to
+    # REDIS_CACHE_TTL for a deactivated acronym). The upload itself succeeded;
+    # the fix is to clear the cache, not to re-upload.
+    cache_refreshed: bool = True
+    errors: List[AcronymUploadError]
+
+class AcronymItem(BaseModel):
+    acronym: str
+    expansions: List[str]
+    description: Optional[str] = None
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+class AcronymListResponse(BaseModel):
+    total: int = Field(..., description="Total rows matching the filters, independent of limit/offset")
+    limit: int
+    offset: int
+    items: List[AcronymItem]

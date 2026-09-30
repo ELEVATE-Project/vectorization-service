@@ -15,11 +15,8 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class Settings(BaseSettings):
     QDRANT_HOST: str = os.getenv("QDRANT_HOST", "127.0.0.1")
     QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", 6333))
-    # QA runs Qdrant server 1.12 while the client is pinned at 1.18 (required for BM25 sparse search).
-    # The 6-minor-version gap exceeds Qdrant's allowed ≤1 diff, causing a blanket UserWarning on every
-    # startup. Setting this to false suppresses that check. All operations the service uses have been
-    # verified to work on server 1.12 — the warning is a false alarm for our feature set.
-    # Set to true once QA server is upgraded to 1.18 to re-enable the check.
+    # QA runs Qdrant 1.12 with client 1.18 (needed for BM25); the version check only warns.
+    # All features used work on 1.12. Set true once QA is on 1.18.
     QDRANT_CHECK_COMPATIBILITY: bool = os.getenv("QDRANT_CHECK_COMPATIBILITY", "false").lower() == "true"
     COLLECTION_NAME: str = os.getenv("COLLECTION_NAME", "documents")
     QA_CACHE_COLLECTION: str = os.getenv("QA_CACHE_COLLECTION", "qa_cache")
@@ -42,11 +39,37 @@ class Settings(BaseSettings):
     MAX_CACHE_RESULTS: int = 1
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
+    # Commons uses db 0 on the shared Redis, so this service defaults to db 2.
+    REDIS_DB: int = int(os.getenv("REDIS_DB", 2))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+    # Small on purpose: redis-py has no default timeout, and a blackholed
+    # connection (packets silently dropped) would hang cache reads for minutes,
+    # stalling search instead of falling back to Postgres.
+    REDIS_SOCKET_CONNECT_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", 1))
+    REDIS_SOCKET_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_TIMEOUT", 1))
     REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", 86400))  # 24 hours in seconds
+    # Caches "not an acronym" so ordinary words skip Postgres; shorter than REDIS_CACHE_TTL.
+    # Uploads refresh their own keys, so this only bounds staleness in rare races.
+    REDIS_NEGATIVE_CACHE_TTL: int = int(os.getenv("REDIS_NEGATIVE_CACHE_TTL", 3600))  # 1 hour
+    # Shorter than REDIS_NEGATIVE_CACHE_TTL: this caches a DB-error miss, not a
+    # genuine "not an acronym" miss. DB outages are often transient — caching
+    # "not found" for a full hour would hide real acronyms after Postgres recovers.
+    REDIS_DB_ERROR_CACHE_TTL: int = int(os.getenv("REDIS_DB_ERROR_CACHE_TTL", 30))
     REDIS_MAX_CACHE_SIZE: int = int(os.getenv("REDIS_MAX_CACHE_SIZE", 1000))
     DATABASE_URL: str = os.getenv("POSTGRES_DATABASE_URI", "postgresql://anuj:1234@localhost:5432/ai_vector_service")
+    # Without a connect timeout, a blackholed Postgres host hangs for minutes.
+    # See release-doc/acronym-design-notes.md, Postgres timeouts.
+    POSTGRES_CONNECT_TIMEOUT: int = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", 3))
+    # Bounds each query on an open connection (a stuck server hung requests forever).
+    # All queries here are small indexed lookups, so 5s never fires when healthy.
+    POSTGRES_STATEMENT_TIMEOUT_MS: int = int(os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
     REDIS_CACHE_ENABLED: bool = False
+
+    # Shared secret for internal-only endpoints (e.g. acronym bulk upload), checked
+    # against the X-Internal-Token request header. No default — must be set explicitly.
+    INTERNAL_API_TOKEN: str = os.getenv("INTERNAL_API_TOKEN", "")
+    # some api endpoints are more sensitive than others (e.g. acronym bulk upload) — require a second, stricter shared secret for those. No default — must be set explicitly.
+    ADMIN_API_TOKEN: str = os.getenv("ADMIN_API_TOKEN", "")
 
     # URL extraction settings
     URL_EXTRACTION_CHUNK_SIZE: int = 1500
@@ -55,6 +78,9 @@ class Settings(BaseSettings):
 
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
+    # Acronym bulk-upload CSVs are small tabular text, not documents —
+    # a much lower cap than MAX_FILE_SIZE_MB.
+    ACRONYM_BULK_UPLOAD_MAX_SIZE_MB: int = int(os.getenv("ACRONYM_BULK_UPLOAD_MAX_SIZE_MB", 5))
 
 
     # Prioritized Search Configuration
@@ -88,50 +114,58 @@ class Settings(BaseSettings):
     SHORT_QUERY_THRESHOLD: int = int(os.getenv("SHORT_QUERY_THRESHOLD", "3"))
     RRF_K: int = int(os.getenv("RRF_K", "60"))  # standard Reciprocal Rank Fusion constant
 
+    # Minimum stem length for prefix-matching expansion words ("institute" ~ "institutes").
+    # Not an acronym length limit. See design notes, Settings.
+    ACRONYM_MIN_PREFIX_MATCH_LEN: int = int(os.getenv("ACRONYM_MIN_PREFIX_MATCH_LEN", "4"))
+
+    # Max extra characters in a prefix match: "tests" ~ "test", but not "testimony".
+    ACRONYM_PREFIX_SUFFIX_CAP: int = int(os.getenv("ACRONYM_PREFIX_SUFFIX_CAP", "3"))
+
+    # Dense variants per query, including the original: one per expansion meaning
+    # (SSC, DM, MIP have two). See design notes, Settings.
+    ACRONYM_MAX_DENSE_VARIANTS: int = int(os.getenv("ACRONYM_MAX_DENSE_VARIANTS", "3"))
+
+    # Acronym ranking: relevance = (1 - W) x query score + W x expansion score,
+    # final = relevance x (1 + bonus). W and bonuses: see design notes, Settings.
+    ACRONYM_EXPANSION_SCORE_WEIGHT: float = float(os.getenv("ACRONYM_EXPANSION_SCORE_WEIGHT", "0.5"))
+    ACRONYM_BONUS_TITLE_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_TITLE_ACRONYM", "0.40"))
+    ACRONYM_BONUS_TITLE_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_TITLE_EXPANSION", "0.30"))
+    ACRONYM_BONUS_SUMMARY_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_ACRONYM", "0.20"))
+    ACRONYM_BONUS_SUMMARY_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_EXPANSION", "0.10"))
+
+    # Cap on the bonus summed across several matched acronyms (1.6x max vs 1.4x for one).
+    ACRONYM_BONUS_MULTI_MATCH_CAP: float = float(os.getenv("ACRONYM_BONUS_MULTI_MATCH_CAP", "0.60"))
+
+    # Only the top N candidates are rescored by the blend (uncapped it tripled latency).
+    ACRONYM_RESCORE_POOL_LIMIT: int = int(os.getenv("ACRONYM_RESCORE_POOL_LIMIT", "200"))
+    # Longest multi-word acronym (in words) that detection finds and upload accepts.
+    ACRONYM_MAX_PHRASE_WORDS: int = int(os.getenv("ACRONYM_MAX_PHRASE_WORDS", "4"))
+    # Top BM25 chunks per document read when checking its body backs an acronym claim.
+    ACRONYM_BODY_CHECK_TOP_CHUNKS: int = int(os.getenv("ACRONYM_BODY_CHECK_TOP_CHUNKS", "3"))
+
+    # Master switch for acronym search; off gives exactly the pre-feature ranking.
+    ACRONYM_SEARCH_ENABLED: bool = os.getenv("ACRONYM_SEARCH_ENABLED", "true").lower() == "true"
+    # explicitly enable/disable caching of redis results (default true)
+    CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").lower() == "true"
+
     # Sparse Vector Configuration (Phase 2 — requires qdrant-client>=1.9.0)
     SPARSE_VECTOR_NAME: str = os.getenv("SPARSE_VECTOR_NAME", "bm25")
     SPARSE_SEARCH_ENABLED: bool = os.getenv("SPARSE_SEARCH_ENABLED", "false").lower() == "true"
 
-    # Hybrid score fusion weights. In hybrid mode the dense (cosine) and sparse
-    # (BM25) scores are each min-max normalized to [0, 1] across the candidate
-    # pool, then combined as: HYBRID_DENSE_WEIGHT * dense + HYBRID_SPARSE_WEIGHT * sparse.
-    # This yields a calibrated 0-1 weighted_score comparable to filter_score
-    # (raw RRF fused scores are ~0-0.1 and would never clear a cosine-scale
-    # threshold like 0.35, silently dropping every hybrid result).
+    # Hybrid fusion: dense and sparse scores are min-max normalized, then weighted,
+    # so weighted_score stays 0-1 and comparable to filter_score.
     HYBRID_DENSE_WEIGHT: float = float(os.getenv("HYBRID_DENSE_WEIGHT", "0.7"))
     HYBRID_SPARSE_WEIGHT: float = float(os.getenv("HYBRID_SPARSE_WEIGHT", "0.3"))
 
-    # Hybrid fusion method — how the dense and sparse modalities are combined into
-    # the final weighted_score that orders results. Selectable per deployment:
-    #   "weighted" (default): HYBRID_DENSE_WEIGHT * minmax(dense) +
-    #                         HYBRID_SPARSE_WEIGHT * minmax(sparse). Score-based.
-    #   "rrf": Reciprocal Rank Fusion over two lists — the combined dense list
-    #          (ranked by the weighted multi-field cosine sum) and the sparse list —
-    #          rrf = 1/(RRF_K+dense_rank) + 1/(RRF_K+sparse_rank), then min-max
-    #          normalized to [0, 1]. Rank-based; robust across retrievers.
-    # In BOTH modes the dense component remains the weighted multi-field cosine sum
-    # (SEARCH_PRIORITY_WEIGHTS) — only the dense+sparse fusion step differs.
+    # "weighted" (min-max score fusion) or "rrf" (rank fusion, min-max normalized).
+    # Only the dense+sparse step differs; the dense side is the same in both.
     HYBRID_FUSION_METHOD: str = os.getenv("HYBRID_FUSION_METHOD", "weighted").lower()
 
-    # Default for the per-request `include_scoring_debug` flag. When true, search
-    # responses surface the hybrid fusion breakdown (keyword_score, rrf_score,
-    # dense_rank, sparse_rank) on every result. A request may still override this
-    # per call by sending include_scoring_debug explicitly. Keep false in
-    # production (responses stay lean given the large default top_k).
+    # Default for include_scoring_debug (fusion breakdown per result); keep false in production.
     INCLUDE_SCORING_DEBUG: bool = os.getenv("INCLUDE_SCORING_DEBUG", "false").lower() == "true"
 
-    # Candidate pool sizing for multi-field search. Each dense named-vector search
-    # (title/text/tags/summary/metadata) and the sparse BM25 search retrieves up to
-    # `min(top_k * SEARCH_CANDIDATE_FANOUT, SEARCH_CANDIDATE_MAX)` candidates; the
-    # union is fused/ranked client-side. The CAP bounds HNSW `ef` — the dominant
-    # query cost — so a large top_k cannot trigger a 10k-deep traversal per field;
-    # the FANOUT gives small-top_k callers a re-ranking margin (retrieve more than
-    # you return). For top_k=1000 the CAP wins → 2000/field (was 10000).
-    #
-    # CAP also influences result `count`: the hybrid score is min-max normalized
-    # across the candidate pool, so a larger pool lets more docs clear filter_score.
-    # 2000 balances latency (~2x faster than the old 10000) against count fidelity.
-    # Raise toward 10000 for fuller counts, lower toward 500 for max speed.
+    # Candidates per field = min(top_k x FANOUT, MAX); MAX bounds HNSW ef, the main cost.
+    # A larger MAX lets more documents clear filter_score but is slower.
     SEARCH_CANDIDATE_FANOUT: int = int(os.getenv("SEARCH_CANDIDATE_FANOUT", "8"))
     SEARCH_CANDIDATE_MAX: int = int(os.getenv("SEARCH_CANDIDATE_MAX", "2000"))
 
