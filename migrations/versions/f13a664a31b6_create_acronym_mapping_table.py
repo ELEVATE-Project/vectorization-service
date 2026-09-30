@@ -111,9 +111,6 @@ def upgrade() -> None:
             'code', UUID(as_uuid=True), primary_key=True,
             server_default=sa.text('gen_random_uuid()'),
         ),
-        # Kept alongside `code` (not the PK) as a plain auto-incrementing identity
-        # column, still unique.
-        sa.Column('id', sa.BigInteger(), sa.Identity(always=False), nullable=False, unique=True),
         sa.Column('acronym', sa.String(length=32), nullable=False),
         sa.Column(
             'expansions', JSONB(), nullable=False, server_default=sa.text("'[]'::jsonb")
@@ -143,6 +140,10 @@ def upgrade() -> None:
             server_default=sa.text('now()'),
         ),
         sa.UniqueConstraint('acronym', name='uq_acronym'),
+        # JSONB alone also accepts {}, "text" or null; expansions must be a list.
+        sa.CheckConstraint(
+            "jsonb_typeof(expansions) = 'array'", name='ck_acronym_expansions_array'
+        ),
     )
     op.create_index(
         'idx_acronym_active', 'acronym_mapping', ['acronym', 'is_active']

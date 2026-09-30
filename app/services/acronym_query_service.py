@@ -3,24 +3,13 @@ from typing import Dict, List
 
 from spacy.lang.en.stop_words import STOP_WORDS
 
+from app.config import settings
+from app.constants import ACRONYM_NON_LETTER_PATTERN
 from app.services.acronym_service import get_expansions_batch
 
-# Letters only — strips internal dots ("D.I.E.T." -> "DIET"), digits, and any
-# surrounding punctuation in one pass. Known simplification: a token like
-# "PTM2024" also normalizes to "PTM", which isn't addressed by the spec.
-# Same simplification extends to phrases: "RTE2024 ACT" normalizes to the
-# "RTE ACT" candidate here (digits stripped per word before joining), but
-# _acronym_substitution_pattern's trailing-digits capture only ever attaches
-# digits to the FINAL word of a match, so it cannot bridge digits stuck to a
-# non-final word back into the same phrase — detected, but not substituted.
-# Digits after the whole phrase ("RTE ACT 2024", "RTE ACT2024") are unaffected.
-_NON_LETTER_RE = re.compile(r"[^A-Za-z]")
-
-# Longest multi-word entry on file is 4 tokens (e.g. "PADHE BHARAT BADHE
-# BHARAT"), so a phrase candidate never needs more than a 4-word window.
-# Covers 147/147 multi-word dictionary rows but one ("SCOUTS & GUIDES") —
-# its "&" normalizes to nothing (see below) and is never bridged.
-_MAX_PHRASE_WORDS = 4
+# Digits are stripped per word, so "RTE2024 ACT" is detected as "RTE ACT" but
+# not substituted (trailing digits only attach to the last word of a match).
+_NON_LETTER_RE = re.compile(ACRONYM_NON_LETTER_PATTERN)
 
 
 def _normalize_token(raw_token: str) -> str:
@@ -58,7 +47,7 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
     stores these as a single opaque key with a space in it — the cache and DB
     lookups never assumed a single word, only detection did. So alongside
     each single-token candidate, every contiguous run of 2..
-    _MAX_PHRASE_WORDS raw tokens is also normalized (per word) and joined
+    settings.ACRONYM_MAX_PHRASE_WORDS raw tokens is also normalized (per word) and joined
     into one space-separated phrase candidate. No stopword filtering is
     applied to phrases: unlike a bare word, a whole adjacent phrase is
     specific enough that the dictionary lookup itself is the filter — a
@@ -131,7 +120,7 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
     # under a phrase neither side of the gap actually forms.
     if len(raw_tokens) > 1:
         normalized_words = [_normalize_token(t) for t in raw_tokens]
-        max_window = min(_MAX_PHRASE_WORDS, len(raw_tokens))
+        max_window = min(settings.ACRONYM_MAX_PHRASE_WORDS, len(raw_tokens))
         for window in range(2, max_window + 1):
             for start in range(0, len(raw_tokens) - window + 1):
                 words = normalized_words[start:start + window]

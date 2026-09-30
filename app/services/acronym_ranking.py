@@ -21,20 +21,13 @@ from qdrant_client import models
 from spacy.lang.en.stop_words import STOP_WORDS
 
 from app.config import settings
+from app.constants import ACRONYM_USE_PREFIX, ACRONYM_USE_SUFFIX, WORD_TOKEN_PATTERN
 from app.core.clients.qdrant import qdrant_client
 
 logger = logging.getLogger(__name__)
 
-# Precompiled once: _expansion_content_words and _phrase_in_text run this
-# against every candidate's title and summary, so re-parsing the pattern per
-# call showed up.
-_WORD_RE = re.compile(r"[A-Za-z0-9]+")
-
-# Chunks per source whose text _sources_with_expansion_in_body reads. The chunk
-# that really contains the expansion ranks at or near the top on BM25 for its
-# words, but not always first (a chunk repeating "parent" can outrank the one
-# saying "Parent Teacher Meeting"), so a few rather than one.
-_EXPANSION_BODY_CHECK_CHUNKS = 3
+# Compiled once: runs against every candidate's title and summary.
+_WORD_RE = re.compile(WORD_TOKEN_PATTERN)
 
 
 @lru_cache(maxsize=1024)
@@ -51,7 +44,7 @@ def _acronym_use_pattern(acronym: str) -> "re.Pattern[str]":
     not to collide with ordinary text."""
     words = r"\s+".join(re.escape(w) for w in acronym.split())
     flags = re.IGNORECASE if " " in acronym.strip() else 0
-    return re.compile(rf"(?<![A-Za-z0-9]){words}[sS]?(?![A-Za-z])", flags)
+    return re.compile(f"{ACRONYM_USE_PREFIX}{words}{ACRONYM_USE_SUFFIX}", flags)
 
 
 class FieldMatchQuery(NamedTuple):
@@ -469,7 +462,7 @@ class AcronymRankingMixin:
                             key="source_id", match=models.MatchAny(any=sorted(sources)),
                         )]),
                         group_by="source_id",
-                        group_size=_EXPANSION_BODY_CHECK_CHUNKS,
+                        group_size=settings.ACRONYM_BODY_CHECK_TOP_CHUNKS,
                         limit=len(sources),
                         with_payload=["text"],
                     )
@@ -541,7 +534,7 @@ class AcronymRankingMixin:
         """Which of `sources` spell out one of `expansions` in their body.
 
         BM25 on the expansion's content words narrows each source to its few
-        best-matching chunks (_EXPANSION_BODY_CHECK_CHUNKS); those chunks' text
+        best-matching chunks (ACRONYM_BODY_CHECK_TOP_CHUNKS); those chunks' text
         then has to pass _phrase_in_text — the same all-content-words rule
         the expansion title/summary grades use. The BM25 hit alone is never
         enough: it matches any chunk containing "education" or "district", and
@@ -571,7 +564,7 @@ class AcronymRankingMixin:
                     key="source_id", match=models.MatchAny(any=sorted(remaining)),
                 )]),
                 group_by="source_id",
-                group_size=_EXPANSION_BODY_CHECK_CHUNKS,
+                group_size=settings.ACRONYM_BODY_CHECK_TOP_CHUNKS,
                 limit=len(remaining),
                 with_payload=["text"],
             )

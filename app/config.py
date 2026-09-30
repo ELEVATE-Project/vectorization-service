@@ -42,7 +42,8 @@ class Settings(BaseSettings):
     MAX_CACHE_RESULTS: int = 1
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
-    REDIS_DB: int = int(os.getenv("REDIS_DB", 0))
+    # Commons uses db 0 on the shared Redis, so this service defaults to db 2.
+    REDIS_DB: int = int(os.getenv("REDIS_DB", 2))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
     # Small on purpose: redis-py has no default timeout, and a blackholed
     # connection (packets silently dropped) would hang cache reads for minutes,
@@ -227,6 +228,10 @@ class Settings(BaseSettings):
     # results after blending; those are left at their retrieval score instead
     # of being rescored.
     ACRONYM_RESCORE_POOL_LIMIT: int = int(os.getenv("ACRONYM_RESCORE_POOL_LIMIT", "200"))
+    # Longest multi-word acronym (in words) that detection finds and upload accepts.
+    ACRONYM_MAX_PHRASE_WORDS: int = int(os.getenv("ACRONYM_MAX_PHRASE_WORDS", "4"))
+    # Top BM25 chunks per document read when checking its body backs an acronym claim.
+    ACRONYM_BODY_CHECK_TOP_CHUNKS: int = int(os.getenv("ACRONYM_BODY_CHECK_TOP_CHUNKS", "3"))
 
     # Acronym Search — on by default, matching .env.sample and the 2.1.0 release
     # note, which both already described it that way while the code still defaulted

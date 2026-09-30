@@ -15,6 +15,7 @@ from app.constants import (
     ACRONYM_CSV_COLUMN_DESCRIPTION,
     ACRONYM_CSV_COLUMN_EXPANSIONS,
     ACRONYM_CSV_COLUMN_IS_ACTIVE,
+    ACRONYM_KEY_WORD_PATTERN,
 )
 from app.core.clients import cache_client
 from app.core.database import SessionLocal
@@ -405,13 +406,11 @@ def _split_expansions(raw: str) -> List[str]:
 # of sync if the column length is ever changed there.
 _ACRONYM_MAX_LENGTH = AcronymMapping.__table__.c.acronym.type.length
 
-# Letters only, 1-4 space-separated words — matches exactly what
-# detect_acronyms() can ever actually find (single tokens and the up-to-4-word
-# phrase windows in acronym_query_service.py). Anything outside this shape
-# (symbols like "WI-FI", digits like "4G", a stray "/" or "-") can never be
-# detected, so bulk_upsert rejects it up front instead of silently accepting
-# a row that will sit in the table forever unreachable.
-_ACRONYM_KEY_RE = re.compile(r"^[A-Z]+(?: [A-Z]+){0,3}$")
+# Letters only, up to ACRONYM_MAX_PHRASE_WORDS words: the only shape detection can
+# find, so anything else ("WI-FI", "4G") is rejected at upload.
+_ACRONYM_KEY_RE = re.compile(
+    rf"^{ACRONYM_KEY_WORD_PATTERN}(?: {ACRONYM_KEY_WORD_PATTERN}){{0,{settings.ACRONYM_MAX_PHRASE_WORDS - 1}}}$"
+)
 
 
 def _is_valid_acronym_key(acronym: str) -> bool:
