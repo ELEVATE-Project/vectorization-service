@@ -223,6 +223,26 @@ def invalidate_cache(acronyms: List[str]) -> bool:
         return False
 
 
+# See mark_deactivated_in_cache: must outlast an in-flight lookup, and nothing
+# more.
+_DEACTIVATION_MARKER_TTL = 30
+
+
+def _active_acronyms(acronyms: List[str]) -> set:
+    """Which of `acronyms` are active in Postgres right now. Raises on a DB
+    error; the caller decides what that means."""
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(AcronymMapping.acronym)
+            .filter(AcronymMapping.acronym.in_(acronyms), AcronymMapping.is_active.is_(True))
+            .all()
+        )
+        return {row.acronym for row in rows}
+    finally:
+        db.close()
+
+
 def mark_deactivated_in_cache(acronyms: List[str]) -> bool:
     """Cache a "not an acronym" (`null`) entry for each just-deactivated
     acronym, instead of deleting its key.
@@ -231,18 +251,37 @@ def mark_deactivated_in_cache(acronyms: List[str]) -> bool:
     from Postgres just before the upload committed could then write it back —
     get_expansions_batch's write-back only fills ABSENT keys, so it restored the
     deactivated acronym for the full 24h TTL. A present `null` closes that gap:
-    the late write-back sees the key taken and leaves it alone. The marker uses
-    the negative TTL; once it expires, Postgres (where the row is inactive)
-    answers again.
+    the late write-back sees the key taken and leaves it alone.
+
+    A marker is also a claim that blocks Postgres, so it must not outlive the
+    commit that justified it. A second upload can reactivate the acronym and
+    refresh its value before this one's cache step runs; blindly writing `null`
+    then hid an active acronym. So Postgres is re-read first and only acronyms
+    that are STILL inactive are marked — the same read-fresh-then-write
+    refresh_cache does. For the small window left between that read and the
+    write, the marker lives only _DEACTIVATION_MARKER_TTL: long enough to
+    outlast any lookup already in flight (milliseconds), short enough that a
+    lost race hides a reactivated acronym for seconds, not an hour. If the
+    re-read fails, fall back to deleting the keys — a delete heals itself on
+    the next lookup, a wrong marker would not.
 
     Same error contract as invalidate_cache: Redis errors are logged and
     swallowed, and the return value says whether the cache is consistent with
     the database afterwards."""
     if not acronyms or not settings.CACHE_ENABLED:
         return True
+    normalized = list(dict.fromkeys(a.strip().upper() for a in acronyms))
+    try:
+        still_active = _active_acronyms(normalized)
+    except Exception as e:
+        logger.warning(
+            f"Acronym deactivation re-check failed for {len(normalized)} acronym(s), "
+            f"invalidating instead: {e}"
+        )
+        return invalidate_cache(normalized)
     writes = {
-        _cache_key(a.strip().upper()): (json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL)
-        for a in acronyms
+        _cache_key(a): (json.dumps(None), _DEACTIVATION_MARKER_TTL)
+        for a in normalized if a not in still_active
     }
     try:
         cache_client.set_many(writes)
