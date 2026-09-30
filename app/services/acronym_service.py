@@ -29,27 +29,17 @@ def _cache_key(acronym: str) -> str:
 
 
 def _valid_expansions(expansions) -> bool:
-    """A DB/cache expansions value must be a non-empty list of non-empty
-    strings. Guards against a malformed row (null, wrong type, empty
-    strings) written outside bulk_upsert's validation — e.g. raw SQL —
-    from being cached and crashing the acronym query-building code in
-    prioritized_search_service.search() downstream."""
+    """True for a non-empty list of non-empty strings, the only usable expansions value."""
     return isinstance(expansions, list) and bool(expansions) and all(
         isinstance(e, str) and e.strip() for e in expansions
     )
 
 
 def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
-    """Cache-aside lookup for a list of acronyms in one call — Redis hits
-    return immediately, misses fall back to Postgres and write through to
-    the cache.
+    """Cache-aside lookup for many acronyms at once: one Redis read, Postgres for misses.
 
-    Batched, not one round-trip per acronym: detect_acronyms() calls this
-    once per query with every candidate token, which also collapses N
-    independent connection-timeout exposures into one on a Redis outage.
-
-    Input is deduped internally; acronyms not found (or empty) are simply
-    absent from the returned dict."""
+    Input is deduped; acronyms not found are absent from the result. See design notes, Cache.
+    """
     normalized = list(dict.fromkeys(a.strip().upper() for a in acronyms if a and a.strip()))
     if not normalized:
         return {}
@@ -69,20 +59,14 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
 
     result: Dict[str, List[str]] = {}
     missing: List[str] = []
-    # Keys that HOLD a value we couldn't use (unparseable or malformed). They
-    # are not absent, so the if-absent write-back below would never replace
-    # them; they get a plain overwrite instead.
+    # Keys holding an unusable value: overwritten below, since SET NX would keep them.
     broken: set = set()
     for acronym, cached in zip(normalized, cached_values):
         if cached is None:
             missing.append(acronym)
             continue
 
-        # Parse inside its own guard: the try above covers only the Redis READ,
-        # so an unparseable value used to raise JSONDecodeError straight out of
-        # search() as a 500 on an ordinary query. A cache entry is never worth
-        # failing a request over — treat a bad one exactly like a cache miss and
-        # let Postgres, the source of truth, answer instead.
+        # An unparseable value is a miss, not a 500; Postgres answers instead.
         try:
             decoded = json.loads(cached)
         except (ValueError, TypeError) as e:
@@ -94,17 +78,12 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
             broken.add(acronym)
             continue
 
-        # None is the NEGATIVE cache entry ("looked this up, it isn't an
-        # acronym"). Skipped WITHOUT going into `missing` — routing it to
-        # Postgres would defeat the negative cache and re-query every ordinary
-        # English word on every request.
+        # Cached null = "not an acronym": skip it, don't send it to Postgres.
         if decoded is None:
             continue
 
-        # The same shape check the DB rows already get. Without it a cached bare
-        # string survives as-is and expansions[0] downstream yields its first
-        # CHARACTER, silently searching for "D" instead of the expansion; a
-        # cached dict or list-of-ints fails later as a RuntimeError instead.
+        # Same shape check as DB rows: a cached bare string would make
+        # expansions[0] its first character.
         if not _valid_expansions(decoded):
             logger.warning(
                 f"Acronym {acronym!r} has a malformed cached value "
@@ -127,21 +106,16 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
             .all()
         )
     except Exception as e:
-        # A Postgres outage (or the acronym table not existing yet) must
-        # degrade to "not found" rather than propagating — search never
-        # depended on Postgres before this feature. Negative-cache with the
-        # short DB-error TTL so a Postgres outage doesn't get re-attempted
-        # on every request for its full duration.
+        # A Postgres outage degrades to "not found", cached briefly so it isn't
+        # retried on every request.
         logger.warning(
             f"Acronym batch DB lookup failed for {len(missing)} acronym(s), "
             f"treating as not found: {e}"
         )
         if settings.CACHE_ENABLED:
             try:
-                # if-absent for the same reason as the normal write-back below:
-                # this is an absence we inferred from a FAILED lookup, which is
-                # even weaker evidence than a successful "not found", so it must
-                # never overwrite a real value someone else cached.
+                # SET NX: an absence inferred from a failed lookup must not
+                # overwrite a real cached value.
                 cache_client.set_many_if_absent({
                     _cache_key(a): (json.dumps(None), settings.REDIS_DB_ERROR_CACHE_TTL)
                     for a in missing
@@ -161,18 +135,8 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
                 f"Acronym {mapping.acronym!r} has malformed expansions in DB "
                 f"({mapping.expansions!r}), treating as not found"
             )
-    # Everything we write here — found AND not-found — is only as fresh as the
-    # moment we queried, and a bulk upload can commit and update the cache in
-    # between. An unconditional write-back then undid the upload: a NOT-FOUND
-    # buried a freshly uploaded acronym under `null` for the negative TTL, and a
-    # FOUND restored an old expansion (or a just-deactivated acronym) for the
-    # full 24h TTL. So both go through SET..NX, which makes the "is it still
-    # absent" check and the write one atomic step inside Redis: whatever the
-    # upload wrote — a new value, or the `null` marker mark_deactivated_in_cache
-    # leaves for a deactivated acronym — wins. We only reach this point for keys
-    # that were absent when we read them, so in the normal case NX changes
-    # nothing. The exception is a `broken` key: it holds an unusable value, NX
-    # would keep it forever, so it is overwritten instead.
+    # SET NX so an upload that committed after our read wins; broken keys are
+    # overwritten. See release-doc/acronym-design-notes.md, Cache.
     if_absent_writes: Dict[str, Tuple[str, int]] = {}
     overwrite_writes: Dict[str, Tuple[str, int]] = {}
     for acronym in missing:
@@ -198,21 +162,10 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
 
 
 def invalidate_cache(acronyms: List[str]) -> bool:
-    """Drop cached entries for the given acronyms in one batched round-trip.
-    Call after any write to those rows so stale expansions aren't served
-    until TTL expiry.
+    """Delete the cached entries for `acronyms` in one round-trip.
 
-    Swallows Redis errors (logged) rather than raising — this is already the
-    degraded-mode fallback when the cache is having problems (e.g. the bulk
-    upload endpoint calls this when refresh_cache() itself failed), so letting
-    it raise would turn an already-committed, successful write into a 500.
-
-    Returns True when the cache is consistent with the database afterwards
-    (including the nothing-to-do and cache-disabled cases), False when the
-    delete failed and stale entries may still be served for up to
-    REDIS_CACHE_TTL. Swallowing the error is right; staying SILENT about it was
-    not — a bulk upload that deactivated 30 acronyms returned 200 with no hint
-    that all 30 were still live in search for the next 24 hours."""
+    Swallows Redis errors; returns False if stale entries may still be served.
+    """
     if not acronyms or not settings.CACHE_ENABLED:
         return True
     keys = [_cache_key(a.strip().upper()) for a in acronyms]
@@ -245,30 +198,11 @@ def _active_acronyms(acronyms: List[str]) -> set:
 
 
 def mark_deactivated_in_cache(acronyms: List[str]) -> bool:
-    """Cache a "not an acronym" (`null`) entry for each just-deactivated
-    acronym, instead of deleting its key.
+    """Write a short-lived "not an acronym" marker for acronyms Postgres shows inactive.
 
-    Deleting left the key absent, and a lookup that had read the old active row
-    from Postgres just before the upload committed could then write it back —
-    get_expansions_batch's write-back only fills ABSENT keys, so it restored the
-    deactivated acronym for the full 24h TTL. A present `null` closes that gap:
-    the late write-back sees the key taken and leaves it alone.
-
-    A marker is also a claim that blocks Postgres, so it must not outlive the
-    commit that justified it. A second upload can reactivate the acronym and
-    refresh its value before this one's cache step runs; blindly writing `null`
-    then hid an active acronym. So Postgres is re-read first and only acronyms
-    that are STILL inactive are marked — the same read-fresh-then-write
-    refresh_cache does. For the small window left between that read and the
-    write, the marker lives only _DEACTIVATION_MARKER_TTL: long enough to
-    outlast any lookup already in flight (milliseconds), short enough that a
-    lost race hides a reactivated acronym for seconds, not an hour. If the
-    re-read fails, fall back to deleting the keys — a delete heals itself on
-    the next lookup, a wrong marker would not.
-
-    Same error contract as invalidate_cache: Redis errors are logged and
-    swallowed, and the return value says whether the cache is consistent with
-    the database afterwards."""
+    Blocks a late lookup from restoring them; deletes the keys if the re-read fails.
+    Returns False on a Redis error. See design notes, Cache.
+    """
     if not acronyms or not settings.CACHE_ENABLED:
         return True
     normalized = list(dict.fromkeys(a.strip().upper() for a in acronyms))
@@ -293,12 +227,10 @@ def mark_deactivated_in_cache(acronyms: List[str]) -> bool:
 
 
 def refresh_cache(acronyms: List[str]) -> None:
-    """Re-cache expansions for exactly the given acronyms (e.g. after a bulk
-    upload), instead of re-warming the entire cache via load_acronym_cache().
+    """Re-cache the given active acronyms in one pipelined write (after a bulk upload).
 
-    Deliberately synchronous, same reasoning as load_acronym_cache() —
-    callers must run this via run_in_threadpool rather than awaiting it
-    directly."""
+    Blocking: call via run_in_threadpool. Raises on Redis errors; the caller handles them.
+    """
     if not acronyms or not settings.CACHE_ENABLED:
         return
 
@@ -312,9 +244,7 @@ def refresh_cache(acronyms: List[str]) -> None:
     finally:
         db.close()
 
-    # Collect first, write once. One pipelined round-trip instead of one SETEX
-    # per acronym — the same batching the read side (get_expansions_batch) has
-    # always used. A 500-row upload was 500 sequential round-trips.
+    # One pipelined write instead of one round-trip per acronym.
     writes: Dict[str, Tuple[str, int]] = {}
     for mapping in mappings:
         if not _valid_expansions(mapping.expansions):
@@ -327,21 +257,15 @@ def refresh_cache(acronyms: List[str]) -> None:
             json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL
         )
 
-    # Deliberately NOT wrapped: the bulk-upload caller catches a refresh failure
-    # and invalidates the whole batch instead, so swallowing it here would hide
-    # the failure and leave stale expansions cached.
+    # Not wrapped on purpose: the upload endpoint handles a refresh failure.
     cache_client.set_many(writes)
 
 
 def load_acronym_cache() -> int:
-    """Pre-populate the cache-aside store with every active acronym at
-    startup, so first-touch queries after boot are already cache hits.
-    Not a substitute for get_expansions_batch()'s DB fallback — acronyms
-    added after startup, or evicted via TTL, are still served by that path.
+    """Warm the cache with every active acronym at startup, in one pipelined write.
 
-    Deliberately synchronous — every call inside is blocking, so async
-    callers must run this via run_in_threadpool or the ~600 sequential
-    Redis round-trips stall the whole event loop."""
+    Blocking: call via run_in_threadpool. Returns the count, or 0 if the warm-up failed.
+    """
     if not settings.CACHE_ENABLED:
         logger.info("Acronym cache warm-up skipped (CACHE_ENABLED=false)")
         return 0
@@ -364,13 +288,8 @@ def load_acronym_cache() -> int:
             json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL
         )
 
-    # One pipelined round-trip rather than ~550 sequential ones at boot. The
-    # per-acronym try/except this replaces could only ever have salvaged a
-    # partial warm-up from a mid-flight Redis failure; a pipeline rides one
-    # connection either way, so the batch is all-or-nothing. The failure is
-    # logged and swallowed because a cold cache must never stop the service
-    # booting — get_expansions_batch still falls back to Postgres per query,
-    # so a cold cache costs latency on first touch, not correctness.
+    # One pipelined write, all or nothing. A failure must not stop the boot: a cold
+    # cache only costs latency, since lookups fall back to Postgres.
     try:
         cache_client.set_many(writes)
     except Exception as e:
@@ -385,13 +304,10 @@ def load_acronym_cache() -> int:
 
 
 def _split_expansions(raw: str) -> List[str]:
-    """Pipe-separated -> deduped list, order preserved (spec §5/§7).
+    """Pipe-separated text to a deduped list, order kept.
 
-    Deliberately duplicated from the identical helper in migration
-    f13a664a31b6 rather than imported: Alembic migrations must stay
-    self-contained snapshots, frozen at the point they were written, so a
-    future change to this live-app helper can never silently alter what an
-    already-applied historical migration does on re-run."""
+    Duplicated in migration f13a664a31b6 on purpose: migrations stay frozen snapshots.
+    """
     seen = set()
     result = []
     for part in raw.split("|"):
@@ -417,24 +333,18 @@ def _is_valid_acronym_key(acronym: str) -> bool:
     if not _ACRONYM_KEY_RE.match(acronym):
         return False
     words = acronym.split(" ")
-    # A single-letter WHOLE key ("A") can never be a candidate on its own —
-    # detect_acronyms drops any token under 2 letters. A single-letter word
-    # INSIDE a phrase is fine ("RBI GRADE B" is a real, working entry): the
-    # phrase-window path only requires each word to be non-empty.
+    # Detection skips single letters, so "A" alone can never match; a one-letter
+    # word inside a phrase ("RBI GRADE B") is fine.
     if len(words) == 1 and len(words[0]) < 2:
         return False
     return True
 
 
 def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List[dict]]:
-    """Validate and upsert a batch of CSV rows (spec §7) in a single
-    transaction. A row missing acronym/expansions, or an in-batch duplicate
-    (Postgres' ON CONFLICT can't affect the same row twice), is recorded as
-    an error and skipped rather than aborting the batch — last occurrence
-    wins. Does not touch the cache — the caller owns refresh-vs-invalidate.
-    Returns (created_acronyms, updated_acronyms, deactivated_acronyms, errors).
-    deactivated_acronyms is a subset of created+updated (whichever rows had
-    is_active=false in this batch), not a separate category.
+    """Validate and upsert CSV rows in one transaction; bad rows become errors, the rest commit.
+
+    Returns (created, updated, deactivated, errors); deactivated is a subset of created + updated.
+    Does not touch the cache. See design notes, Bulk upload.
     """
     errors: List[dict] = []
     valid_by_acronym: dict = {}
@@ -466,9 +376,7 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
             })
             continue
 
-        # Optional column — missing/empty defaults to active (backward-compatible
-        # with every CSV that predates this column). Only "true"/"false" are
-        # accepted; anything else is a per-row error rather than a silent guess.
+        # Optional: missing means active; anything but true/false is a row error.
         if not status:
             is_active = True
         elif status == "true":
@@ -484,10 +392,7 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
             continue
 
         if len(acronym) > _ACRONYM_MAX_LENGTH:
-            # Must be caught here, before the batch insert: an over-length
-            # value reaching Postgres raises StringDataRightTruncation on the
-            # single multi-row INSERT, which fails the ENTIRE batch (including
-            # every otherwise-valid row) rather than just this one row.
+            # Reject here: an over-length value would fail the whole multi-row INSERT.
             errors.append({
                 "index": index,
                 "acronym": acronym,
@@ -526,9 +431,7 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
 
     db = SessionLocal()
     try:
-        # Determine create vs. update (spec §7 counts them separately) before
-        # the upsert — ON CONFLICT itself doesn't tell us which branch fired
-        # per row.
+        # Decide create vs update first: ON CONFLICT doesn't report which ran.
         existing = {
             row.acronym
             for row in db.query(AcronymMapping.acronym)
@@ -577,20 +480,9 @@ def list_acronyms(
     limit: int = 50,
     offset: int = 0,
 ) -> Tuple[List[AcronymMapping], int]:
-    """Read path for GET /api/acronyms (AC-16: there was no way to inspect
-    the dictionary via the API at all, active or not). Queries Postgres
-    directly rather than the Redis cache, which only ever holds active rows
-    and was never meant to support listing/pagination — this is an
-    admin/inspection endpoint, not the search hot path, so a plain query per
-    call is fine.
+    """Rows for GET /api/acronyms from Postgres (the cache holds only active rows).
 
-    prefix: case-insensitive match against the START of the acronym key, so
-    "RTE" matches both "RTE" and "RTE ACT". is_active=None (the default)
-    returns both active and inactive rows on purpose — omitting inactive
-    rows entirely was the original gap.
-
-    Returns (rows, total) — total is the full match count ignoring
-    limit/offset, for the caller to build pagination from.
+    `prefix` matches the start of the key; is_active=None returns all. Returns (rows, total).
     """
     db = SessionLocal()
     try:
