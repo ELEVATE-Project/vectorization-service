@@ -68,6 +68,10 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
 
     result: Dict[str, List[str]] = {}
     missing: List[str] = []
+    # Keys that HOLD a value we couldn't use (unparseable or malformed). They
+    # are not absent, so the if-absent write-back below would never replace
+    # them; they get a plain overwrite instead.
+    broken: set = set()
     for acronym, cached in zip(normalized, cached_values):
         if cached is None:
             missing.append(acronym)
@@ -86,6 +90,7 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
                 f"falling back to Postgres: {e}"
             )
             missing.append(acronym)
+            broken.add(acronym)
             continue
 
         # None is the NEGATIVE cache entry ("looked this up, it isn't an
@@ -105,6 +110,7 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
                 f"({decoded!r}), falling back to Postgres"
             )
             missing.append(acronym)
+            broken.add(acronym)
             continue
 
         result[acronym] = decoded
@@ -154,36 +160,37 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
                 f"Acronym {mapping.acronym!r} has malformed expansions in DB "
                 f"({mapping.expansions!r}), treating as not found"
             )
-    # Split by what we actually learned, because the two need different write
-    # rules. A FOUND value came from Postgres, the source of truth, so writing
-    # it unconditionally is safe. A NOT-FOUND is only an absence, and an absence
-    # can be filled in while we were querying: a bulk upload committing in that
-    # window calls refresh_cache and writes the real value, and an unconditional
-    # write-back then buried it under `null` for the whole negative TTL — an hour
-    # in which a freshly uploaded acronym was in the database but invisible to
-    # search. Negative entries therefore go through SET..NX, which makes the
-    # "is it still absent" check and the write one atomic step inside Redis.
-    found_writes: Dict[str, Tuple[str, int]] = {}
-    absent_writes: Dict[str, Tuple[str, int]] = {}
+    # Everything we write here — found AND not-found — is only as fresh as the
+    # moment we queried, and a bulk upload can commit and update the cache in
+    # between. An unconditional write-back then undid the upload: a NOT-FOUND
+    # buried a freshly uploaded acronym under `null` for the negative TTL, and a
+    # FOUND restored an old expansion (or a just-deactivated acronym) for the
+    # full 24h TTL. So both go through SET..NX, which makes the "is it still
+    # absent" check and the write one atomic step inside Redis: whatever the
+    # upload wrote — a new value, or the `null` marker mark_deactivated_in_cache
+    # leaves for a deactivated acronym — wins. We only reach this point for keys
+    # that were absent when we read them, so in the normal case NX changes
+    # nothing. The exception is a `broken` key: it holds an unusable value, NX
+    # would keep it forever, so it is overwritten instead.
+    if_absent_writes: Dict[str, Tuple[str, int]] = {}
+    overwrite_writes: Dict[str, Tuple[str, int]] = {}
     for acronym in missing:
         if acronym in found_by_acronym:
             result[acronym] = found_by_acronym[acronym]
-            found_writes[_cache_key(acronym)] = (
-                json.dumps(found_by_acronym[acronym]), settings.REDIS_CACHE_TTL
-            )
+            entry = (json.dumps(found_by_acronym[acronym]), settings.REDIS_CACHE_TTL)
         else:
-            absent_writes[_cache_key(acronym)] = (
-                json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL
-            )
+            entry = (json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL)
+        target = overwrite_writes if acronym in broken else if_absent_writes
+        target[_cache_key(acronym)] = entry
 
     if settings.CACHE_ENABLED:
         try:
-            cache_client.set_many(found_writes)
-            cache_client.set_many_if_absent(absent_writes)
+            cache_client.set_many_if_absent(if_absent_writes)
+            cache_client.set_many(overwrite_writes)
         except Exception as e:
             logger.warning(
                 "Acronym batch cache write-through failed for "
-                f"{len(found_writes) + len(absent_writes)} acronym(s): {e}"
+                f"{len(if_absent_writes) + len(overwrite_writes)} acronym(s): {e}"
             )
 
     return result
@@ -213,6 +220,35 @@ def invalidate_cache(acronyms: List[str]) -> bool:
         return True
     except Exception as e:
         logger.warning(f"Acronym cache invalidation failed for {len(keys)} key(s): {e}")
+        return False
+
+
+def mark_deactivated_in_cache(acronyms: List[str]) -> bool:
+    """Cache a "not an acronym" (`null`) entry for each just-deactivated
+    acronym, instead of deleting its key.
+
+    Deleting left the key absent, and a lookup that had read the old active row
+    from Postgres just before the upload committed could then write it back —
+    get_expansions_batch's write-back only fills ABSENT keys, so it restored the
+    deactivated acronym for the full 24h TTL. A present `null` closes that gap:
+    the late write-back sees the key taken and leaves it alone. The marker uses
+    the negative TTL; once it expires, Postgres (where the row is inactive)
+    answers again.
+
+    Same error contract as invalidate_cache: Redis errors are logged and
+    swallowed, and the return value says whether the cache is consistent with
+    the database afterwards."""
+    if not acronyms or not settings.CACHE_ENABLED:
+        return True
+    writes = {
+        _cache_key(a.strip().upper()): (json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL)
+        for a in acronyms
+    }
+    try:
+        cache_client.set_many(writes)
+        return True
+    except Exception as e:
+        logger.warning(f"Acronym cache deactivation marker failed for {len(writes)} key(s): {e}")
         return False
 
 

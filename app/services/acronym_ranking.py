@@ -37,6 +37,16 @@ _WORD_RE = re.compile(r"[A-Za-z0-9]+")
 _EXPANSION_BODY_CHECK_CHUNKS = 3
 
 
+@lru_cache(maxsize=1024)
+def _acronym_use_pattern(acronym: str) -> "re.Pattern[str]":
+    """Case-SENSITIVE whole-word pattern for an acronym as it is written when
+    it IS the acronym: "DIET", "DIETs"/"DIETS", "PTM2024", "RTE  Act" words
+    joined by any whitespace. Lowercase "diet" does not match — that is the
+    everyday word, not the District Institute of Education and Training."""
+    words = r"\s+".join(re.escape(w) for w in acronym.split())
+    return re.compile(rf"(?<![A-Za-z0-9]){words}[sS]?(?![A-Za-z])")
+
+
 class FieldMatchQuery(NamedTuple):
     """One title/summary check to run, and how strictly to run it.
 
@@ -437,6 +447,13 @@ class AcronymRankingMixin:
                 found: Set[str] = set()
                 indices, values = generate_sparse_vector(acronym)
                 if indices:
+                    # BM25 folds case, so a hit alone can't tell "DIET" from
+                    # the everyday word "diet": a food article titled "DIET
+                    # Handbook" passed. It only narrows each source to its best
+                    # few chunks; one of them must then USE the acronym, written
+                    # in capitals (_acronym_use_pattern) — the same
+                    # narrow-then-verify shape _sources_with_expansion_in_body
+                    # uses for the expansion.
                     response = qdrant_client.query_points_groups(
                         collection_name=self.collection_name,
                         query=models.SparseVector(indices=indices, values=values),
@@ -445,11 +462,18 @@ class AcronymRankingMixin:
                             key="source_id", match=models.MatchAny(any=sorted(sources)),
                         )]),
                         group_by="source_id",
-                        group_size=1,
+                        group_size=_EXPANSION_BODY_CHECK_CHUNKS,
                         limit=len(sources),
-                        with_payload=False,
+                        with_payload=["text"],
                     )
-                    found = {str(group.id) for group in response.groups}
+                    pattern = _acronym_use_pattern(acronym)
+                    found = {
+                        str(group.id) for group in response.groups
+                        if any(
+                            pattern.search((hit.payload or {}).get("text") or "")
+                            for hit in group.hits
+                        )
+                    }
                 # Only the sources the bare acronym didn't already back, so the
                 # common case (acronym in the body) costs no extra query.
                 unbacked = sources - found
