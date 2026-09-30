@@ -281,6 +281,23 @@ class SearchResultItem(BaseModel):
                     "off and when the document was never actually measured (a genuinely "
                     "new keyword match, or a normal non-injected result)."
     )
+    relevance: Optional[float] = Field(
+        default=None,
+        description="Acronym queries only (debug): the score before the acronym bonus, "
+                    "so score = relevance x (1 + acronym_bonus). None otherwise."
+    )
+    acronym_grades: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description="Acronym queries only (debug): the bonus grade each detected acronym "
+                    "earned: title_acronym, title_expansion, summary_acronym, "
+                    "summary_expansion, or null for none."
+    )
+    body_backed: Optional[Dict[str, Optional[str]]] = Field(
+        default=None,
+        description="Acronym queries only (debug): how the document's body backs each "
+                    "acronym: acronym (used in capitals), expansion (spelled out), "
+                    "dense_fallback (BM25 unavailable), or null (not backed)."
+    )
     title_match: Optional[str] = Field(
         default=None,
         description="Title match type: 'exact', 'partial', or None if no title match"

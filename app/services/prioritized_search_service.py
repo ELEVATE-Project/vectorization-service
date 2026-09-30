@@ -127,7 +127,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
             ranked_results.sort(key=lambda r: r['weighted_score'], reverse=True)
 
         if acronyms_detected:
-            self._assign_acronym_bonuses(ranked_results, acronyms_detected)
+            body_check = self._assign_acronym_bonuses(ranked_results, acronyms_detected)
+            if scoring_context_out is not None:
+                scoring_context_out["acronym_body_check"] = body_check
             # Kept separately from weighted_score, which becomes the bonused
             # final score below: the threshold and any re-injection must read the
             # real relevance, never a score that already carries the bonus.
@@ -247,6 +249,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     acronym_bonus=result_data.get('acronym_bonus') if include_scoring_debug else None,
                     # Real relevance of a re-injected document; None if never measured.
                     measured_relevance=result_data.get('measured_relevance') if include_scoring_debug else None,
+                    # Acronym queries only: why this document got its bonus.
+                    relevance=result_data.get('relevance') if include_scoring_debug else None,
+                    acronym_grades=result_data.get('acronym_grades') if include_scoring_debug else None,
+                    body_backed=result_data.get('body_backed') if include_scoring_debug else None,
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")
@@ -519,6 +525,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
             # ACRONYM_EXPANSION_SCORE_WEIGHT (see _blended_acronym_relevance). Only meaningful when an expansion
             # variant was built; a query that already spelled it out has one text.
             relevance_override = None
+            # What the rescore did, for scoring_context.acronym_ranking (debug only).
+            rescore_info: Optional[Dict[str, Any]] = None
             if soft_acronym_ranking and len(dense_query_texts) > 1:
                 pool_ids = list(all_results.keys())
                 # Rescore only the top ACRONYM_RESCORE_POOL_LIMIT, normalized to the full pool's
@@ -547,6 +555,20 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     expansion_embedding=query_embeddings[1],
                     normalization_reference=normalization_reference,
                 )
+                if normalization_reference is not None:
+                    normalization = "full_pool"
+                elif settings.HYBRID_FUSION_METHOD == "rrf":
+                    normalization = "rrf_full_pool"
+                else:
+                    normalization = "self"
+                rescore_info = {
+                    "applied": relevance_override is not None,
+                    "candidate_pool": len(all_results),
+                    "rescored": len(pool_ids),
+                    "limit": settings.ACRONYM_RESCORE_POOL_LIMIT,
+                    "capped": len(pool_ids) < len(all_results),
+                    "normalization": normalization,
+                }
 
             top_results, unique_source_results = self._process_and_filter_results(
                 all_results, field_scores, weights, search_fields, top_k,
@@ -703,17 +725,20 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 }
 
             # Gated by include_scoring_debug to keep prod responses lean. _rank_results
-            # has already filled scoring_context; add just the boost multipliers.
+            # has already filled scoring_context; add the boosts and acronym ranking.
+            body_check = scoring_context.pop("acronym_body_check", "none")
             if request.include_scoring_debug:
                 # Never default dense_weight/sparse_weight from settings: _rank_results
                 # writes them only where weighted fusion ran, so their absence is the
                 # signal that it didn't (dense-only, empty-BM25, RRF).
-                scoring_context["boost_config"] = {
-                    "exact_title_boost": settings.EXACT_TITLE_BOOST,
-                    "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
-                    "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,
-                    "partial_summary_boost": settings.PARTIAL_SUMMARY_BOOST,
-                }
+                scoring_context["boost_config"] = self._boost_config(
+                    lexical_ranking_enabled, soft_acronym_ranking
+                )
+                if acronyms_detected:
+                    scoring_context["acronym_ranking"] = self._acronym_ranking_context(
+                        soft_acronym_ranking, search_mode, len(dense_query_texts),
+                        rescore_info, body_check,
+                    )
                 search_config["scoring_context"] = scoring_context
 
             # total_results = all unique matched sources (semantic pool ∪ injected boost docs),
@@ -1684,6 +1709,29 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 if match_type == "partial" and source_id not in matches:
                     matches[source_id] = "partial"
 
+    @staticmethod
+    def _boost_config(lexical_ranking_enabled: bool, soft_acronym_ranking: bool) -> Dict[str, Any]:
+        """The title/summary multipliers actually applied, and why ("mode").
+
+        Acronym queries use the acronym bonus instead, so their multipliers are 1.0.
+        """
+        if not lexical_ranking_enabled or soft_acronym_ranking:
+            mode = "acronym_bonus" if soft_acronym_ranking else "off"
+            return {
+                "mode": mode,
+                "exact_title_boost": 1.0,
+                "partial_title_boost": 1.0,
+                "exact_summary_boost": 1.0,
+                "partial_summary_boost": 1.0,
+            }
+        return {
+            "mode": "title_summary_boost",
+            "exact_title_boost": settings.EXACT_TITLE_BOOST,
+            "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
+            "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,
+            "partial_summary_boost": settings.PARTIAL_SUMMARY_BOOST,
+        }
+
     def _apply_field_boost(
         self,
         ranked_results: List[Dict[str, Any]],
@@ -1891,6 +1939,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
         # One batched body check for the never-retrieved documents below, so their bonus
         # doesn't depend on top_k. None (no BM25) withholds acronym grades.
         floor_body_sources: Optional[Dict[str, Set[str]]] = {}
+        floor_backing: Dict[str, Dict[str, str]] = {}
         if acronyms_detected:
             floor_candidates: List[Dict[str, Any]] = []
             considered: Set[str] = set()
@@ -1903,6 +1952,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
             floor_body_sources = self._sources_with_acronym_in_body(
                 self._sources_claiming_acronym(floor_candidates, acronyms_detected),
                 acronyms_detected=acronyms_detected,
+                backing_out=floor_backing,
             )
 
         # Step 3: Deduplicate matching points in-memory.
@@ -1933,20 +1983,20 @@ class PrioritizedSearchService(AcronymRankingMixin):
             }
             # The bonus uses this point's own title/summary and its per-acronym body
             # check; on the floor base it stays small.
-            backed_acronyms = (
-                {a for a, sources in floor_body_sources.items() if str(source_id) in sources}
-                if floor_body_sources is not None
-                else set()
+            body_backed = (
+                self._body_backing(str(source_id), acronyms_detected, floor_body_sources, floor_backing)
+                if acronyms_detected and floor_body_sources is not None
+                else {a: None for a in (acronyms_detected or {})}
             )
-            bonus = (
-                self._acronym_bonus(
+            bonus, grades = (
+                self._acronym_bonus_detail(
                     point.payload.get("title"),
                     point.payload.get("summary"),
                     acronyms_detected,
-                    backed_acronyms,
+                    {a for a, how in body_backed.items() if how},
                 )
                 if acronyms_detected
-                else 0.0
+                else (0.0, None)
             )
             score = relevance * (1.0 + bonus)
             field_scores[match_key] = match_type
@@ -1969,6 +2019,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 "raw_dense": raw_dense,
                 "relevance": relevance,
                 "acronym_bonus": bonus,
+                "acronym_grades": grades,
+                "body_backed": body_backed if acronyms_detected else None,
                 mult_key: boost,
                 # See the note at the other injection site: this score is a keyword-match
                 # floor, so it must be distinguishable from a real fused score.

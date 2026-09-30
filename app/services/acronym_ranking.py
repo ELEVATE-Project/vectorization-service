@@ -222,9 +222,11 @@ class AcronymRankingMixin:
         self,
         sources_by_acronym: Dict[str, Set[str]],
         acronyms_detected: Optional[Dict[str, List[str]]] = None,
+        backing_out: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Optional[Dict[str, Set[str]]]:
         """{acronym: sources whose body backs it}: the acronym in capitals, or its expansion.
 
+        backing_out, if given, gets {acronym: {source: "acronym" | "expansion"}}.
         Returns None when BM25 cannot answer, so the caller falls back. See design notes, Body check.
         """
         if not sources_by_acronym:
@@ -266,12 +268,17 @@ class AcronymRankingMixin:
                     rejected = {str(group.id) for group in response.groups} - found
                     if rejected:
                         found |= self._sources_using_acronym_in_any_chunk(rejected, pattern)
+                if backing_out is not None:
+                    backing_out[acronym] = {source: "acronym" for source in found}
                 # Expansion check only for sources the acronym did not back.
                 unbacked = sources - found
                 if unbacked and acronyms_detected and acronyms_detected.get(acronym):
-                    found |= self._sources_with_expansion_in_body(
+                    by_expansion = self._sources_with_expansion_in_body(
                         unbacked, acronyms_detected[acronym]
                     )
+                    found |= by_expansion
+                    if backing_out is not None:
+                        backing_out[acronym].update({source: "expansion" for source in by_expansion})
                 backed[acronym] = found
             return backed
         except Exception as exc:
@@ -357,72 +364,148 @@ class AcronymRankingMixin:
 
         Acronym grades need body backing for that acronym. See design notes, Bonus.
         """
-        title_acronym = settings.ACRONYM_BONUS_TITLE_ACRONYM
-        title_expansion = settings.ACRONYM_BONUS_TITLE_EXPANSION
-        summary_acronym = settings.ACRONYM_BONUS_SUMMARY_ACRONYM
-        summary_expansion = settings.ACRONYM_BONUS_SUMMARY_EXPANSION
+        return self._acronym_bonus_detail(title, summary, acronyms_detected, backed_acronyms)[0]
+
+    def _acronym_bonus_detail(
+        self,
+        title: Optional[str],
+        summary: Optional[str],
+        acronyms_detected: Dict[str, List[str]],
+        backed_acronyms: Set[str],
+    ) -> Tuple[float, Dict[str, Optional[str]]]:
+        """(bonus, {acronym: grade earned}); grade is "title_acronym", "title_expansion",
+        "summary_acronym", "summary_expansion" or None."""
+        grades = (
+            ("title_acronym", settings.ACRONYM_BONUS_TITLE_ACRONYM),
+            ("title_expansion", settings.ACRONYM_BONUS_TITLE_EXPANSION),
+            ("summary_acronym", settings.ACRONYM_BONUS_SUMMARY_ACRONYM),
+            ("summary_expansion", settings.ACRONYM_BONUS_SUMMARY_EXPANSION),
+        )
+        values = dict(grades)
         total = 0.0
+        earned: Dict[str, Optional[str]] = {}
         for acronym, expansions in acronyms_detected.items():
             content_backs_acronym = acronym in backed_acronyms
-            best = 0.0
+            best, best_name = 0.0, None
+
+            def consider(name: str) -> None:
+                nonlocal best, best_name
+                if values[name] > best:
+                    best, best_name = values[name], name
+
             if content_backs_acronym and self._term_in_text(acronym, title):
-                best = max(best, title_acronym)
+                consider("title_acronym")
             # Expansion checks tokenize the text; run them only if they can raise the grade.
-            if best < title_expansion and any(
+            if best < values["title_expansion"] and any(
                 self._phrase_in_text(exp, title) for exp in expansions
             ):
-                best = max(best, title_expansion)
-            if content_backs_acronym and best < summary_acronym and self._term_in_text(acronym, summary):
-                best = max(best, summary_acronym)
-            if best < summary_expansion and any(
+                consider("title_expansion")
+            if (content_backs_acronym and best < values["summary_acronym"]
+                    and self._term_in_text(acronym, summary)):
+                consider("summary_acronym")
+            if best < values["summary_expansion"] and any(
                 self._phrase_in_text(exp, summary) for exp in expansions
             ):
-                best = max(best, summary_expansion)
+                consider("summary_expansion")
             total += best
-        return min(total, settings.ACRONYM_BONUS_MULTI_MATCH_CAP)
+            earned[acronym] = best_name
+        return min(total, settings.ACRONYM_BONUS_MULTI_MATCH_CAP), earned
+
+    @staticmethod
+    def _body_backing(
+        source_id: str,
+        acronyms_detected: Dict[str, List[str]],
+        body_sources: Dict[str, Set[str]],
+        backing: Dict[str, Dict[str, str]],
+    ) -> Dict[str, Optional[str]]:
+        """{acronym: "acronym" | "expansion" | None} for one source; body_sources decides."""
+        return {
+            acronym: (backing.get(acronym, {}).get(source_id, "acronym")
+                      if source_id in body_sources.get(acronym, ()) else None)
+            for acronym in acronyms_detected
+        }
 
     def _assign_acronym_bonuses(
         self,
         rows: List[Dict[str, Any]],
         acronyms_detected: Dict[str, List[str]],
-    ) -> None:
-        """Set r['acronym_bonus'] on every row, computed once per source.
+    ) -> str:
+        """Set acronym_bonus, acronym_grades and body_backed on every row, once per source.
 
-        Falls back to the dense body check when BM25 cannot answer.
+        Returns the body check used: "bm25", "dense_fallback" (BM25 unavailable) or
+        "none" (no document claims the acronym).
         """
         body_sources = None
+        claiming: Dict[str, Set[str]] = {}
+        backing: Dict[str, Dict[str, str]] = {}
         # An empty BM25 index would reject every document, so if no pooled row has
         # a sparse score, treat BM25 as unavailable.
         if any((r.get('field_scores') or {}).get(settings.SPARSE_VECTOR_NAME) for r in rows):
+            claiming = self._sources_claiming_acronym(rows, acronyms_detected)
             body_sources = self._sources_with_acronym_in_body(
-                self._sources_claiming_acronym(rows, acronyms_detected),
-                acronyms_detected=acronyms_detected,
+                claiming, acronyms_detected=acronyms_detected, backing_out=backing,
             )
-        by_source: Dict[str, float] = {}
+        by_source: Dict[str, Tuple[float, Dict[str, Optional[str]], Dict[str, Optional[str]]]] = {}
         for r in rows:
             payload = r['payload']
             source_id = payload.get('source_id')
             key = str(source_id) if source_id is not None else None
             if body_sources is not None and key is not None:
                 if key not in by_source:
-                    backed_acronyms = {
-                        acronym for acronym, sources in body_sources.items()
-                        if key in sources
-                    }
-                    by_source[key] = self._acronym_bonus(
-                        payload.get('title'), payload.get('summary'),
-                        acronyms_detected, backed_acronyms,
+                    body_backed = self._body_backing(key, acronyms_detected, body_sources, backing)
+                    bonus, grades = self._acronym_bonus_detail(
+                        payload.get('title'), payload.get('summary'), acronyms_detected,
+                        {acronym for acronym, how in body_backed.items() if how},
                     )
-                r['acronym_bonus'] = by_source[key]
+                    by_source[key] = (bonus, grades, body_backed)
+                r['acronym_bonus'], r['acronym_grades'], r['body_backed'] = by_source[key]
             else:
                 # Uniform fallback, applied to every acronym alike — see docstring.
-                backed_acronyms = (
-                    set(acronyms_detected) if self._body_matched(r.get('field_scores')) else set()
+                matched = self._body_matched(r.get('field_scores'))
+                r['body_backed'] = {
+                    acronym: ("dense_fallback" if matched else None) for acronym in acronyms_detected
+                }
+                r['acronym_bonus'], r['acronym_grades'] = self._acronym_bonus_detail(
+                    payload.get('title'), payload.get('summary'), acronyms_detected,
+                    set(acronyms_detected) if matched else set(),
                 )
-                r['acronym_bonus'] = self._acronym_bonus(
-                    payload.get('title'), payload.get('summary'),
-                    acronyms_detected, backed_acronyms,
-                )
+        if body_sources is None:
+            return "dense_fallback"
+        return "bm25" if claiming else "none"
+
+    @staticmethod
+    def _acronym_ranking_context(
+        applied: bool,
+        search_mode: str,
+        dense_variants: int,
+        rescore: Optional[Dict[str, Any]],
+        body_check: str,
+    ) -> Dict[str, Any]:
+        """scoring_context.acronym_ranking: how an acronym query was scored (debug only).
+
+        When ranking is off (semantic mode, hybrid disabled), only retrieval was widened.
+        """
+        if not applied:
+            reason = ("search_mode is semantic" if search_mode == "semantic"
+                      else "HYBRID_SEARCH_ENABLED is false")
+            return {"applied": False, "reason": reason, "dense_variants": dense_variants}
+        return {
+            "applied": True,
+            "relevance": "(1 - W) x query_score + W x expansion_score",
+            "expansion_score_weight": settings.ACRONYM_EXPANSION_SCORE_WEIGHT,
+            "final_score": "relevance x (1 + acronym_bonus)",
+            "bonus_grades": {
+                "title_acronym": settings.ACRONYM_BONUS_TITLE_ACRONYM,
+                "title_expansion": settings.ACRONYM_BONUS_TITLE_EXPANSION,
+                "summary_acronym": settings.ACRONYM_BONUS_SUMMARY_ACRONYM,
+                "summary_expansion": settings.ACRONYM_BONUS_SUMMARY_EXPANSION,
+            },
+            "bonus_cap": settings.ACRONYM_BONUS_MULTI_MATCH_CAP,
+            "dense_variants": dense_variants,
+            # None when the query already spelled out the expansion (nothing to blend).
+            "rescore": rescore,
+            "body_check": body_check,
+        }
 
     def _blended_acronym_relevance(
         self,

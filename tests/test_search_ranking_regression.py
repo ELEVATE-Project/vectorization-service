@@ -513,7 +513,7 @@ class TestFieldMatchInjection:
         per-acronym mapping only ever needs the one "DIET" key."""
         monkeypatch.setattr(
             PrioritizedSearchService, "_sources_with_acronym_in_body",
-            lambda self, candidates, acronyms_detected=None: {"DIET": set(backed)})
+            lambda self, candidates, acronyms_detected=None, **kw: {"DIET": set(backed)})
         boosts = (
             (settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST)
             if field == "title"
@@ -755,12 +755,13 @@ class TestAcronymBonusFollowsLexicalRanking:
     """
 
     def _run(self, service, monkeypatch, search_mode, hybrid_enabled=True,
-             field_scores=None):
+             field_scores=None, acronyms=None, **request_fields):
         from app.models.api_models import PrioritizedSearchRequest
 
+        detected = dict(ACR) if acronyms is None else acronyms
         monkeypatch.setattr(
             "app.services.prioritized_search_service.detect_acronyms",
-            lambda q: dict(ACR))
+            lambda q: dict(detected))
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", True)
         monkeypatch.setattr(settings, "HYBRID_SEARCH_ENABLED", hybrid_enabled)
         monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", False)
@@ -790,7 +791,8 @@ class TestAcronymBonusFollowsLexicalRanking:
             lambda self, *a, **kw: {})
 
         return service.search(
-            PrioritizedSearchRequest(query="DIET", top_k=10, search_mode=search_mode))
+            PrioritizedSearchRequest(query="DIET", top_k=10, search_mode=search_mode,
+                                     **request_fields))
 
     def test_semantic_mode_ranks_by_similarity_alone(self, service, monkeypatch):
         """THE fix: no tier ordering, so nothing contradicts the raw scores."""
@@ -897,7 +899,7 @@ class TestAcronymBonusFollowsLexicalRanking:
         # Content check: this document's content doesn't mention DIET.
         monkeypatch.setattr(
             PrioritizedSearchService, "_sources_with_acronym_in_body",
-            lambda self, candidates, acronyms_detected=None: {})
+            lambda self, candidates, acronyms_detected=None, **kw: {})
 
         injected = service._fetch_field_match_docs(
             ["Z"], {"Z": "partial"}, "title",
@@ -963,6 +965,111 @@ class TestAcronymBonusFollowsLexicalRanking:
             PrioritizedSearchService, "_process_and_filter_results", spy)
         self._run(service, monkeypatch, "hybrid")
         assert seen["acronyms_detected"] == dict(ACR)
+
+
+# ── scoring_context reports how an acronym query was actually scored ──────
+
+class TestAcronymScoringContext:
+    """search_config.scoring_context (debug only) must describe the scoring that
+    ran: neutral title/summary multipliers and the acronym ranking block."""
+
+    def _context(self, service, monkeypatch, search_mode="hybrid", acronyms=None):
+        response = TestAcronymBonusFollowsLexicalRanking()._run(
+            service, monkeypatch, search_mode, acronyms=acronyms, include_scoring_debug=True)
+        return response.search_config["scoring_context"]
+
+    def test_acronym_query_reports_neutral_boosts_and_ranking(self, service, monkeypatch):
+        ctx = self._context(service, monkeypatch)
+        assert ctx["boost_config"] == {
+            "mode": "acronym_bonus", "exact_title_boost": 1.0, "partial_title_boost": 1.0,
+            "exact_summary_boost": 1.0, "partial_summary_boost": 1.0,
+        }
+        ranking = ctx["acronym_ranking"]
+        assert ranking["applied"] is True
+        assert ranking["expansion_score_weight"] == settings.ACRONYM_EXPANSION_SCORE_WEIGHT
+        assert ranking["bonus_cap"] == settings.ACRONYM_BONUS_MULTI_MATCH_CAP
+        assert ranking["bonus_grades"]["title_acronym"] == settings.ACRONYM_BONUS_TITLE_ACRONYM
+        assert ranking["dense_variants"] == 2
+        assert ranking["rescore"] == {
+            "applied": True, "candidate_pool": 2, "rescored": 2,
+            "limit": settings.ACRONYM_RESCORE_POOL_LIMIT, "capped": False,
+            "normalization": "self",
+        }
+        # Sparse is off in this fixture, so the body check falls back to dense.
+        assert ranking["body_check"] == "dense_fallback"
+
+    def test_capped_rescore_is_reported(self, service, monkeypatch):
+        monkeypatch.setattr(settings, "ACRONYM_RESCORE_POOL_LIMIT", 1)
+        monkeypatch.setattr(settings, "HYBRID_FUSION_METHOD", "weighted")
+        rescore = self._context(service, monkeypatch)["acronym_ranking"]["rescore"]
+        assert rescore["capped"] is True
+        assert rescore["rescored"] == 1
+        assert rescore["normalization"] == "full_pool"
+
+    def test_semantic_mode_reports_ranking_off(self, service, monkeypatch):
+        ctx = self._context(service, monkeypatch, search_mode="semantic")
+        assert ctx["boost_config"]["mode"] == "off"
+        assert ctx["acronym_ranking"] == {
+            "applied": False, "reason": "search_mode is semantic", "dense_variants": 2,
+        }
+
+    def test_ordinary_query_keeps_configured_boosts(self, service, monkeypatch):
+        ctx = self._context(service, monkeypatch, acronyms={})
+        assert ctx["boost_config"] == {
+            "mode": "title_summary_boost",
+            "exact_title_boost": settings.EXACT_TITLE_BOOST,
+            "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
+            "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,
+            "partial_summary_boost": settings.PARTIAL_SUMMARY_BOOST,
+        }
+        assert "acronym_ranking" not in ctx
+
+
+# ── Per-document acronym breakdown: grades, body backing, relevance ───────
+
+class TestPerDocumentAcronymBreakdown:
+    """Each result explains its bonus: which grade each acronym earned, how the
+    body backs it, and the relevance before the bonus."""
+
+    def test_grades_name_the_grade_earned(self, service):
+        bonus, grades = service._acronym_bonus_detail(
+            "DIET Handbook", None, dict(ACR), {"DIET"})
+        assert bonus == settings.ACRONYM_BONUS_TITLE_ACRONYM
+        assert grades == {"DIET": "title_acronym"}
+
+    def test_unbacked_title_falls_to_expansion_grade_or_none(self, service):
+        both = f"DIET — {ACR['DIET'][0]}"
+        assert service._acronym_bonus_detail(both, None, dict(ACR), set())[1] == {
+            "DIET": "title_expansion"}
+        assert service._acronym_bonus_detail("DIET Handbook", None, dict(ACR), set())[1] == {
+            "DIET": None}
+
+    def test_backing_labels_acronym_and_expansion(self, service, monkeypatch):
+        TestExpansionInBodyBacksAcronymClaim._stub_qdrant(
+            self, monkeypatch, acronym_hits=["A"],
+            chunk_text={"B": "District Institute of Education and Training staff."})
+        backing = {}
+        backed = service._sources_with_acronym_in_body(
+            {"DIET": {"A", "B"}}, acronyms_detected=ACR, backing_out=backing)
+        assert backed == {"DIET": {"A", "B"}}
+        assert backing == {"DIET": {"A": "acronym", "B": "expansion"}}
+
+    def test_results_carry_the_breakdown_in_debug(self, service, monkeypatch):
+        response = TestAcronymBonusFollowsLexicalRanking()._run(
+            service, monkeypatch, "hybrid", include_scoring_debug=True)
+        by_source = {r.source_id: r for r in response.results}
+        a = by_source["A"]
+        # Sparse is off in this fixture, so backing comes from the dense fallback.
+        assert a.body_backed == {"DIET": "dense_fallback"}
+        assert a.acronym_grades == {"DIET": "title_acronym"}
+        assert a.score == pytest.approx(a.relevance * (1 + a.acronym_bonus))
+        assert by_source["B"].acronym_grades == {"DIET": None}
+
+    def test_breakdown_hidden_without_debug(self, service, monkeypatch):
+        response = TestAcronymBonusFollowsLexicalRanking()._run(
+            service, monkeypatch, "hybrid", include_scoring_debug=False)
+        assert all(r.acronym_grades is None and r.body_backed is None and r.relevance is None
+                   for r in response.results)
 
 
 # ── The acronym rescore cap is skipped in RRF mode ────────────────────────
