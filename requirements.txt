@@ -3,6 +3,9 @@ fastapi
 uvicorn
 # Database and Caching
 sqlalchemy
+# Both Postgres drivers: a plain postgresql:// URL (config default, .env.sample)
+# loads psycopg2; a postgresql+psycopg:// URL (deployed envs) loads psycopg 3.
+psycopg2-binary
 psycopg[binary]
 redis
 alembic
