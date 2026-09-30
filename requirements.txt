@@ -3,7 +3,7 @@ fastapi
 uvicorn
 # Database and Caching
 sqlalchemy
-psycopg2-binary
+psycopg[binary]
 redis
 alembic
 # Pinned to >=1.18.0: enables sparse vectors (BM25) and the Query API with RRF.
