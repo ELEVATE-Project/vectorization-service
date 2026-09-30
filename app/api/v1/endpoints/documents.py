@@ -153,14 +153,8 @@ async def check_similarity(request: SimilarityCheckRequest) -> SimilarityCheckRe
 
 
 @router.post("/documents/search", response_model=PrioritizedSearchResponse)
-# Deliberately sync (`def`, not `async def`) — please don't "fix" this back.
-# search() blocks all the way down: Qdrant, and since acronym search, Redis and
-# Postgres too. Declared `async` it ran that blocking work on the event loop
-# itself, so one stalled dependency froze EVERY concurrent request, not just its
-# own — measured at 2.0s per search against a hung Redis, 5.0s with Postgres
-# hung as well, and 10.08s of total stall from two concurrent requests. FastAPI
-# runs a plain `def` endpoint in its threadpool, so a stall costs one worker
-# instead of the whole service. Nothing here awaits, so `async` bought nothing.
+# Deliberately sync: search() blocks (Qdrant, Redis, Postgres), and as `async` one
+# stalled dependency froze every request. FastAPI runs `def` in its threadpool.
 def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSearchResponse:
     """
     Perform prioritized multi-field search across documents with optional filters.

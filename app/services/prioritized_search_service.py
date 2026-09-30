@@ -13,12 +13,7 @@ from app.services.acronym_ranking import AcronymRankingMixin, FieldMatchQuery
 from app.core.clients import embedding
 from app.core.clients.embedding import EmbeddingError
 from app.config import settings
-# _normalize_token is imported deliberately, private name and all: the
-# substitution step below has to strip a matched span EXACTLY the way detection
-# stripped the token it found, or the two disagree about what a token is — which
-# is precisely the bug being fixed here (detection saw "D.I.E.T." as DIET, the
-# old \bDIET\b substitution could not find it again, and the expansion was
-# silently never searched for). One tokenizer, one definition.
+# Private _normalize_token on purpose: substitution must normalize exactly like detection.
 from app.services.acronym_query_service import detect_acronyms, _normalize_token
 from app.models.api_models import (
     PrioritizedSearchRequest,
@@ -113,31 +108,12 @@ class PrioritizedSearchService(AcronymRankingMixin):
         _rank_results, which uses it (not the presence of sparse hits) to choose the
         scoring formula, so the returned score stays on one scale across queries.
 
-        relevance_override: optional {point_id: relevance} replacing the fused score
-        for ordering and the filter_score threshold (see
-        _blended_acronym_relevance). field_scores and the fusion breakdown are left
-        as retrieved, so detail_filter_score and debug output don't move.
-
-        acronyms_detected: optional {acronym: [expansions]} map. When truthy, each
-        candidate earns a proportional acronym bonus (see _acronym_bonus):
-        final = relevance x (1 + bonus). The bonus is applied AFTER the threshold —
-        filter_score always reads the real relevance — and BEFORE dedup and the
-        top_k cap, so a document just outside the page can still rise into it.
-        None (the default) skips it for non-acronym callers; search() also passes
-        None when lexical ranking is off (search_mode "semantic", or
-        HYBRID_SEARCH_ENABLED false), since the bonus is a lexical signal.
-
-        This replaces hard tiering, which sorted by (tier, score) and so let any
-        acronym-titled document outrank any untitled one however much weaker it
-        was — measured on the local corpus, 16-43 cases per top 20 of a document
-        sitting above one more than 20% more relevant.
-
-        prethreshold_by_source_out: optional mutable dict filled with source_id -> best
-        ranked entry, captured BEFORE the threshold filter runs. The caller uses
-        this so a title/summary match later re-injected by _fetch_field_match_docs
-        (because the semantic threshold dropped it) can carry its real relevance,
-        field_scores and acronym bonus instead of the synthetic floor. Pass None to
-        skip it (semantic search, which never needs it).
+        relevance_override: {point_id: relevance} used for ordering and filter_score
+        (see _blended_acronym_relevance); field_scores stay as retrieved.
+        acronyms_detected: when set, applies the acronym bonus after the threshold and
+        before dedup (see _acronym_bonus). None skips it.
+        prethreshold_by_source_out: filled with source_id -> best entry before the
+        threshold, so re-injected documents keep their real scores.
         """
         logger.info(f"Total documents matched: {len(all_results)}")
 
@@ -151,7 +127,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
             ranked_results.sort(key=lambda r: r['weighted_score'], reverse=True)
 
         if acronyms_detected:
-            self._assign_acronym_bonuses(ranked_results, acronyms_detected)
+            body_check = self._assign_acronym_bonuses(ranked_results, acronyms_detected)
+            if scoring_context_out is not None:
+                scoring_context_out["acronym_body_check"] = body_check
             # Kept separately from weighted_score, which becomes the bonused
             # final score below: the threshold and any re-injection must read the
             # real relevance, never a score that already carries the bonus.
@@ -182,10 +160,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
         logger.info(f"After filtering: {len(filtered_results)} documents (removed {len(ranked_results) - len(filtered_results)})")
 
         if acronyms_detected:
-            # After the threshold, so filter_score judges real relevance; before
-            # dedup and the top_k cap, so the bonus can lift a document into the
-            # page rather than only reorder the ones already on it. The bonus is
-            # per source, so dedup still keeps the same best chunk it would have.
+            # After the threshold (filter_score sees real relevance), before dedup and
+            # top_k (the bonus can lift a document onto the page).
             for r in filtered_results:
                 r['weighted_score'] = r['relevance'] * (1.0 + r.get('acronym_bonus', 0.0))
             filtered_results.sort(key=lambda r: r['weighted_score'], reverse=True)
@@ -269,18 +245,14 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     # them, even for docs the boost pass didn't touch (e.g. keyword-injected).
                     title_multiplier=result_data.get('title_multiplier', 1.0) if include_scoring_debug else None,
                     summary_multiplier=result_data.get('summary_multiplier', 1.0) if include_scoring_debug else None,
-                    # No default here, unlike the multipliers above: the key is only ever
-                    # set at all when the query was an acronym query (_assign_acronym_bonuses
-                    # runs conditionally), so a bare .get() correctly stays None for an
-                    # ordinary query — 0.0 would wrongly read as "an acronym bonus of zero
-                    # was computed" rather than "the bonus mechanism never ran".
+                    # No default: None means "not an acronym query", unlike 0.0.
                     acronym_bonus=result_data.get('acronym_bonus') if include_scoring_debug else None,
-                    # Only ever set for a document reused via prethreshold_by_source
-                    # (see _fetch_field_match_docs) — the real relevance the pipeline
-                    # measured before the threshold dropped it, kept visible instead of
-                    # being silently replaced by the synthetic floor score. None means
-                    # either debug is off or this document was never actually measured.
+                    # Real relevance of a re-injected document; None if never measured.
                     measured_relevance=result_data.get('measured_relevance') if include_scoring_debug else None,
+                    # Acronym queries only: why this document got its bonus.
+                    relevance=result_data.get('relevance') if include_scoring_debug else None,
+                    acronym_grades=result_data.get('acronym_grades') if include_scoring_debug else None,
+                    body_backed=result_data.get('body_backed') if include_scoring_debug else None,
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")
@@ -372,13 +344,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 if acronyms_detected:
                     logger.info(f"Acronyms detected in query: {list(acronyms_detected.keys())}")
 
-            # Surfaced in the response as acronym_info so callers can see what was
-            # detected/expanded, independent of ACRONYM_SEARCH_ENABLED — null when
-            # nothing was detected (or the flag is off). "ambiguous" lists any
-            # detected acronym with more than one registered meaning (AC-11) —
-            # nothing downstream consumes it yet, but it's cheap to surface now
-            # rather than silently picking a meaning with no way for a caller to
-            # even know that happened.
+            # Reported as acronym_info (null if none detected); "ambiguous" lists
+            # acronyms with more than one meaning (AC-11).
             acronym_info = None
             if acronyms_detected:
                 acronym_info = {"detected": True, "mapping": acronyms_detected}
@@ -386,121 +353,60 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 if ambiguous:
                     acronym_info["ambiguous"] = ambiguous
 
-            # Acronym path: N separate dense query strings, one per expansion
-            # variant (never concatenated — embedding "PTM meeting" + "Parent
-            # Teacher Meeting" together would average two concepts into one
-            # point in vector space, close to neither) + 1 combined sparse OR
-            # string. Non-acronym queries (or nothing detected) fall through
-            # unchanged below.
+            # Acronym path: one dense text per expansion variant (never concatenated)
+            # plus one sparse text with every expansion's words. See design notes.
             dense_query_texts = [query_for_embedding]
             sparse_query_text = query_for_embedding
             if acronyms_detected:
-                # Single regex pass over the ORIGINAL text, not sequential
-                # substitutions — looping could re-scan an expansion that itself
-                # contains another acronym (e.g. NFST -> "...for ST" when ST is
-                # also detected), producing garbled, duplicated text.
+                # One regex pass over the original text, so an expansion containing
+                # another acronym (NFST -> "...for ST") is never re-substituted.
                 combined_pattern = self._acronym_substitution_pattern(acronyms_detected)
 
                 def _make_resolver(expansion_index: int):
-                    """Build a resolver that substitutes every detected acronym
-                    with its expansion at `expansion_index` (AC-11: falls back
-                    to an acronym's LAST expansion if it doesn't have that many
-                    — a 1-meaning acronym like PTM is unaffected at any index).
-                    expansion_index 0 is the primary variant, unchanged from
-                    before this existed for anything with a single meaning."""
+                    """Resolver substituting each acronym with its expansion at
+                    `expansion_index`, or its last one if it has fewer (AC-11)."""
                     def _resolve_acronym(match: re.Match) -> str:
-                        # A callable, not a string replacement — re.sub treats
-                        # backslashes in a string replacement specially, so an
-                        # expansion containing one (e.g. a Windows path) would
-                        # crash or corrupt the text.
+                        # A callable: re.sub would treat backslashes in a string specially.
                         matched = match.group(0)
-                        # Normalize the matched SPAN exactly as detect_acronyms
-                        # normalized the token(s) it found, so "d.i.e.t." and
-                        # "ptm2024" map back to the DIET / PTM keys, and a
-                        # multi-word match like "rte  act" maps back to the "RTE
-                        # ACT" key. Per-word normalization (strip non-letters),
-                        # then a single space between words — normalizing the
-                        # whole span in one pass would strip the space along
-                        # with the punctuation and turn "RTE ACT" into
-                        # "RTEACT", which is not a key in acronyms_detected.
+                        # Normalize per word like detection ("d.i.e.t." -> DIET,
+                        # "rte  act" -> "RTE ACT"), keeping one space between words.
                         words = [_normalize_token(w) for w in matched.split()]
                         spaced_key = " ".join(words).upper()
-                        # The pattern above now also matches a run of single
-                        # letters that used to be one dotted word before a
-                        # caller (commons) turned every "." into a space
-                        # ("d i e t") — detect_acronyms recovers that by gluing
-                        # the run with NO separator, so the key it's registered
-                        # under is "DIET", not "D I E T". Try both joins; for an
-                        # ordinary single- or multi-word match the two are
-                        # identical, so this never changes behaviour for
-                        # anything that already worked.
+                        # "d i e t" is registered glued ("DIET"), so try both joins; for
+                        # any other match the two are the same.
                         glued_key = "".join(words).upper()
                         resolved = None
                         for candidate_key in dict.fromkeys([spaced_key, glued_key]):
                             resolved = acronyms_detected.get(candidate_key)
                             if resolved:
                                 break
-                            # The pattern also now accepts an optional trailing
-                            # "S" (the plural-retry counterpart on the
-                            # detection side) — try the same singular guess
-                            # here.
+                            # Plural: try the singular, like detection's retry.
                             if candidate_key.endswith("S") and len(candidate_key) > 2:
                                 resolved = acronyms_detected.get(candidate_key[:-1])
                                 if resolved:
                                     break
                         if not resolved:
-                            # The pattern is built from these keys, so this
-                            # cannot normally miss — but a substitution must
-                            # never raise on a live query, so leave the text
-                            # untouched if it does.
+                            # Should not happen (the pattern comes from these keys);
+                            # leave the text unchanged rather than raise.
                             return matched
                         expansion = resolved[min(expansion_index, len(resolved) - 1)]
 
-                        # Leave the acronym in place when the query ALREADY
-                        # spells the expansion out ("DIET District Institute of
-                        # Education and Training"). Substituting there repeats
-                        # the phrase verbatim, and a doubled phrase embeds to a
-                        # different point than the phrase said once — so the
-                        # "second reading" is a distorted copy of the first,
-                        # not an alternative to it, and it still costs a query
-                        # vector and a per-field max() merge. Reuses the
-                        # tiering matcher rather than a literal check, so
-                        # inflections and different connectives ("District
-                        # Institutes of Education & Training") count as
-                        # already-present too.
+                        # Keep the acronym if the query already spells the expansion out:
+                        # a doubled phrase embeds to a distorted point.
                         if self._phrase_in_text(expansion, query_for_embedding):
                             return matched
 
-                        # Trailing digits are matched but NOT swallowed:
-                        # "ptm2024" becomes "Parent Teacher Meeting 2024", not
-                        # "...Meeting2024" (which embeds as one nonsense token)
-                        # and not "...Meeting" (which silently drops a year the
-                        # user typed).
+                        # Keep trailing digits as a word: "ptm2024" -> "Parent Teacher Meeting 2024".
                         trailing_digits = match.group("digits") or ""
                         return f"{expansion} {trailing_digits}" if trailing_digits else expansion
                     return _resolve_acronym
 
-                # A case-only diff isn't a real second reading — embeddings are
-                # case-insensitive in practice (cosine sim 1.0) — so a variant
-                # only gets added when it's a genuine semantic change, and only
-                # once per distinct string (two acronyms that happen to share
-                # an expansion at the same index would otherwise duplicate it).
+                # Add a variant only if it differs beyond case (embeddings ignore case),
+                # and only once.
                 seen_variants = {query_for_embedding.lower()}
                 variants = [query_for_embedding]
-                # AC-11: one variant per expansion index, not just the first —
-                # max(len(expansions)) across detected acronyms is how many
-                # distinct meanings exist to explore; an acronym with fewer
-                # expansions than the current index just reuses its last one
-                # (see _make_resolver), so it never re-adds a duplicate variant
-                # on its own. Capped so a query naming several ambiguous
-                # acronyms at once can't fan out unboundedly. Note:
-                # _blended_acronym_relevance below only ever consumes
-                # dense_query_texts[1] (the first substituted variant) as "the
-                # expansion" side of its blend — a second or third meaning here
-                # still widens retrieval (more candidates found) but isn't
-                # separately reflected in that blend. Extending the blend
-                # itself to multiple meanings is a further step, not part of
-                # this fix.
+                # AC-11: one variant per expansion meaning, capped. Only the first feeds
+                # the relevance blend; the others widen retrieval.
                 max_expansions = max((len(exps) for exps in acronyms_detected.values()), default=1)
                 for expansion_index in range(max_expansions):
                     if len(variants) >= settings.ACRONYM_MAX_DENSE_VARIANTS:
@@ -511,11 +417,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
                         variants.append(substituted)
                 dense_query_texts = variants
 
-                # Sparse: append every expansion word (not just the first, unlike
-                # the dense pick above) — more ways to match, no dilution risk
-                # for a bag-of-words BM25 search. Plain word-appending, not
-                # boolean/phrase syntax — the BM25 tokenizer has no notion of
-                # OR or quoted phrases.
+                # Sparse: append every expansion's words; BM25 is a bag of words with
+                # no OR or phrase syntax, so this cannot dilute it.
                 expansion_words = " ".join(
                     expansion
                     for expansions in acronyms_detected.values()
@@ -524,11 +427,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 sparse_query_text = f"{query_for_keyword_match} {expansion_words}"
 
             logger.info(f"Generating {len(dense_query_texts)} dense embedding(s) for query: {dense_query_texts}")
-            # Passing the list (not one text at a time) batches every dense query
-            # text into a single model call — one encode() instead of
-            # len(dense_query_texts) sequential ones — and validates each produced
-            # vector (length == EMBEDDING_DIM, finite values) so a malformed vector
-            # can never reach Qdrant.
+            # One encode() for all dense texts; every vector is validated before Qdrant.
             try:
                 query_embeddings = embedding.embed_query(dense_query_texts)
             except EmbeddingError as e:
@@ -552,11 +451,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
             self._log_search_request(request, top_k, filter_conditions)
             
             logger.info("========== EXECUTING SEARCH ==========" )
-            # query_embeddings is a single-element list unless acronym detection
-            # produced a substituted variant (built above) — either way,
-            # _hybrid_batch_search/_parallel_batch_search fan out per field per
-            # embedding and merge same-field hits with max(), which is a no-op for
-            # the single-embedding case.
+            # One embedding, or several acronym variants; same-field hits merge with max().
             if settings.SPARSE_SEARCH_ENABLED:
                 logger.info(
                     "Starting hybrid batch search (dense + BM25 sparse, "
@@ -612,15 +507,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
             # Only two modes exist: "semantic" opts out of boosts; "hybrid" (the
             # default) opts in. search_mode is validated to that set by Pydantic.
             search_mode = getattr(request, "search_mode", "hybrid")
-            # The acronym bonus is a LEXICAL ranking signal — _acronym_bonus
-            # matches the acronym and its expansions against title/summary — so it
-            # belongs to the same family as the title/summary boost below, and
-            # rides the same switch. "semantic" means rank by vector similarity
-            # alone.
-            #
-            # Retrieval is deliberately NOT gated: the expanded dense/sparse queries
-            # built above still run, so an acronym keeps widening WHICH documents are
-            # found in semantic mode. Only their ORDER falls back to pure similarity.
+            # The bonus is lexical, so it follows the title/summary boost switch. Retrieval
+            # is not gated: acronyms still widen what semantic mode finds.
             lexical_ranking_enabled = (
                 settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic"
             )
@@ -637,33 +525,12 @@ class PrioritizedSearchService(AcronymRankingMixin):
             # ACRONYM_EXPANSION_SCORE_WEIGHT (see _blended_acronym_relevance). Only meaningful when an expansion
             # variant was built; a query that already spelled it out has one text.
             relevance_override = None
+            # What the rescore did, for scoring_context.acronym_ranking (debug only).
+            rescore_info: Optional[Dict[str, Any]] = None
             if soft_acronym_ranking and len(dense_query_texts) > 1:
                 pool_ids = list(all_results.keys())
-                # Rescoring is a second and third Qdrant round trip against the
-                # pool (see ACRONYM_RESCORE_POOL_LIMIT) -- cap it to the top N
-                # candidates by the score retrieval already computed, instead
-                # of the full candidate pool (which can run into the thousands
-                # at large top_k). Anything outside the cap keeps its retrieval
-                # score (_process_and_filter_results falls back to it for any
-                # id relevance_override doesn't cover).
-                #
-                # normalization_reference: None while pool_ids is still the full
-                # pool (nothing excluded, self-normalizing is already correct).
-                # Once capped, the full pool's own dense/sparse min-max is
-                # captured here (from the SAME prelim ranking pass we already
-                # need to pick the cutoff, so this is free) and passed through so
-                # the capped subset's rescore lands on the same scale as the
-                # untouched remainder, instead of being stretched to fill [0, 1]
-                # against just its own narrower range.
-                #
-                # RRF mode is never capped: its score comes from each point's
-                # RANK within the list it is given and ignores
-                # normalization_reference, so a capped subset would be ranked
-                # against itself (its 200th point normalizing to 0) while the
-                # untouched remainder kept full-pool scores — two incompatible
-                # scales meeting at the cutoff, reordering it and skewing
-                # filter_score there. Rescoring the full pool costs more Qdrant
-                # work, but only in RRF mode.
+                # Rescore only the top ACRONYM_RESCORE_POOL_LIMIT, normalized to the full pool's
+                # range; RRF rescores all (rank-based). See design notes, Relevance blend.
                 normalization_reference: Optional[Dict[str, float]] = None
                 if (settings.HYBRID_FUSION_METHOD != "rrf"
                         and len(pool_ids) > settings.ACRONYM_RESCORE_POOL_LIMIT):
@@ -671,6 +538,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     prelim_ranked = self._rank_results(
                         all_results, field_scores, weights, search_fields,
                         scoring_context_out=full_pool_context,
+                        # Same hybrid decision as the rescore, so min/max are always recorded.
+                        sparse_issued=sparse_issued,
                     )
                     pool_ids = [r['id'] for r in prelim_ranked[:settings.ACRONYM_RESCORE_POOL_LIMIT]]
                     normalization_reference = {
@@ -686,6 +555,20 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     expansion_embedding=query_embeddings[1],
                     normalization_reference=normalization_reference,
                 )
+                if normalization_reference is not None:
+                    normalization = "full_pool"
+                elif settings.HYBRID_FUSION_METHOD == "rrf":
+                    normalization = "rrf_full_pool"
+                else:
+                    normalization = "self"
+                rescore_info = {
+                    "applied": relevance_override is not None,
+                    "candidate_pool": len(all_results),
+                    "rescored": len(pool_ids),
+                    "limit": settings.ACRONYM_RESCORE_POOL_LIMIT,
+                    "capped": len(pool_ids) < len(all_results),
+                    "normalization": normalization,
+                }
 
             top_results, unique_source_results = self._process_and_filter_results(
                 all_results, field_scores, weights, search_fields, top_k,
@@ -705,12 +588,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
             if lexical_ranking_enabled:
                 logger.info("Applying hybrid title + summary boost")
 
-                # On the soft acronym path the acronym bonus (already applied in
-                # _process_and_filter_results) IS the title/summary signal, so the
-                # multipliers go neutral rather than counting it twice (x1.5 on
-                # top of x1.2). The match passes below still run: they supply
-                # injection candidates and the title_match/summary_match debug
-                # fields. Ordinary queries keep their boosts unchanged.
+                # Acronym queries: the bonus already is the title/summary signal, so the
+                # multipliers go neutral; the match passes still run for injection.
                 if soft_acronym_ranking:
                     title_boosts = summary_boosts = (1.0, 1.0)
                 else:
@@ -719,17 +598,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
 
                 # Title boost (highest priority). Scroll retrieves prefix/partial
                 # matches; the supplement adds any mid/infix matches already present
-                # in the dense candidate pool that the scroll missed. Checks the
-                # literal query text plus every detected acronym's expansion(s) in
-                # one combined call — a document titled with the acronym's actual
-                # expansion ("Social Science / Social Studies") gets the same credit
-                # a literal acronym match ("SST") would, without a separate Qdrant
-                # round-trip per expansion (see _get_field_match_sources' docstring).
-                # Each entry carries its own matching rule (see
-                # _build_field_match_queries): substring for an ordinary query,
-                # whole-word for the acronym, content-words for expansions — the
-                # same rules _acronym_bonus uses, so the two can't contradict each
-                # other on the same document.
+                # in the dense candidate pool that the scroll missed.
+                # Query and expansions use _acronym_bonus's rules (_build_field_match_queries).
                 title_queries = self._build_field_match_queries(
                     query_for_keyword_match, acronyms_detected
                 )
@@ -855,17 +725,20 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 }
 
             # Gated by include_scoring_debug to keep prod responses lean. _rank_results
-            # has already filled scoring_context; add just the boost multipliers.
+            # has already filled scoring_context; add the boosts and acronym ranking.
+            body_check = scoring_context.pop("acronym_body_check", "none")
             if request.include_scoring_debug:
                 # Never default dense_weight/sparse_weight from settings: _rank_results
                 # writes them only where weighted fusion ran, so their absence is the
                 # signal that it didn't (dense-only, empty-BM25, RRF).
-                scoring_context["boost_config"] = {
-                    "exact_title_boost": settings.EXACT_TITLE_BOOST,
-                    "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
-                    "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,
-                    "partial_summary_boost": settings.PARTIAL_SUMMARY_BOOST,
-                }
+                scoring_context["boost_config"] = self._boost_config(
+                    lexical_ranking_enabled, soft_acronym_ranking
+                )
+                if acronyms_detected:
+                    scoring_context["acronym_ranking"] = self._acronym_ranking_context(
+                        soft_acronym_ranking, search_mode, len(dense_query_texts),
+                        rescore_info, body_check,
+                    )
                 search_config["scoring_context"] = scoring_context
 
             # total_results = all unique matched sources (semantic pool ∪ injected boost docs),
@@ -904,23 +777,15 @@ class PrioritizedSearchService(AcronymRankingMixin):
         """
         Execute parallel batch search across multiple vector fields.
 
-        Uses Qdrant's native search_batch for optimal performance. Fans a batch of
-        dense requests out across BOTH search_fields and query_embeddings (one
-        request per field per embedding) in a single Qdrant batch call, then merges
-        results back per field with max() — the non-acronym path always passes a
-        single-element list, so the merge is a no-op there; the acronym path passes
-        the original + acronym-substituted embeddings, where the same point can be
-        scored twice for the same field (once per embedding).
+        One request per field per embedding in a single batch call; same-field hits
+        are merged with max() (a no-op for a single embedding).
 
         Args:
             search_fields: Field names to search (title, tags, summary, metadata, text)
             weights: Weight configuration for each field
-            query_embeddings: List of query embedding vectors (a single-element list
-                for a normal query; original + acronym-substituted when acronym
-                detection produced more than one).
+            query_embeddings: Query vectors (one, or original + acronym variants)
             filter_conditions: Optional Qdrant filter conditions
             limit: Number of results to retrieve per field
-
         Returns:
             Tuple of (all_results dict, field_scores dict)
         """
@@ -995,18 +860,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
         To minimize network bandwidth and memory footprint, payloads are projected to exclude
         heavy text content; full payloads are fetched late for the final top results.
 
-        Fans dense requests out across BOTH search_fields and query_embeddings (one
-        request per field per embedding), bundled with the single BM25 sparse request
-        into one Qdrant batch call, merging same-field hits back with max() — the
-        non-acronym path always passes a single-element list, so the merge is a no-op
-        there; the acronym path can score the same point twice for the same field
-        (once per embedding). query_text (for the single BM25 sparse request — sparse
-        fan-out is a string-level OR, not multiple requests) is expected to already
-        carry any acronym OR-expansion baked in by the caller.
-
-        Returns (all_results, field_scores, sparse_issued), where ``sparse_issued`` means
-        the BM25 query was SENT, not that it matched — _rank_results needs that
-        distinction to keep zero-hit sparse queries on the hybrid [0, 1] scale.
+        One dense request per field per embedding plus one BM25 request (query_text,
+        already carrying any acronym expansion words), merged per field with max().
+        Returns (all_results, field_scores, sparse_issued): sparse_issued means sent,
+        not matched, which keeps zero-hit queries on the hybrid [0, 1] scale.
         """
         try:
             from qdrant_client.models import QueryRequest, SparseVector
@@ -1321,16 +1178,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
         zero and a min-max is undefined; a positive value maps to 1.0 and a zero
         value to 0.0 so that present candidates are never spuriously zeroed out.
 
-        lo/hi: optional external reference range, in place of the range of
-        `scores` itself. Every other caller omits these and gets the original
-        self-normalizing behaviour; the acronym rescore path (see
-        _blended_acronym_relevance) supplies the FULL retrieval pool's range so
-        a subset rescored on its own (ACRONYM_RESCORE_POOL_LIMIT) lands on the
-        same scale as candidates that were never rescored, instead of being
-        stretched to fill [0, 1] against just its own, possibly much narrower,
-        range. Clamped to [0, 1] since a value scored against different text
-        (the literal acronym vs its expansion) than the one lo/hi came from can
-        legitimately fall outside that external range.
+        lo/hi: optional external range (the full pool's, for a capped acronym rescore);
+        results are then clamped to [0, 1]. Omitted, the range comes from `scores`.
         """
         if not scores:
             return {}
@@ -1422,13 +1271,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
                       weights actually applied (1.0/0.0 if sparse matched nothing).
                       Absent elsewhere; never back-fill from settings.
             normalization_reference: Optional {dense_min, dense_max, sparse_min,
-                sparse_max} — when given (weighted-fusion branch only), min-max
-                normalizes against THIS range instead of computing a fresh one from
-                `field_scores`. For rescoring a capped subset of a larger pool (see
-                _blended_acronym_relevance) so the subset's scores land on the same
-                scale as the untouched remainder, rather than being locally
-                stretched to fill [0, 1] on their own. None (every other caller)
-                is the original self-normalizing behaviour.
+                sparse_max} to normalize against (weighted fusion only), for a capped rescore.
 
         Returns:
             List of ranked results sorted by weighted score (descending)
@@ -1764,24 +1607,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
         field: str,
     ) -> Dict[str, str]:
         """Return a map of source_id → match_type ('exact'|'partial') for documents
-        whose ``field`` payload (e.g. 'title' or 'summary') contains any of ``queries``.
+        whose ``field`` payload (e.g. 'title' or 'summary') matches any of ``queries``.
 
-        Takes a list — the literal query text plus every detected acronym's
-        expansion(s) — so all of them are checked in a single Qdrant round-trip
-        (one scroll with an OR/``should`` filter) instead of one scroll per text.
-        Classification is done as if each text had its own sequential scroll:
-        for each query text in order, a source_id already recorded as "exact"
-        is left alone, otherwise the first point (chunk) of that source found to
-        match is classified and recorded — reproducing the same "first match
-        wins per text, later texts can upgrade partial to exact" behavior as N
-        separate calls, since a should-filter can only return the union of what
-        N individual MatchText filters would each return on their own (never
-        fewer points), just fetched once.
-
-        Uses a MatchText payload filter against the prefix-tokenized index, then
-        refines with a Python substring check per query text so prefix and
-        mid/infix occurrences are classified. The scroll retrieves all matching
-        points (batched) so no relevant document is missed.
+        One scroll with an OR filter for all query texts; each text is classified by its
+        own rule, and "exact" is never downgraded. See acronym-design-notes.md.
         """
         matches: Dict[str, str] = {}
         normalized = self._normalize_field_match_queries(queries)
@@ -1795,10 +1624,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
             ]
         )
 
-        # Combine with any existing hard filters (org / category / etc.) — the
-        # hard filters stay required (must), while at least one query text has
-        # to match (nested should). must_not has to carry through too, or this
-        # scroll re-admits documents the caller asked to exclude.
+        # Hard filters stay required and at least one text must match; must_not is kept,
+        # or the scroll would re-admit excluded documents.
         if filter_conditions:
             combined_filter = models.Filter(
                 must=list(filter_conditions.must or []) + [text_filter],
@@ -1864,9 +1691,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
         The prefix-tokenized index broadens MatchText recall to prefixes, but a true
         infix query (e.g. 'sur' in 'insurance') may not be retrieved by the scroll.
         This in-memory pass scans the dense candidates' ``field`` payloads with a plain
-        substring check — no extra Qdrant calls — against every query text (the literal
-        query plus any acronym expansions) and adds any newly found matches, never
-        downgrading a source_id already recorded as "exact".
+        check against every query text, adding matches but never downgrading "exact".
         """
         normalized = self._normalize_field_match_queries(queries)
         if not normalized:
@@ -1883,6 +1708,29 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     break
                 if match_type == "partial" and source_id not in matches:
                     matches[source_id] = "partial"
+
+    @staticmethod
+    def _boost_config(lexical_ranking_enabled: bool, soft_acronym_ranking: bool) -> Dict[str, Any]:
+        """The title/summary multipliers actually applied, and why ("mode").
+
+        Acronym queries use the acronym bonus instead, so their multipliers are 1.0.
+        """
+        if not lexical_ranking_enabled or soft_acronym_ranking:
+            mode = "acronym_bonus" if soft_acronym_ranking else "off"
+            return {
+                "mode": mode,
+                "exact_title_boost": 1.0,
+                "partial_title_boost": 1.0,
+                "exact_summary_boost": 1.0,
+                "partial_summary_boost": 1.0,
+            }
+        return {
+            "mode": "title_summary_boost",
+            "exact_title_boost": settings.EXACT_TITLE_BOOST,
+            "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
+            "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,
+            "partial_summary_boost": settings.PARTIAL_SUMMARY_BOOST,
+        }
 
     def _apply_field_boost(
         self,
@@ -1951,21 +1799,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
         asked for. Per-field scores are reused from ``prethreshold_by_source`` when the
         document was already scored, otherwise computed from its stored vectors.
 
-        prethreshold_by_source: optional source_id -> ranked entry map (see
-        _process_and_filter_results' prethreshold_by_source_out) for documents the
-        normal pipeline DID score but that filter_score then dropped. For those,
-        the real field_scores/acronym bonus are reused and the real relevance is
-        preserved under measured_relevance — but weighted_score/relevance still go
-        through the same floor formula as every other injected document, so a
-        rescued entry can never be mistaken for a genuine semantic hit. Sources
-        genuinely absent from the candidate pool still take the floor path
-        unchanged (and get no measured_relevance, since nothing was measured).
-
-        acronyms_detected: same map _process_and_filter_results uses for the
-        acronym bonus. Only when truthy is a bonus given at all — it must stay a
-        no-op for non-acronym queries. A never-retrieved document earns its bonus
-        by _acronym_bonus against the scrolled payload's own title/summary,
-        exactly like every scored document, with the same content check.
+        prethreshold_by_source: documents scored before the threshold reuse their real
+        scores and bonus (shown as measured_relevance); the score still uses the floor.
+        acronyms_detected: when set, adds the acronym bonus. See acronym-design-notes.md.
 
         Optimized to fetch all missing documents in a single MatchAny query.
         """
@@ -1996,11 +1832,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 continue
 
             match_type = matches.get(source_id, "partial")
-            # _score_for's floor/score_floor guarantee applies here too — an
-            # injected document must never read as scoring below the threshold
-            # the caller asked for, reused or not. The acronym bonus (our
-            # addition) multiplies on top of that, same as everywhere else in
-            # the acronym path: final = relevance x (1 + bonus).
+            # Floored at the threshold like every injected document; the acronym bonus
+            # multiplies on top: final = relevance x (1 + bonus).
             relevance, boost = _score_for(match_type)
             bonus = ranked.get("acronym_bonus", 0.0)
             score = relevance * (1.0 + bonus)
@@ -2103,17 +1936,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
             logger.warning(f"Could not bulk fetch {field}-match docs: {exc}")
             return []
 
-        # Content check for the floor-path documents below, done up front in one
-        # batch rather than per document. These are documents missing from the
-        # retrieval pool — which pool they miss depends on top_k — so withholding
-        # their acronym bonus unconditionally would leave it page-size dependent
-        # in exactly the way the scored path no longer is. The same per-document
-        # BM25 check applies. None (BM25 unavailable) withholds the acronym
-        # grades, as before: nothing was measured about these documents.
-        # source_ids here is `remaining` (reassigned above) — every id already
-        # covered by prethreshold_by_source was resolved in Step 2 and never
-        # reaches this point, so no extra check for that is needed.
+        # One batched body check for the never-retrieved documents below, so their bonus
+        # doesn't depend on top_k. None (no BM25) withholds acronym grades.
         floor_body_sources: Optional[Dict[str, Set[str]]] = {}
+        floor_backing: Dict[str, Dict[str, str]] = {}
         if acronyms_detected:
             floor_candidates: List[Dict[str, Any]] = []
             considered: Set[str] = set()
@@ -2126,6 +1952,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
             floor_body_sources = self._sources_with_acronym_in_body(
                 self._sources_claiming_acronym(floor_candidates, acronyms_detected),
                 acronyms_detected=acronyms_detected,
+                backing_out=floor_backing,
             )
 
         # Step 3: Deduplicate matching points in-memory.
@@ -2141,9 +1968,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
             seen_sources.add(source_id)
 
             # Step 4: Compute the boosted score, floored at the caller's threshold.
-            # (Documents already known via prethreshold_by_source were handled in
-            # Step 2 above and never reach this loop — this is only the genuinely
-            # never-scored remainder.)
+            # (Only never-scored documents reach here.)
             match_type = matches.get(source_id, "partial")
             relevance, boost = _score_for(match_type)
 
@@ -2156,30 +1981,22 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     if score_vectors else None)
                 for f in self.priority_order
             }
-            # The bonus, unlike the scores, IS computable here: the scroll ran with
-            # with_payload=True, so this point carries the document's own title and
-            # summary — same function every scored candidate goes through, same
-            # content check (floor_body_sources, above). On the floor base the
-            # bonus is small in absolute terms, so a document nothing was measured
-            # about stays below the ones that were.
-            #
-            # Per-document, per-acronym: which of THIS point's detected acronyms
-            # were actually verified in ITS body, not just whether any acronym
-            # was backed anywhere in the batch (see _sources_with_acronym_in_body).
-            backed_acronyms = (
-                {a for a, sources in floor_body_sources.items() if str(source_id) in sources}
-                if floor_body_sources is not None
-                else set()
+            # The bonus uses this point's own title/summary and its per-acronym body
+            # check; on the floor base it stays small.
+            body_backed = (
+                self._body_backing(str(source_id), acronyms_detected, floor_body_sources, floor_backing)
+                if acronyms_detected and floor_body_sources is not None
+                else {a: None for a in (acronyms_detected or {})}
             )
-            bonus = (
-                self._acronym_bonus(
+            bonus, grades = (
+                self._acronym_bonus_detail(
                     point.payload.get("title"),
                     point.payload.get("summary"),
                     acronyms_detected,
-                    backed_acronyms,
+                    {a for a, how in body_backed.items() if how},
                 )
                 if acronyms_detected
-                else 0.0
+                else (0.0, None)
             )
             score = relevance * (1.0 + bonus)
             field_scores[match_key] = match_type
@@ -2202,6 +2019,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 "raw_dense": raw_dense,
                 "relevance": relevance,
                 "acronym_bonus": bonus,
+                "acronym_grades": grades,
+                "body_backed": body_backed if acronyms_detected else None,
                 mult_key: boost,
                 # See the note at the other injection site: this score is a keyword-match
                 # floor, so it must be distinguishable from a real fused score.

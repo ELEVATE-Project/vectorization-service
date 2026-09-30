@@ -19,9 +19,7 @@ EMBEDDING_DIM: int = embedding_model.get_embedding_dimension()
 class EmbeddingError(ValueError):
     """Raised when a query embedding cannot be produced or is malformed.
 
-    Carries enough context for structured logging and for the API layer to return a
-    meaningful error instead of leaking a cryptic Qdrant ``400`` (e.g.
-    ``Vector dimension error: expected dim: 384, got 0``).
+    Lets the API return a clear error instead of Qdrant's cryptic dimension 400.
     """
 
 
@@ -36,17 +34,9 @@ def generate_single_embedding(text: str):
 
 
 def validate_vector(vec: Any) -> List[float]:
-    """Coerce *vec* to a validated 1-D Python list of floats.
+    """Return *vec* as a 1-D list of EMBEDDING_DIM finite floats.
 
-    Guards the embedding→Qdrant boundary: a 0-length or wrong-dimension vector reaching
-    ``query_points``/``query_batch_points`` produces an opaque server-side 400. We catch
-    it in-process instead and raise :class:`EmbeddingError` with the offending dimension.
-
-    Returns:
-        The vector as a ``list[float]`` of length ``EMBEDDING_DIM``.
-
-    Raises:
-        EmbeddingError: if the vector is empty, the wrong dimension, or non-finite.
+    Raises EmbeddingError if it is empty, the wrong dimension, or non-finite.
     """
     # numpy arrays / tensors expose tolist(); fall back to list() for plain sequences.
     if hasattr(vec, "tolist"):
@@ -70,23 +60,9 @@ def validate_vector(vec: Any) -> List[float]:
 
 
 def embed_query(text: Union[str, List[str]]) -> Union[List[float], List[List[float]]]:
-    """Embed a *query* and return validated vector(s).
+    """Embed one query or a list of them in one encode() call; the return mirrors the input shape.
 
-    The single entry point every search service should use for query vectors.
-    Takes one string or a list of them, and mirrors that shape in the return: a
-    string gives one ``list[float]``, a list gives a ``list[list[float]]`` in the
-    same order.
-
-    A list is embedded with ONE encode() call rather than one per text — a real
-    batching benefit for local sentence-transformers inference (reduced per-call
-    overhead), not just fewer Python-level round trips.
-
-    Empty/whitespace input is rejected up front and every produced vector is
-    validated before it can reach Qdrant.
-
-    Raises:
-        EmbeddingError: if any text is empty/whitespace, embedding fails, or a
-            produced vector is empty/malformed.
+    Raises EmbeddingError for empty text, a failed encode, or a malformed vector.
     """
     single = isinstance(text, str)
     texts = [text] if single else list(text)
