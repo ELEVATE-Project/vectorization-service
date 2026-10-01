@@ -74,76 +74,82 @@ accepts the same shapes:
 
 ## Title and summary matching (`_build_field_match_queries`)
 
-The boost/injection path and the bonus path used to disagree about what
-"matches" means. Substring matching boosted "Dietary Guidelines" for DIET and
-"Basic Maths" for BA, while a title that really was the expansion (plural, or
-different connectives) earned a grade but was never boosted or injected. Now
-each check carries its own rule, the same rules `_acronym_bonus` uses:
+Substring matching boosted "Dietary Guidelines" for DIET and "Basic Maths" for
+BA, so each check carries its own rule:
 - `substring`: the pre-acronym behaviour, used only when no acronym is
   detected, so ordinary queries are unchanged.
-- `word`: whole-word, for the query and the acronym.
-- `phrase`: all content words present, for expansions.
+- `word`: whole-word, for the query and each acronym on acronym queries.
 
-For expansions the Qdrant `MatchText` prefilter gets only the content words.
-Sending the full phrase made it demand "of" and "and", so "District Institute
-for Education & Training" was never retrieved to be classified.
+Expansions are not matched in titles or summaries. Retrieval (the expansion's
+dense variant and BM25 words) and the relevance blend already reward documents
+that spell the expansion out; also boosting them on top over-rewarded generic
+titles. Known limitation: the `word` rule ignores case, so a "Diet" title gets
+the DIET title multiplier. Measured locally, such a document only enters as a
+keyword-injected row at the floor and ranks near the bottom; matching
+single-word acronyms case-sensitively (as the body check does) is the fix if it
+matters.
 
 `_term_in_text` uses letter/digit lookarounds instead of `\b`, because `\b`
 treats `_` as a word character and missed "DIET" in file-name titles like
 "..._DIET Empowerment..." (seen on real titles).
 
-`_phrase_in_text` requires **all** content words, allowing inflections by prefix
-("institute" ~ "institutes"). A partial threshold would promote near-misses:
-"District Primary Education Programme" shares district and education with the
-DIET expansion but is a different programme. `_words_match` limits prefix
-matches by `ACRONYM_MIN_PREFIX_MATCH_LEN` and `ACRONYM_PREFIX_SUFFIX_CAP`, so
-"tests" matches "test" but "testimony" does not.
+`_phrase_in_text` is kept for query building: it decides whether the query
+already spells out an expansion (see Search pipeline). It requires **all**
+content words, allowing inflections by prefix ("institute" ~ "institutes");
+`_words_match` limits prefix matches by `ACRONYM_MIN_PREFIX_MATCH_LEN` and
+`ACRONYM_PREFIX_SUFFIX_CAP`, so "tests" matches "test" but "testimony" does not.
 
 ## Body check (`_sources_with_acronym_in_body`)
 
-A title or summary is a claim about the topic, not evidence (the corpus has a
-"DIET Reference Handbook" about coastal navigation). So the acronym grades of
-the bonus need the document's body to back the acronym.
-- One BM25 query per acronym, restricted to the claiming sources and grouped by
-  source. Restricting to the candidates makes the answer independent of
-  `top_k`.
+Feeds the text boost: a document whose body uses the acronym gets
+`EXACT_TEXT_BOOST`.
+- One BM25 query per acronym, restricted to the checked sources and grouped by
+  source.
 - BM25 folds case, so "diet" and "DIET" look the same. The top chunks
   (`ACRONYM_BODY_CHECK_TOP_CHUNKS`) must use the acronym in capitals
-  (`_acronym_use_pattern`), so a food article titled "DIET Handbook" fails.
-  Multi-word keys ("RTE Act", "NIPUN Bharat") match in any case.
+  (`_acronym_use_pattern`), so a food article about diet fails. Multi-word keys
+  ("RTE Act", "NIPUN Bharat") match in any case.
 - Top chunks rank by how often the word appears, not by case, so a BM25 hit
   that fails in its top chunks has all its chunks read before it is rejected.
-- A body that spells out the expansion ("Parent Teacher Meeting") also backs
-  the acronym. Without this, such a PTM document ranked about 15th instead of
-  about 5th.
-- Kept per acronym: in "DIET SMC", body evidence for SMC must not back a DIET
-  title claim.
-- Returns None when BM25 cannot answer (sparse search off, encoder missing,
-  query failed), so the caller falls back instead of treating "could not check"
-  as "absent". A BM25 index with no vectors would reject everything, so if no
-  pooled row has a sparse score, BM25 is treated as unavailable.
-- The fallback (`_body_matched`) only checks for a dense `text` score. That is
-  pool membership, not relevance, and applies to all acronyms alike; it exists
-  only so a missing BM25 index does not demote every acronym document.
+- Only the acronym counts. A body that only spells out the expansion gets no
+  text boost: retrieval and the relevance blend cover it.
+- Only candidates that can still reach the page are checked (score x
+  `EXACT_TEXT_BOOST`, capped at 1.0, reaches the k-th score), best first, at
+  most `ACRONYM_BODY_CHECK_MAX_SOURCES`. The rule alone never changes a
+  ranking; the cap only can when more candidates than that could still reach
+  the page.
+- Chunks without a BM25 vector (indexed before BM25 was enabled) never answer
+  the BM25 query, so they are listed with a `has_vector` filter and their text is
+  checked directly with the same pattern. This also covers a fully pre-BM25
+  collection. On a Qdrant without `has_vector` filtering (before 1.13) the
+  lookup is rejected (HTTP 400) and those chunks stay unchecked. The rejection
+  is remembered, so later searches skip the lookup until restart; other
+  failures are retried on the next search.
+- Returns None when the check cannot run (sparse search off, encoder missing,
+  query failed); the text boost is then skipped.
+- `body_check` in the debug output: "bm25" (every checked document indexed),
+  "bm25+scan" (some read directly), "scan" (all read directly), "bm25 (scan
+  unsupported)" (Qdrant rejected has_vector; unindexed chunks unchecked), "unavailable"
+  (the check could not run), "none" (nothing to check).
 
-## Bonus (`_acronym_bonus`)
+## Field boosts (acronym queries)
 
-final = relevance x (1 + bonus). Grades: title acronym 0.40, title expansion
-0.30, summary acronym 0.20, summary expansion 0.10. They replace the old tiers
-4/2/3/1, but scale relevance instead of placing documents in bands, so a title
-can close a gap but never lift a much weaker document over a stronger one.
-- Acronym grades need body backing for *that* acronym; expansion grades do not,
-  because spelling the expansion out is itself evidence. All grades are
-  checked, so an unbacked title acronym can still earn the expansion grade.
-- With several acronyms, each gets its own best grade and they are summed, then
-  capped at `ACRONYM_BONUS_MULTI_MATCH_CAP` (0.60): a title with both SMC and
-  DIET outranks one with only DIET, without the multiplier running away.
-- Computed once per source (all chunks share title, summary and body); a live
-  acronym query ranks about 2,500 chunks over about 590 sources.
+final = acronym_pre_boost_score x title multiplier x summary multiplier x text
+multiplier, capped at 1.0. The title/summary multipliers are the ordinary
+`EXACT_*`/`PARTIAL_*` boosts, matched on the query and the acronym (see Title
+and summary matching); the text multiplier is `EXACT_TEXT_BOOST` when the body
+uses the acronym (see Body check).
+
+This replaced the acronym bonus (final = relevance x (1 + bonus), with grades
+for the acronym or expansion in the title or summary). A comparison on 33
+acronym queries found no speed difference and similar relevance, and field
+boosts are simpler code. Known trade-off: stacked multipliers on a capped score
+put many good documents at exactly 1.0, so ties at the top are common; their
+order follows the score before the cap.
 
 ## Relevance blend (`_blended_acronym_relevance`)
 
-relevance = (1 - W) x score vs query + W x score vs expansion,
+acronym_pre_boost_score = (1 - W) x score vs query + W x score vs expansion,
 W = `ACRONYM_EXPANSION_SCORE_WEIGHT` (0.5). Retrieval merges both texts with
 max(), which is right for finding documents but wrong for scoring them: a
 generic expansion scores any education document highly ("District Primary
@@ -152,31 +158,33 @@ above every real DIET document), while a bare "ptm" means almost nothing.
 Averaging needs both to agree.
 
 Only the top `ACRONYM_RESCORE_POOL_LIMIT` candidates are rescored; the rest keep
-their retrieval score. The full pool's min/max (`normalization_reference`) is
-passed so the rescored subset stays on the same scale; otherwise ordering and
-`filter_score` break at the cutoff. RRF mode rescores the whole pool, because
-RRF scores are rank-based and cannot use that reference.
+their retrieval score (and show no `acronym_pre_boost_score`). The full pool's min/max
+(`normalization_reference`) is passed so the rescored subset stays on the same
+scale; otherwise ordering and `filter_score` break at the cutoff. RRF mode
+rescores the whole pool, because RRF scores are rank-based and cannot use that
+reference.
 
 ## Settings (`app/config.py`)
 
-**`ACRONYM_EXPANSION_SCORE_WEIGHT` = 0.5, with bonuses 0.40/0.30/0.20/0.10.**
-Chosen on 2026-09-29 by comparing 0.2, 0.35, 0.65, 0.8 and 0.7-with-doubled-
-bonuses on 19 acronyms of the local corpus
-(`scripts/simulate_soft_acronym_boost.py`). At 0.2 the acronym side dominated:
-a nutrition document titled "Healthy Diet Guide" outranked real DIET documents
-(MiniLM reads "diet" as food), and documents that only spell out the expansion
-ranked far below their content. Above 0.5 the expansion's generic words took
-over ("District ... Education" pulled "District Primary Education Programme"
-into DIET's top 5; "School ... Committee" pushed SMC modules out of SMC's top
-10). At 0.5 with doubled bonuses, DIET's top 10 is all DIET documents and every
-Parent Teacher Meeting document fills PTM's top 7. Known cost: thin documents
-with the acronym only in the title (for example scanned PDFs) slip below richer
-on-topic documents.
+**`ACRONYM_EXPANSION_SCORE_WEIGHT` = 0.5.** Chosen on 2026-09-29 by comparing
+0.2, 0.35, 0.65, 0.8 and 0.7 on 19 acronyms of the local corpus
+(`scripts/simulate_soft_acronym_boost.py`; the acronym bonus still existed
+then). At 0.2 the acronym side dominated: a nutrition document titled "Healthy
+Diet Guide" outranked real DIET documents (MiniLM reads "diet" as food), and
+documents that only spell out the expansion ranked far below their content.
+Above 0.5 the expansion's generic words took over ("District ... Education"
+pulled "District Primary Education Programme" into DIET's top 5; "School ...
+Committee" pushed SMC modules out of SMC's top 10).
 
-**`ACRONYM_BONUS_MULTI_MATCH_CAP` = 0.60.** Several acronyms sum their grades
-(AC-15: taking only the best made a document about SMC and DIET rank the same
-as one about DIET). Two full title matches would sum to 0.80; the cap gives a
-visibly higher ceiling than one match (1.6x vs 1.4x) without approaching 2x.
+**`EXACT_TEXT_BOOST` = 2.0.** The text multiplier for a body that uses the
+acronym. It only applies on acronym queries, after the title/summary
+multipliers.
+
+**`ACRONYM_BODY_CHECK_MAX_SOURCES` = 200.** Caps the documents whose body the
+text boost checks, so its cost does not grow with the candidate pool. Measured
+locally: rankings identical for 33 acronym queries at `filter_score` 0.35; at
+`filter_score` 0 with top_k 100, 5 queries changed from rank 39 down, between
+near-equal scores.
 
 **`ACRONYM_RESCORE_POOL_LIMIT` = 200.** The blend costs two more Qdrant round
 trips. Uncapped it raised latency by 115% at top_k=10 and 297% at top_k=1000
@@ -256,14 +264,45 @@ connection timeouts into one during a Redis outage.
   the single multi-row INSERT for the whole batch.
 - `is_active` is optional (missing means active, for older CSVs); anything other
   than true/false is a per-row error.
-- Create vs update is decided before the upsert, because `ON CONFLICT` does not
-  report which branch ran.
+- Create vs update comes from `RETURNING (xmax = 0)` in the same upsert (an
+  inserted row has xmax 0), not from timestamps: two uploads can share the same
+  `now`. A database error says the outcome is unconfirmed (a lost connection
+  during the commit can leave it saved) and that retrying the whole file is
+  safe, since it is an upsert.
 - After the commit, active rows are refreshed in the cache and deactivated rows
   get the marker (see Cache). If the refresh fails, active keys are deleted and
   deactivated keys still get the marker. The request succeeds either way (the
   database change is done); `cache_refreshed` says whether the cache caught up.
 - `_split_expansions` is duplicated in migration `f13a664a31b6` on purpose:
   migrations must stay frozen snapshots.
+
+## Schema history (`acronym_mapping` key)
+
+Revision `f13a664a31b6` was edited before the table reached production, so a
+database recorded at that revision can hold one of these shapes:
+
+| Shape | Where it comes from |
+|---|---|
+| `id` primary key, identity GENERATED ALWAYS | `f13a664a31b6` as it is now (fresh databases) |
+| `id` primary key, identity GENERATED BY DEFAULT | `f13a664a31b6` on 2026-10-01, before the switch to ALWAYS |
+| UUID `code` primary key only | `f13a664a31b6` as it was from 2026-09-30 |
+| UUID `code` primary key plus a unique identity `id` | earlier versions of `f13a664a31b6` |
+| `id` bigserial primary key | the first version of `f13a664a31b6` |
+
+Revision `5b7dea819fa4` converts all of them to the first: it drops `code` and
+adds `id` as the key, or promotes the existing `id` (dropping its own unique
+constraint), and then makes `id` GENERATED ALWAYS (a serial column gets an
+identity that continues after the highest id). GENERATED ALWAYS means nothing
+can insert its own `id`, so the identity can never collide with a hand-written
+value. Deployment runs `alembic upgrade head` (`deployment/ansible.yml`), so every
+environment ends up with the same table without manual SQL.
+
+Its downgrade restores a UUID `code` primary key (new UUIDs; the old values are
+gone) and keeps `id` as a unique column. That shape is read by every model
+version, so an app rolled back together with `alembic downgrade -1` keeps
+working. All five histories were tested with upgrade, downgrade and upgrade on a
+throwaway database: rows kept, new rows continue after the highest id, an
+explicit id is rejected, `uq_acronym` and the expansions check stay.
 
 ## Search pipeline (`prioritized_search_service.search`)
 
@@ -285,39 +324,31 @@ words, so extra words cannot dilute it, and its tokenizer has no OR or phrases.
 All dense texts are embedded in one `encode()` call and validated before Qdrant.
 Retrieval merges same-field hits across embeddings with `max()`.
 
-**Semantic mode.** The bonus is a lexical signal, so it follows the same switch
-as the title/summary boost: off in `search_mode="semantic"` and when
-`HYBRID_SEARCH_ENABLED` is false. Retrieval is not gated: the expanded queries
-still run, so an acronym still widens *which* documents are found.
+**Semantic mode.** Acronym ranking (the blend and the field boosts) is
+lexical, so it follows the same switch as the title/summary boost: off in
+`search_mode="semantic"` and when `HYBRID_SEARCH_ENABLED` is false. Retrieval is
+not gated: the expanded queries still run, so an acronym still widens *which*
+documents are found.
 
-**Bonus placement.** Applied after the threshold (so `filter_score` judges real
-relevance) and before dedup and the `top_k` cap (so the bonus can lift a
-document onto the page). It replaced hard tiering, which sorted by (tier, score)
-and let any acronym-titled document outrank any untitled one however much
-weaker: measured, 16-43 cases per top 20 of a document ranked above one more
-than 20% more relevant.
-
-**Title/summary boost on acronym queries.** The bonus already *is* the
-title/summary signal, so the boost multipliers go neutral (1.0) instead of
-counting it twice. The match passes still run, for injection candidates and
-the `title_match`/`summary_match` debug fields. A neutral multiplier leaves the
-score untouched, so scores above 1.0 are not clamped.
+**Boost placement.** `filter_score` judges the pre-boost score. On acronym
+queries, the title, summary and text boosts are applied to every unique
+candidate before the `top_k` cut, so a boost can lift a document onto the page.
+This replaced hard tiering, which sorted by (tier, score) and let any
+acronym-titled document outrank any untitled one however much weaker:
+measured, 16-43 cases per top 20 of a document ranked above one more than 20%
+more relevant.
 
 **Injected documents** (title/summary matches the threshold dropped). If the
-pipeline scored the document before the threshold, its real field scores and
-bonus are reused, and its real relevance is shown as `measured_relevance`; the
-score itself still uses the floor formula, so it is never mistaken for a
-semantic hit. A document never retrieved gets the floor score, and its bonus is
-computed from its own scrolled title/summary with the same body check, done in
-one batch. Without that check the bonus would depend on `top_k`, because which
-documents miss the pool depends on the pool size. If BM25 cannot answer, these
-documents get no acronym grades, since nothing was measured about them.
+pipeline scored the document before the threshold, its real field scores are
+reused and its real relevance is shown as `pre_floor_score`; the score itself
+still uses the floor formula, so it is never mistaken for a semantic hit, and it
+shows no `acronym_pre_boost_score`. A document never retrieved gets the floor score.
 
-**Debug fields.** `acronym_bonus` is None (not 0.0) for non-acronym queries, so
-"never computed" is distinguishable from "computed as zero". `measured_relevance`
-is set only for reused documents.
+**Debug fields.** `acronym_pre_boost_score` (the blend, before the boosts) is set only on
+rescored rows; `acronym_in_body_match`/`acronym_in_body_multiplier` only where the text boost ran;
+`pre_floor_score` only for reused injected documents. All are debug-only.
 
-**Title match scroll.** The literal query and every expansion are checked in
+**Title match scroll.** The literal query and every acronym are checked in
 one scroll with an OR filter, not one scroll per text, classified as if each
 had its own scroll ("exact" is never downgraded). `must_not` filters carry
 into the scroll, or it would re-admit excluded documents.

@@ -259,75 +259,33 @@ class SearchResultItem(BaseModel):
                     "Applied after title_multiplier, each capped at 1.0. "
                     "Debug-only (include_scoring_debug=true)."
     )
-    acronym_bonus: Optional[float] = Field(
+    pre_floor_score: Optional[float] = Field(
         default=None,
-        description="Proportional bonus from the acronym/expansion match in title or "
-                    "summary (see the four ACRONYM_BONUS_* settings), applied as "
-                    "score = relevance x (1 + acronym_bonus). 0.0 means no bonus applied "
-                    "(neutral, not a phantom bonus) — this is the actual mechanism behind "
-                    "the boost on acronym queries; title_multiplier/summary_multiplier are "
-                    "neutralized to 1.0 there to avoid double-counting the same signal. "
-                    "None when the query wasn't an acronym query at all. "
-                    "Debug-only (include_scoring_debug=true)."
+        description="Keyword-injected rows only (debug, see match_source): the relevance "
+                    "the search measured before the threshold dropped this document and "
+                    "it was re-added as a title/summary match. Its score is the floor, "
+                    "not this value. None when debug is off, for documents that were "
+                    "never scored, and for normal results."
     )
-    measured_relevance: Optional[float] = Field(
+    acronym_pre_boost_score: Optional[float] = Field(
         default=None,
-        description="The real relevance the pipeline measured for this document before "
-                    "the search threshold dropped it and it was re-added as a keyword "
-                    "match (see match_source). weighted_score/relevance for a reused "
-                    "document are still the synthetic floor score, same as any other "
-                    "injected result — this field is only where the original, fully "
-                    "measured number is kept so it isn't lost. None both when debug is "
-                    "off and when the document was never actually measured (a genuinely "
-                    "new keyword match, or a normal non-injected result)."
+        description="Acronym queries only (debug): the score before the title, summary and "
+                    "text boosts, a blend of the query and expansion scores (see "
+                    "search_config.scoring_context.acronym_ranking). score = acronym_pre_boost_score "
+                    "x title, summary and text multipliers, capped at 1.0. None when no blend "
+                    "ran (the query already spells out the expansion, or the rescore failed; "
+                    "see scoring_context.acronym_ranking.rescore), for keyword-injected rows, "
+                    "for rows outside the rescored pool, and for ordinary queries."
     )
-    blended_score: Optional[float] = Field(
+    acronym_in_body_match: Optional[str] = Field(
         default=None,
-        description="Acronym queries only (debug): the score before the acronym bonus or "
-                    "the field boosts, a blend of the query and expansion scores (see "
-                    "search_config.scoring_context.acronym_ranking). Bonus mode: score = "
-                    "blended_score x (1 + acronym_bonus). Field-boost mode: score = "
-                    "blended_score x title, summary and text multipliers, capped at 1.0. "
-                    "No blend runs when the query already spells out the expansion (one "
-                    "dense variant) or the rescore fails (see scoring_context.acronym_ranking."
-                    "rescore): bonus mode then shows the plain fused score, field-boost mode "
-                    "None. Field-boost mode is also None for keyword-injected rows and rows "
-                    "outside the rescored pool. None otherwise."
+        description="Acronym queries only (debug): 'exact' when the body uses the acronym "
+                    "as written (capitals), else None."
     )
-    title_acronym_bonus: Optional[float] = Field(
+    acronym_in_body_multiplier: Optional[float] = Field(
         default=None,
-        description="Acronym queries only (debug): bonus for the acronym in the title "
-                    "(body must back it). The four *_bonus fields sum to acronym_bonus "
-                    "before the cap."
-    )
-    title_expansion_bonus: Optional[float] = Field(
-        default=None, description="Acronym queries only (debug): bonus for an expansion in the title."
-    )
-    summary_acronym_bonus: Optional[float] = Field(
-        default=None,
-        description="Acronym queries only (debug): bonus for the acronym in the summary "
-                    "(body must back it)."
-    )
-    summary_expansion_bonus: Optional[float] = Field(
-        default=None, description="Acronym queries only (debug): bonus for an expansion in the summary."
-    )
-    acronym_bonus_breakdown: Optional[Dict[str, Dict[str, Any]]] = Field(
-        default=None,
-        description="Acronym queries only (debug), per detected acronym: bonus_type "
-                    "(e.g. title_acronym_bonus, or none), bonus_value, matched_in (title/"
-                    "summary), matched_text (the acronym or the expansion that matched), "
-                    "body_evidence (acronym_in_body, expansion_in_body, dense_fallback, "
-                    "or null when not backed) and body_evidence_text (null when not backed)."
-    )
-    text_match: Optional[str] = Field(
-        default=None,
-        description="ACRONYM_USE_FIELD_BOOSTS only (debug): 'exact' when the body uses the "
-                    "acronym, 'partial' when it only spells out the expansion, else None."
-    )
-    text_multiplier: Optional[float] = Field(
-        default=None,
-        description="ACRONYM_USE_FIELD_BOOSTS only (debug): text boost applied "
-                    "(EXACT_TEXT_BOOST / PARTIAL_TEXT_BOOST, 1.0 when no match), else None."
+        description="Acronym queries only (debug): text boost applied (EXACT_TEXT_BOOST, "
+                    "1.0 when the body does not use the acronym), else None."
     )
     title_match: Optional[str] = Field(
         default=None,
@@ -349,7 +307,10 @@ class PrioritizedSearchResponse(BaseModel):
     )
     acronym_info: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Detected acronym(s) and their expansions, if any were found in the query"
+        description="Acronym detection for this query: enabled (ACRONYM_SEARCH_ENABLED), "
+                    "detected (an acronym was found), and when detected the mapping "
+                    "{acronym: expansions} plus ambiguous (acronyms with several meanings). "
+                    "None only when the request had no query text."
     )
 
 class TextSearchRequest(BaseModel):
