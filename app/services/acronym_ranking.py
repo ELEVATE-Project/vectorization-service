@@ -5,15 +5,17 @@ Relies on the core service's search and rank methods. Design: release-doc/acrony
 import logging
 import re
 from functools import lru_cache
-from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from qdrant_client import models
+from qdrant_client.http.exceptions import UnexpectedResponse
 # Same stopword list detection uses, so both agree on what a content word is.
 from spacy.lang.en.stop_words import STOP_WORDS
 
 from app.config import settings
 from app.constants import ACRONYM_USE_PREFIX, ACRONYM_USE_SUFFIX, WORD_TOKEN_PATTERN
 from app.core.clients.qdrant import qdrant_client
+from app.utils.text_matching import SUBSTRING, WORD, FieldMatchQuery
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +34,11 @@ def _acronym_use_pattern(acronym: str) -> "re.Pattern[str]":
     return re.compile(f"{ACRONYM_USE_PREFIX}{words}{ACRONYM_USE_SUFFIX}", flags)
 
 
-class FieldMatchQuery(NamedTuple):
-    """One title/summary check: scroll_text (Qdrant prefilter), match_text (compared
-    with the field) and rule ("substring" | "word").
-    """
-    scroll_text: str
-    match_text: str
-    rule: str
-
-
 class AcronymRankingMixin:
+    # Set when Qdrant rejects has_vector filtering (before 1.13); the direct read of
+    # chunks without BM25 is then skipped until restart. See _chunks_without_bm25.
+    _bm25_scan_unsupported = False
+
     @staticmethod
     def _acronym_substitution_pattern(acronyms: Dict[str, List[str]]) -> re.Pattern:
         """One pattern finding every detected acronym in the query text, in the shapes
@@ -65,9 +62,10 @@ class AcronymRankingMixin:
         literal_query: str,
         acronyms_detected: Optional[Dict[str, List[str]]],
     ) -> List[FieldMatchQuery]:
-        """Title/summary checks for the match passes, each with its own rule.
+        """Title/summary checks for the match passes, each with its own rule
+        (app/utils/text_matching.py).
 
-        "substring" when no acronym is detected; else "word" for the query and each acronym.
+        SUBSTRING when no acronym is detected; else WORD for the query and each acronym.
         Expansions are not matched here: retrieval and the relevance blend cover them.
         """
         queries: List[FieldMatchQuery] = []
@@ -75,62 +73,18 @@ class AcronymRankingMixin:
 
         if not acronyms_detected:
             if literal:
-                queries.append(FieldMatchQuery(literal, literal, "substring"))
+                queries.append(FieldMatchQuery(literal, literal, SUBSTRING))
             return queries
 
         if literal:
-            queries.append(FieldMatchQuery(literal, literal, "word"))
+            queries.append(FieldMatchQuery(literal, literal, WORD))
 
         for acronym in acronyms_detected:
             # The acronym alone, so "DIET handbook guidelines" still matches a
             # "DIET Handbook" title.
-            queries.append(FieldMatchQuery(acronym, acronym, "word"))
+            queries.append(FieldMatchQuery(acronym, acronym, WORD))
 
         return queries
-
-    @staticmethod
-    def _normalize_field_match_queries(
-        queries: List[FieldMatchQuery],
-    ) -> List[FieldMatchQuery]:
-        """Lowercase, trim and dedupe on (match_text, rule), keeping order."""
-        normalized: List[FieldMatchQuery] = []
-        seen: Set[Tuple[str, str]] = set()
-        for scroll_text, match_text, rule in queries:
-            scroll_lower = (scroll_text or "").strip().lower()
-            match_lower = (match_text or "").strip().lower()
-            if not scroll_lower or not match_lower:
-                continue
-            key = (match_lower, rule)
-            if key in seen:
-                continue
-            seen.add(key)
-            normalized.append(FieldMatchQuery(scroll_lower, match_lower, rule))
-        return normalized
-
-    def _classify_field_match(
-        self, match_text: str, rule: str, field_lower: str
-    ) -> Optional[str]:
-        """'exact' if the field is the text, 'partial' if it matches under `rule`, else None."""
-        # Pre-acronym behaviour, defined in one place.
-        if rule == "substring":
-            return self._classify_text_match(match_text, field_lower)
-
-        if not field_lower:
-            return None
-        if field_lower == match_text:
-            return "exact"
-        return "partial" if self._term_in_text(match_text, field_lower) else None
-
-    @staticmethod
-    def _term_in_text(term: str, text: Optional[str]) -> bool:
-        """Whole-word, case-insensitive match: "DIET" never matches inside "dietary".
-
-        Letter/digit lookarounds, not \\b, so "_DIET_" in file-name titles still matches.
-        """
-        if not term or not text:
-            return False
-        pattern = rf"(?<![A-Za-z0-9]){re.escape(term)}(?![A-Za-z0-9])"
-        return re.search(pattern, text, re.IGNORECASE) is not None
 
     @staticmethod
     @lru_cache(maxsize=2048)
@@ -250,9 +204,12 @@ class AcronymRankingMixin:
         """{source: texts of its chunks that have no BM25 vector}, for the given sources.
 
         Usually empty. On a Qdrant without has_vector filtering (before 1.13) it is
-        empty too, and those chunks stay unchecked rather than failing the check.
+        empty too, and those chunks stay unchecked rather than failing the check; the
+        rejection is remembered so later searches skip the request.
         """
         texts: Dict[str, List[str]] = {}
+        if AcronymRankingMixin._bm25_scan_unsupported:
+            return texts
         offset = None
         try:
             while True:
@@ -274,6 +231,16 @@ class AcronymRankingMixin:
                     texts.setdefault(str(payload.get("source_id")), []).append(payload.get("text") or "")
                 if offset is None:
                     return texts
+        except UnexpectedResponse as exc:
+            # 400: the server cannot parse has_vector (Qdrant before 1.13). It will not
+            # start working, so stop asking; other failures are retried next search.
+            if exc.status_code == 400:
+                AcronymRankingMixin._bm25_scan_unsupported = True
+                logger.warning(f"Qdrant rejected has_vector filtering; chunks without BM25 "
+                               f"vectors stay unchecked until restart: {exc}")
+            else:
+                logger.warning(f"Could not list chunks without BM25 vectors, leaving them unchecked: {exc}")
+            return {}
         except Exception as exc:
             logger.warning(f"Could not list chunks without BM25 vectors, leaving them unchecked: {exc}")
             return {}
@@ -338,9 +305,9 @@ class AcronymRankingMixin:
             return {"applied": False, "reason": reason, "dense_variants": dense_variants}
         return {
             "applied": True,
-            "pre_boost_score": "(1 - W) x query_score + W x expansion_score",
+            "acronym_pre_boost_score": "(1 - W) x query_score + W x expansion_score",
             "expansion_score_weight": settings.ACRONYM_EXPANSION_SCORE_WEIGHT,
-            "final_score": "pre_boost_score x title, summary and text multipliers "
+            "final_score": "acronym_pre_boost_score x title, summary and text multipliers "
                            "(see boost_config), capped at 1.0",
             "dense_variants": dense_variants,
             # None when the query already spelled out the expansion (nothing to blend).

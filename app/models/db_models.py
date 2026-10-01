@@ -37,7 +37,7 @@ class AcronymMapping(Base):
     )
 
     # Auto-incrementing integer primary key.
-    id = Column(BigInteger, Identity(always=False), primary_key=True)
+    id = Column(BigInteger, Identity(always=True), primary_key=True)
     # Stored uppercase per spec §3/§8 — detection normalizes the query token to
     # uppercase before lookup, so the dictionary key must be uppercase too.
     acronym = Column(String(32), nullable=False)

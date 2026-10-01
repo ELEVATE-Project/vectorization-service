@@ -6,7 +6,10 @@ import numpy as np
 from qdrant_client import models
 from qdrant_client.models import QueryRequest
 from app.core.clients.qdrant import qdrant_client
-from app.services.acronym_ranking import AcronymRankingMixin, FieldMatchQuery
+from app.services.acronym_ranking import AcronymRankingMixin
+from app.utils.text_matching import (
+    SUBSTRING, FieldMatchQuery, classify_field_match, normalize_queries,
+)
 # Imported as a module (not `from ... import embed_query`) so a single patch point
 # `app.core.clients.embedding.embed_query` works in tests, and so the validated query
 # helpers are always resolved through the canonical reference.
@@ -122,8 +125,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
         if relevance_override:
             for r in ranked_results:
                 if r['id'] in relevance_override:
-                    # Kept as pre_boost_score (debug): field boosts change weighted_score later.
-                    r['weighted_score'] = r['pre_boost_score'] = relevance_override[r['id']]
+                    # Kept as acronym_pre_boost_score (debug): field boosts change weighted_score later.
+                    r['weighted_score'] = r['acronym_pre_boost_score'] = relevance_override[r['id']]
             ranked_results.sort(key=lambda r: r['weighted_score'], reverse=True)
 
         # Save the best chunk per source before filtering, so documents the threshold
@@ -187,7 +190,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 # field_scores stays a pure {field: float | None} map.
                 title_match = field_scores.pop("title_match", None)
                 summary_match = field_scores.pop("summary_match", None)
-                text_match = field_scores.pop("text_match", None)
+                acronym_in_body_match = field_scores.pop("acronym_in_body_match", None)
 
                 # Remove the internal BM25 score key — it is fusion mechanics,
                 # not a per-field cosine similarity score.
@@ -231,11 +234,11 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     summary_multiplier=result_data.get('summary_multiplier', 1.0) if include_scoring_debug else None,
                     # Acronym queries only: the text boost, and the rescored score before
                     # the title, summary and text boosts.
-                    text_match=text_match if include_scoring_debug else None,
-                    text_multiplier=result_data.get('text_multiplier') if include_scoring_debug else None,
-                    pre_boost_score=result_data.get('pre_boost_score') if include_scoring_debug else None,
+                    acronym_in_body_match=acronym_in_body_match if include_scoring_debug else None,
+                    acronym_in_body_multiplier=result_data.get('acronym_in_body_multiplier') if include_scoring_debug else None,
+                    acronym_pre_boost_score=result_data.get('acronym_pre_boost_score') if include_scoring_debug else None,
                     # Real relevance of a re-injected document; None if never measured.
-                    measured_relevance=result_data.get('measured_relevance') if include_scoring_debug else None,
+                    pre_floor_score=result_data.get('pre_floor_score') if include_scoring_debug else None,
                 ))
             except Exception as e:
                 logger.warning(f"Failed to parse result item {result_data.get('id')}: {str(e)}")
@@ -317,7 +320,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
 
             # Title/summary boost is a KEYWORD substring match, not a semantic match: it must
             # use the ORIGINAL query. The preprocessed query drops stop-words, which breaks the
-            # contiguous-substring check in _classify_text_match when a stop-word sits between
+            # contiguous-substring check in classify_text_match when a stop-word sits between
             # content words (e.g. "ministry of education" → "ministry education"). See CLAUDE.md §15.
             query_for_keyword_match = request.query
 
@@ -327,11 +330,15 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 if acronyms_detected:
                     logger.info(f"Acronyms detected in query: {list(acronyms_detected.keys())}")
 
-            # Reported as acronym_info (null if none detected); "ambiguous" lists
-            # acronyms with more than one meaning (AC-11).
-            acronym_info = None
+            # Reported as acronym_info. "enabled" separates "acronym search is off" from
+            # "no acronym in this query"; "ambiguous" lists acronyms with more than one
+            # meaning (AC-11).
+            acronym_info: Dict[str, Any] = {
+                "enabled": settings.ACRONYM_SEARCH_ENABLED,
+                "detected": bool(acronyms_detected),
+            }
             if acronyms_detected:
-                acronym_info = {"detected": True, "mapping": acronyms_detected}
+                acronym_info["mapping"] = acronyms_detected
                 ambiguous = [a for a, exps in acronyms_detected.items() if len(exps) > 1]
                 if ambiguous:
                     acronym_info["ambiguous"] = ambiguous
@@ -667,12 +674,13 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     scoring_context["acronym_body_check"] = (
                         "none" if not checked
                         else "unavailable" if text_matches is None
+                        else "bm25 (scan unsupported)" if self._bm25_scan_unsupported
                         else "scan" if scanned >= checked
                         else "bm25+scan" if scanned else "bm25"
                     )
                     # Text matches are only ever "exact", so the partial tier is unused.
                     top_results = self._apply_field_boost(
-                        top_results, text_matches or {}, "text", settings.EXACT_TEXT_BOOST, 1.0,
+                        top_results, text_matches or {}, "acronym_in_body", settings.EXACT_TEXT_BOOST, 1.0,
                     )
 
                 # The boosts live in weighted_score itself, so a caller that re-sorts by
@@ -1591,19 +1599,6 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 continue
         return result_items
 
-    @staticmethod
-    def _classify_text_match(query_lower: str, field_lower: str) -> Optional[str]:
-        """Classify how ``query_lower`` matches ``field_lower``.
-
-        Returns 'exact' (whole field equals query), 'partial' (substring match —
-        covers both prefix and mid/infix occurrences), or None (no match). Infix
-        ('mid') matches are intentionally folded into 'partial' so the response
-        contract stays {exact, partial, None}.
-        """
-        if not field_lower or query_lower not in field_lower:
-            return None
-        return "exact" if field_lower == query_lower else "partial"
-
     def _get_field_match_sources(
         self,
         queries: List[FieldMatchQuery],
@@ -1617,7 +1612,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
         own rule, and "exact" is never downgraded. See acronym-design-notes.md.
         """
         matches: Dict[str, str] = {}
-        normalized = self._normalize_field_match_queries(queries)
+        normalized = normalize_queries(queries)
         if not normalized:
             return matches
 
@@ -1670,7 +1665,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 if not source_id or source_id in matched_this_query:
                     continue
                 raw_value = point.payload.get(field) or ""
-                match_type = self._classify_field_match(match_text, rule, raw_value.lower())
+                match_type = classify_field_match(match_text, rule, raw_value.lower())
                 if match_type:
                     matched_this_query.add(source_id)
                     if matches.get(source_id) != "exact":
@@ -1697,7 +1692,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
         This in-memory pass scans the dense candidates' ``field`` payloads with a plain
         check against every query text, adding matches but never downgrading "exact".
         """
-        normalized = self._normalize_field_match_queries(queries)
+        normalized = normalize_queries(queries)
         if not normalized:
             return
         for result in ranked_results:
@@ -1706,7 +1701,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 continue
             raw_value = (result["payload"].get(field) or "").lower()
             for _, match_text, rule in normalized:
-                match_type = self._classify_field_match(match_text, rule, raw_value)
+                match_type = classify_field_match(match_text, rule, raw_value)
                 if match_type == "exact":
                     matches[source_id] = "exact"
                     break
@@ -1812,7 +1807,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
         document was already scored, otherwise computed from its stored vectors.
 
         prethreshold_by_source: documents scored before the threshold reuse their real
-        scores (shown as measured_relevance); the score still uses the floor.
+        scores (shown as pre_floor_score); the score still uses the floor.
 
         Optimized to fetch all missing documents in a single MatchAny query.
         """
@@ -1853,9 +1848,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
             entry["weighted_score"] = score
             # The real relevance the pipeline measured before the threshold dropped this
             # document, overwritten by the floor above; kept so it isn't lost with zero trace.
-            entry["measured_relevance"] = ranked.get("weighted_score")
-            # The score is now the floor, not the blend; measured_relevance keeps the real one.
-            entry.pop("pre_boost_score", None)
+            entry["pre_floor_score"] = ranked.get("weighted_score")
+            # The score is now the floor, not the blend; pre_floor_score keeps the real one.
+            entry.pop("acronym_pre_boost_score", None)
             entry[mult_key] = boost
             # Marks the score as a keyword-match floor, not a semantic one; otherwise an
             # all-injected response is indistinguishable from a real result set.
@@ -2010,7 +2005,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
         filter_conditions: Optional[models.Filter],
     ) -> Dict[str, str]:
         return self._get_field_match_sources(
-            [FieldMatchQuery(query, query, "substring")], filter_conditions, "title"
+            [FieldMatchQuery(query, query, SUBSTRING)], filter_conditions, "title"
         )
 
     def _apply_title_boost(

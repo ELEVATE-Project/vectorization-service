@@ -25,7 +25,9 @@ import types
 import pytest
 
 from app.config import settings
+from app.services.acronym_ranking import AcronymRankingMixin
 from app.services.prioritized_search_service import PrioritizedSearchService
+from app.utils import text_matching
 
 SPARSE = settings.SPARSE_VECTOR_NAME
 FIELDS = list(settings.SEARCH_PRIORITY_ORDER)
@@ -33,7 +35,9 @@ WEIGHTS = dict(settings.SEARCH_PRIORITY_WEIGHTS)
 
 
 @pytest.fixture
-def service():
+def service(monkeypatch):
+    # The has_vector rejection is remembered on the class; start every test without it.
+    monkeypatch.setattr(AcronymRankingMixin, "_bm25_scan_unsupported", False)
     return PrioritizedSearchService()
 
 
@@ -175,14 +179,14 @@ class TestWordsMatch:
 
 
 class TestAcronymFieldMatch:
-    """Title/summary match rules for acronym queries (_classify_field_match): the
+    """Title/summary match rules for acronym queries (text_matching): the
     query and the acronym as whole words. The expansion is not matched in titles."""
 
     @staticmethod
     def _match(service, title):
-        queries = service._normalize_field_match_queries(
+        queries = text_matching.normalize_queries(
             service._build_field_match_queries("DIET", ACR))
-        found = {service._classify_field_match(text, rule, title.lower())
+        found = {text_matching.classify_field_match(text, rule, title.lower())
                  for _, text, rule in queries}
         return "exact" if "exact" in found else "partial" if "partial" in found else None
 
@@ -339,7 +343,7 @@ class TestFieldMatchInjection:
         assert entry["raw_dense"] == 0.2228
         assert entry["keyword_score"] == 0.0
         # the real relevance the pipeline measured is kept, not just dropped
-        assert entry["measured_relevance"] == pytest.approx(0.31)
+        assert entry["pre_floor_score"] == pytest.approx(0.31)
 
     def test_reused_and_never_scored_sources_land_on_the_same_floor(self, service, monkeypatch):
         """A reused source and a never-scored source get the identical weighted_score
@@ -364,8 +368,8 @@ class TestFieldMatchInjection:
         assert floor_only["field_scores"]["tags"] is None
         assert with_real["field_scores"]["tags"] == 0.61
         # never-scored path has nothing measured to preserve; reused path does
-        assert "measured_relevance" not in floor_only
-        assert with_real["measured_relevance"] == pytest.approx(0.31)
+        assert "pre_floor_score" not in floor_only
+        assert with_real["pre_floor_score"] == pytest.approx(0.31)
 
     def test_boost_cap_still_applies(self, service, monkeypatch):
         """The floor/boost/score_floor formula never produces a score above 1.0,
@@ -442,20 +446,20 @@ class TestFieldMatchInjection:
         assert entry["weighted_score"] == pytest.approx(self.FLOOR * settings.PARTIAL_TITLE_BOOST)
         assert "acronym_bonus" not in entry
 
-    def test_reused_doc_reports_its_measured_score(self, service, monkeypatch):
+    def test_reused_doc_reports_its_pre_floor_score(self, service, monkeypatch):
         """A document scored before the threshold takes the floor, its real score is
-        kept as measured_relevance, and it shows no pre-boost score."""
+        kept as pre_floor_score, and it shows no pre-boost score."""
         self._patch_scroll(monkeypatch, [])
         real = {"id": "pt-f", "payload": {"source_id": "F"}, "weighted_score": 0.31,
-                "pre_boost_score": 0.31, "field_scores": {}}
+                "acronym_pre_boost_score": 0.31, "field_scores": {}}
         entry = service._fetch_field_match_docs(
             ["F"], {"F": "partial"}, "title",
             settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
             prethreshold_by_source={"F": real},
         )[0]
         assert entry["weighted_score"] == pytest.approx(self.FLOOR * settings.PARTIAL_TITLE_BOOST)
-        assert entry["measured_relevance"] == 0.31
-        assert "pre_boost_score" not in entry
+        assert entry["pre_floor_score"] == 0.31
+        assert "acronym_pre_boost_score" not in entry
 
 
 # ── 5. Multipliers themselves are untouched ───────────────────────────────────
@@ -570,14 +574,15 @@ class TestAcronymRankingFollowsLexicalRanking:
     """
 
     def _run(self, service, monkeypatch, search_mode, hybrid_enabled=True,
-             field_scores=None, acronyms=None, top_k=10, titles=None, **request_fields):
+             field_scores=None, acronyms=None, top_k=10, titles=None,
+             acronym_search_enabled=True, **request_fields):
         from app.models.api_models import PrioritizedSearchRequest
 
         detected = dict(ACR) if acronyms is None else acronyms
         monkeypatch.setattr(
             "app.services.prioritized_search_service.detect_acronyms",
             lambda q: dict(detected))
-        monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", True)
+        monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", acronym_search_enabled)
         monkeypatch.setattr(settings, "HYBRID_SEARCH_ENABLED", hybrid_enabled)
         monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", False)
         monkeypatch.setattr(
@@ -660,7 +665,21 @@ class TestAcronymRankingFollowsLexicalRanking:
             self, service, monkeypatch):
         """Retrieval widening is NOT gated — only ranking is."""
         response = self._run(service, monkeypatch, "semantic")
-        assert response.acronym_info == {"detected": True, "mapping": dict(ACR)}
+        assert response.acronym_info == {"enabled": True, "detected": True, "mapping": dict(ACR)}
+
+    @pytest.mark.parametrize("enabled, acronyms, expected", [
+        (False, None, {"enabled": False, "detected": False}),
+        (True, {}, {"enabled": True, "detected": False}),
+        (True, None, {"enabled": True, "detected": True, "mapping": dict(ACR)}),
+        (True, {"SSC": ["Staff Selection Commission", "Sainik School Society"]},
+         {"enabled": True, "detected": True, "ambiguous": ["SSC"],
+          "mapping": {"SSC": ["Staff Selection Commission", "Sainik School Society"]}}),
+    ])
+    def test_acronym_info_separates_disabled_from_not_detected(
+            self, service, monkeypatch, enabled, acronyms, expected):
+        response = self._run(service, monkeypatch, "hybrid", acronyms=acronyms,
+                             acronym_search_enabled=enabled)
+        assert response.acronym_info == expected
 
     @pytest.mark.parametrize("search_mode, expected", [("semantic", False), ("hybrid", True)])
     def test_text_boost_runs_only_in_hybrid_mode(
@@ -737,8 +756,8 @@ class TestAcronymScoringContext:
 # ── Acronym debug fields: pre-boost score and text boost ──────────────────
 
 class TestAcronymDebugFields:
-    """pre_boost_score is set only on rows the relevance blend rescored; text_match
-    and text_multiplier only where the text boost ran. All are debug-only."""
+    """acronym_pre_boost_score is set only on rows the relevance blend rescored; acronym_in_body_match
+    and acronym_in_body_multiplier only where the text boost ran. All are debug-only."""
 
     @staticmethod
     def _row(**extra):
@@ -748,17 +767,17 @@ class TestAcronymDebugFields:
 
     def test_ordinary_injected_row_has_no_acronym_fields(self, service):
         item = service._build_result_items([self._row()], True)[0]
-        assert item.pre_boost_score is None and item.text_multiplier is None
+        assert item.acronym_pre_boost_score is None and item.acronym_in_body_multiplier is None
         assert item.match_source == "title_keyword_match"
 
-    def test_rescored_row_shows_its_pre_boost_score(self, service):
-        item = service._build_result_items([self._row(pre_boost_score=0.5)], True)[0]
-        assert item.pre_boost_score == 0.5
+    def test_rescored_row_shows_its_acronym_pre_boost_score(self, service):
+        item = service._build_result_items([self._row(acronym_pre_boost_score=0.5)], True)[0]
+        assert item.acronym_pre_boost_score == 0.5
 
     def test_fields_hidden_without_debug(self, service):
         item = service._build_result_items(
-            [self._row(pre_boost_score=0.5, text_multiplier=2.0)], False)[0]
-        assert item.pre_boost_score is None and item.text_multiplier is None
+            [self._row(acronym_pre_boost_score=0.5, acronym_in_body_multiplier=2.0)], False)[0]
+        assert item.acronym_pre_boost_score is None and item.acronym_in_body_multiplier is None
 
 
 # ── Acronym queries: title/summary boosts plus the text boost ─────────────
@@ -786,26 +805,26 @@ class TestAcronymFieldBoosts:
     def test_text_boost_stacks_on_the_title_boost(self, service, monkeypatch):
         _, by_source = self._run(service, monkeypatch, {"A": "exact"})
         a, b = by_source["A"], by_source["B"]
-        assert (a.text_match, a.text_multiplier) == ("exact", settings.EXACT_TEXT_BOOST)
-        assert (b.text_match, b.text_multiplier) == (None, 1.0)
+        assert (a.acronym_in_body_match, a.acronym_in_body_multiplier) == ("exact", settings.EXACT_TEXT_BOOST)
+        assert (b.acronym_in_body_match, b.acronym_in_body_multiplier) == (None, 1.0)
         # A's title "DIET Handbook" is a partial title match; B's title has no match.
         assert a.title_multiplier == settings.PARTIAL_TITLE_BOOST
         assert a.score == pytest.approx(
-            min(a.pre_boost_score * settings.PARTIAL_TITLE_BOOST * settings.EXACT_TEXT_BOOST, 1.0))
+            min(a.acronym_pre_boost_score * settings.PARTIAL_TITLE_BOOST * settings.EXACT_TEXT_BOOST, 1.0))
         assert b.title_multiplier == 1.0
-        assert b.score == pytest.approx(b.pre_boost_score)
+        assert b.score == pytest.approx(b.acronym_pre_boost_score)
 
-    def test_score_rebuilds_from_the_pre_boost_score(self, service, monkeypatch):
+    def test_score_rebuilds_from_the_acronym_pre_boost_score(self, service, monkeypatch):
         _, by_source = self._run(service, monkeypatch, {"A": "exact"})
         for r in by_source.values():
             assert r.score == pytest.approx(min(
-                r.pre_boost_score * r.title_multiplier * r.summary_multiplier
-                * r.text_multiplier, 1.0))
+                r.acronym_pre_boost_score * r.title_multiplier * r.summary_multiplier
+                * r.acronym_in_body_multiplier, 1.0))
 
-    def test_pre_boost_score_hidden_without_debug(self, service, monkeypatch):
+    def test_acronym_pre_boost_score_hidden_without_debug(self, service, monkeypatch):
         _, by_source = self._run(service, monkeypatch, {"A": "exact"},
                                  include_scoring_debug=False)
-        assert all(r.pre_boost_score is None for r in by_source.values())
+        assert all(r.acronym_pre_boost_score is None for r in by_source.values())
 
     def _status(self, service, monkeypatch, scanned_sources, result=True):
         """body_check for a run whose body check read `scanned_sources` directly;
@@ -824,8 +843,8 @@ class TestAcronymFieldBoosts:
         """No candidate has a BM25 score (documents indexed before BM25): their
         chunks are read directly, so A still earns the text boost."""
         response, by_source = self._status(service, monkeypatch, {"A", "B"})
-        assert by_source["A"].text_match == "exact"
-        assert by_source["A"].text_multiplier == settings.EXACT_TEXT_BOOST
+        assert by_source["A"].acronym_in_body_match == "exact"
+        assert by_source["A"].acronym_in_body_multiplier == settings.EXACT_TEXT_BOOST
         assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == "scan"
 
     @pytest.mark.parametrize("scanned, result, expected", [
@@ -838,9 +857,15 @@ class TestAcronymFieldBoosts:
         response, _ = self._status(service, monkeypatch, scanned, result)
         assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == expected
 
+    def test_body_check_status_when_qdrant_rejects_the_scan(self, service, monkeypatch):
+        monkeypatch.setattr(AcronymRankingMixin, "_bm25_scan_unsupported", True)
+        response, _ = self._status(service, monkeypatch, set())
+        assert (response.search_config["scoring_context"]["acronym_ranking"]["body_check"]
+                == "bm25 (scan unsupported)")
+
     def test_indexed_pool_runs_the_text_boost(self, service, monkeypatch):
         response, by_source = self._run(service, monkeypatch, {"A": "exact"})
-        assert by_source["A"].text_match == "exact"
+        assert by_source["A"].acronym_in_body_match == "exact"
         assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == "bm25"
 
     def test_text_boost_can_lift_a_document_onto_the_page(self, service, monkeypatch):
@@ -859,7 +884,7 @@ class TestAcronymFieldBoosts:
             field_scores={"pt-A": {"title": 0.30, "text": 0.10, SPARSE: 5.0},
                           "pt-B": {"title": 0.90}})
         assert [r.source_id for r in response.results] == ["A"]
-        assert response.results[0].text_multiplier == settings.EXACT_TEXT_BOOST
+        assert response.results[0].acronym_in_body_multiplier == settings.EXACT_TEXT_BOOST
         assert response.results[0].score == pytest.approx(0.4 * settings.EXACT_TEXT_BOOST)
 
     def test_body_check_skips_candidates_that_cannot_reach_the_page(
@@ -898,7 +923,7 @@ class TestAcronymFieldBoosts:
                           "pt-B": {"title": 0.90}})
         assert seen == [{"B"}]
         assert response.results[0].source_id == "B"
-        assert response.results[0].text_match == "exact"
+        assert response.results[0].acronym_in_body_match == "exact"
         assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == "bm25"
 
     def test_body_check_reports_a_direct_read(self, service, monkeypatch):
@@ -912,7 +937,7 @@ class TestAcronymFieldBoosts:
         response = TestAcronymRankingFollowsLexicalRanking()._run(
             service, monkeypatch, "hybrid", include_scoring_debug=True,
             field_scores={pid: dict(s) for pid, s in self.INDEXED.items()})
-        assert {r.source_id: r for r in response.results}["A"].text_match == "exact"
+        assert {r.source_id: r for r in response.results}["A"].acronym_in_body_match == "exact"
         assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == "bm25+scan"
 
 
@@ -1127,6 +1152,31 @@ class TestBodyCheckUsesTheAcronym:
         assert service._sources_with_acronym_in_body(
             {"DIET": {"A"}}, scanned_out=scanned) == {"DIET": {"A"}}
         assert scanned == set()
+
+    @pytest.mark.parametrize("status, remembered", [(400, True), (500, False)])
+    def test_a_rejected_has_vector_filter_is_not_retried(
+            self, service, monkeypatch, status, remembered):
+        """400 = Qdrant before 1.13 cannot parse has_vector: later searches skip the
+        lookup. Any other failure may be transient, so it is tried again."""
+        from qdrant_client.http.exceptions import UnexpectedResponse
+        from app.services import acronym_ranking
+
+        self._stub_qdrant(monkeypatch, acronym_hits={"A": "The DIET faculty met."})
+        stub_scroll = acronym_ranking.qdrant_client.scroll
+        lookups = []
+
+        def scroll_rejecting_has_vector(**kwargs):
+            if kwargs["scroll_filter"].must_not:
+                lookups.append(1)
+                raise UnexpectedResponse(status, "Bad Request", b"", {})
+            return stub_scroll(**kwargs)
+
+        monkeypatch.setattr(
+            "app.services.acronym_ranking.qdrant_client.scroll", scroll_rejecting_has_vector)
+        for _ in range(2):
+            assert service._sources_with_acronym_in_body({"DIET": {"A"}}) == {"DIET": {"A"}}
+        assert service._bm25_scan_unsupported is remembered
+        assert len(lookups) == (1 if remembered else 2)
 
 
 # ── A bare-acronym BM25 hit must be the acronym, not the everyday word ────
