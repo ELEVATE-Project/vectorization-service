@@ -105,11 +105,9 @@ class Settings(BaseSettings):
     # Summary boosts are lower than title (summary carries less weight than title).
     EXACT_SUMMARY_BOOST: float = float(os.getenv("EXACT_SUMMARY_BOOST", "1.4"))
     PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.2"))
-    # Acronym queries only: true replaces the acronym bonus with the title/summary boosts
-    # above plus a text boost (body uses the acronym: exact; only the expansion: partial).
-    ACRONYM_USE_FIELD_BOOSTS: bool = os.getenv("ACRONYM_USE_FIELD_BOOSTS", "false").lower() == "true"
+    # Acronym queries only: text boost on top of the title/summary boosts above, when
+    # the body uses the acronym as written (capitals).
     EXACT_TEXT_BOOST: float = float(os.getenv("EXACT_TEXT_BOOST", "2.0"))
-    PARTIAL_TEXT_BOOST: float = float(os.getenv("PARTIAL_TEXT_BOOST", "1.5"))
     METADATA_MATCH_BOOST: float = float(os.getenv("METADATA_MATCH_BOOST", "1.2"))
     # How many keyword-matched documents we are willing to score per search. Scoring
     # each one downloads 5 vectors, and a short query can match thousands of titles.
@@ -130,16 +128,9 @@ class Settings(BaseSettings):
     # (SSC, DM, MIP have two). See design notes, Settings.
     ACRONYM_MAX_DENSE_VARIANTS: int = int(os.getenv("ACRONYM_MAX_DENSE_VARIANTS", "3"))
 
-    # Acronym ranking: relevance = (1 - W) x query score + W x expansion score,
-    # final = relevance x (1 + bonus). W and bonuses: see design notes, Settings.
+    # Acronym ranking: pre-boost score = (1 - W) x query score + W x expansion score,
+    # then the title, summary and text boosts. W: see design notes, Settings.
     ACRONYM_EXPANSION_SCORE_WEIGHT: float = float(os.getenv("ACRONYM_EXPANSION_SCORE_WEIGHT", "0.5"))
-    ACRONYM_BONUS_TITLE_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_TITLE_ACRONYM", "0.40"))
-    ACRONYM_BONUS_TITLE_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_TITLE_EXPANSION", "0.30"))
-    ACRONYM_BONUS_SUMMARY_ACRONYM: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_ACRONYM", "0.20"))
-    ACRONYM_BONUS_SUMMARY_EXPANSION: float = float(os.getenv("ACRONYM_BONUS_SUMMARY_EXPANSION", "0.10"))
-
-    # Cap on the bonus summed across several matched acronyms (1.6x max vs 1.4x for one).
-    ACRONYM_BONUS_MULTI_MATCH_CAP: float = float(os.getenv("ACRONYM_BONUS_MULTI_MATCH_CAP", "0.60"))
 
     # Only the top N candidates are rescored by the blend (uncapped it tripled latency).
     ACRONYM_RESCORE_POOL_LIMIT: int = int(os.getenv("ACRONYM_RESCORE_POOL_LIMIT", "200"))
