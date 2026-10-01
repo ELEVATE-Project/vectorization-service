@@ -1,15 +1,17 @@
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
     DateTime,
+    Identity,
     Index,
     String,
     Text,
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from datetime import datetime, timezone
 
@@ -34,8 +36,8 @@ class AcronymMapping(Base):
         Index("idx_acronym_active", "acronym", "is_active"),
     )
 
-    # UUID primary key, not an auto-incrementing integer — not guessable/enumerable.
-    code = Column(UUID(as_uuid=True), primary_key=True, server_default=text("gen_random_uuid()"))
+    # Auto-incrementing integer primary key.
+    id = Column(BigInteger, Identity(always=False), primary_key=True)
     # Stored uppercase per spec §3/§8 — detection normalizes the query token to
     # uppercase before lookup, so the dictionary key must be uppercase too.
     acronym = Column(String(32), nullable=False)

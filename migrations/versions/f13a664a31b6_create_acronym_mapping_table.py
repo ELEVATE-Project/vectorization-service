@@ -13,7 +13,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 # revision identifiers, used by Alembic.
@@ -106,11 +106,8 @@ def upgrade() -> None:
 
     op.create_table(
         'acronym_mapping',
-        # UUID PK
-        sa.Column(
-            'code', UUID(as_uuid=True), primary_key=True,
-            server_default=sa.text('gen_random_uuid()'),
-        ),
+        # Auto-incrementing integer PK
+        sa.Column('id', sa.BigInteger(), sa.Identity(always=False), primary_key=True),
         sa.Column('acronym', sa.String(length=32), nullable=False),
         sa.Column(
             'expansions', JSONB(), nullable=False, server_default=sa.text("'[]'::jsonb")
