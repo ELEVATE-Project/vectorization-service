@@ -652,16 +652,18 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     logger.info(f"Injected {len(injected)} summary-match docs missing from semantic results")
 
                 # Text boost (acronym queries): the body uses the acronym as written.
+                # Only candidates that can still reach the page are checked (capped).
                 # Skipped, and reported, when BM25 cannot answer — including when no
                 # candidate has a BM25 score (documents not indexed for BM25 yet),
                 # which would otherwise read as "no body matches".
                 if soft_acronym_ranking:
+                    check_pool = self._body_check_pool(top_results, top_k)
                     bm25_indexed = any(
                         (r.get("field_scores") or {}).get(settings.SPARSE_VECTOR_NAME)
-                        for r in top_results
+                        for r in check_pool
                     )
                     text_matches = self._text_matches_for_acronyms(
-                        {str(r["payload"].get("source_id")) for r in top_results
+                        {str(r["payload"].get("source_id")) for r in check_pool
                          if r["payload"].get("source_id") is not None},
                         acronyms_detected,
                     ) if bm25_indexed else None
@@ -1708,6 +1710,22 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     break
                 if match_type == "partial" and source_id not in matches:
                     matches[source_id] = "partial"
+
+    @staticmethod
+    def _body_check_pool(results: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+        """Candidates whose body the text boost checks: those that can still reach the
+        page, best first, at most ACRONYM_BODY_CHECK_MAX_SOURCES.
+
+        The boost only raises a score, by at most EXACT_TEXT_BOOST (capped at 1.0), so a
+        candidate that stays below the k-th score even when boosted cannot make the page.
+        """
+        ranked = sorted(results, key=lambda r: r["weighted_score"], reverse=True)
+        kth = ranked[top_k - 1]["weighted_score"] if len(ranked) > top_k else 0.0
+        reachable = [
+            r for r in ranked
+            if min(r["weighted_score"] * settings.EXACT_TEXT_BOOST, 1.0) >= kth
+        ]
+        return reachable[:settings.ACRONYM_BODY_CHECK_MAX_SOURCES]
 
     @staticmethod
     def _boost_config(lexical_ranking_enabled: bool, soft_acronym_ranking: bool) -> Dict[str, Any]:

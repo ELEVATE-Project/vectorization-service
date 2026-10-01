@@ -839,6 +839,50 @@ class TestAcronymFieldBoosts:
         assert response.results[0].text_multiplier == settings.EXACT_TEXT_BOOST
         assert response.results[0].score == pytest.approx(0.4 * settings.EXACT_TEXT_BOOST)
 
+    def test_body_check_skips_candidates_that_cannot_reach_the_page(
+            self, service, monkeypatch):
+        """With top_k=1 and dense/BM25 weights 0.8/0.2, B starts at 0.8 and A at 0.2;
+        even x2.0 leaves A at 0.4, below B, so A's body is never checked."""
+        monkeypatch.setattr(settings, "HYBRID_DENSE_WEIGHT", 0.8)
+        monkeypatch.setattr(settings, "HYBRID_SPARSE_WEIGHT", 0.2)
+        seen = []
+        monkeypatch.setattr(
+            PrioritizedSearchService, "_text_matches_for_acronyms",
+            lambda self, sources, acronyms: seen.append(set(sources)) or {})
+        response = TestAcronymRankingFollowsLexicalRanking()._run(
+            service, monkeypatch, "hybrid", top_k=1,
+            titles={"A": "Annual handbook", "B": "Nutrition guide"},
+            field_scores={"pt-A": {"title": 0.30, "text": 0.10, SPARSE: 5.0},
+                          "pt-B": {"title": 0.90, SPARSE: 1.0}})
+        assert seen == [{"B"}]
+        assert [r.source_id for r in response.results] == ["B"]
+
+
+class TestBodyCheckPool:
+    """_body_check_pool: candidates that can still reach the page, best first, capped."""
+
+    @staticmethod
+    def _rows(*scores):
+        return [{"id": f"p{i}", "weighted_score": s} for i, s in enumerate(scores)]
+
+    def test_keeps_only_candidates_that_can_reach_the_page(self):
+        # top_k=2: the k-th score is 0.6; 0.31 x 2 = 0.62 can pass it, 0.29 x 2 cannot.
+        pool = PrioritizedSearchService._body_check_pool(self._rows(0.9, 0.6, 0.31, 0.29), 2)
+        assert [r["weighted_score"] for r in pool] == [0.9, 0.6, 0.31]
+
+    def test_a_boosted_tie_with_the_kth_score_is_kept(self):
+        pool = PrioritizedSearchService._body_check_pool(self._rows(0.9, 0.6, 0.3), 2)
+        assert [r["weighted_score"] for r in pool] == [0.9, 0.6, 0.3]
+
+    def test_everything_is_checked_when_the_page_is_not_full(self):
+        pool = PrioritizedSearchService._body_check_pool(self._rows(0.2, 0.9, 0.1), 10)
+        assert [r["weighted_score"] for r in pool] == [0.9, 0.2, 0.1]
+
+    def test_the_pool_is_capped_best_first(self, monkeypatch):
+        monkeypatch.setattr(settings, "ACRONYM_BODY_CHECK_MAX_SOURCES", 2)
+        pool = PrioritizedSearchService._body_check_pool(self._rows(0.5, 0.9, 0.7, 0.8), 10)
+        assert [r["weighted_score"] for r in pool] == [0.9, 0.8]
+
 
 # ── The acronym rescore cap is skipped in RRF mode ────────────────────────
 

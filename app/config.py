@@ -138,6 +138,9 @@ class Settings(BaseSettings):
     ACRONYM_MAX_PHRASE_WORDS: int = int(os.getenv("ACRONYM_MAX_PHRASE_WORDS", "4"))
     # Top BM25 chunks per document read when checking its body backs an acronym claim.
     ACRONYM_BODY_CHECK_TOP_CHUNKS: int = int(os.getenv("ACRONYM_BODY_CHECK_TOP_CHUNKS", "3"))
+    # Most documents whose body the text boost checks per query: only candidates that
+    # can still reach the page are checked, best first, up to this many.
+    ACRONYM_BODY_CHECK_MAX_SOURCES: int = int(os.getenv("ACRONYM_BODY_CHECK_MAX_SOURCES", "200"))
 
     # Master switch for acronym search; off gives exactly the pre-feature ranking.
     ACRONYM_SEARCH_ENABLED: bool = os.getenv("ACRONYM_SEARCH_ENABLED", "true").lower() == "true"
