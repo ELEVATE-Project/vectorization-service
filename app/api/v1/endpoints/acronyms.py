@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import verify_admin_token, verify_internal_token
@@ -99,7 +100,20 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
 
     # bulk_upsert/refresh_cache/invalidate_cache are all synchronous, blocking
     # Postgres/Redis I/O — run_in_threadpool keeps them off the event loop.
-    created, updated, deactivated, errors = await run_in_threadpool(bulk_upsert, rows)
+    try:
+        created, updated, deactivated, errors = await run_in_threadpool(bulk_upsert, rows)
+    except SQLAlchemyError as e:
+        # One transaction, so usually nothing was saved — but a connection lost during
+        # the commit can leave it saved without confirmation. Retrying is safe: the
+        # upload is an upsert, so repeating the file gives the same rows.
+        logger.error(f"Acronym bulk upload failed in the database, outcome unconfirmed: {e}")
+        raise HTTPException(
+            status_code=503 if isinstance(e, OperationalError) else 500,
+            detail=(
+                "Database error: the upload could not be confirmed. Retrying the whole "
+                "file is safe; check the saved acronyms if unsure."
+            ),
+        ) from e
 
     # Committed already; now refresh active rows and mark deactivated ones.
     # cache_refreshed=False means stale entries may be served. See design notes.
@@ -138,4 +152,7 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
         deactivated=len(deactivated),
         cache_refreshed=cache_refreshed,
         errors=errors,
+        created_acronyms=created,
+        updated_acronyms=updated,
+        deactivated_acronyms=deactivated,
     )

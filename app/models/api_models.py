@@ -281,22 +281,53 @@ class SearchResultItem(BaseModel):
                     "off and when the document was never actually measured (a genuinely "
                     "new keyword match, or a normal non-injected result)."
     )
-    relevance: Optional[float] = Field(
+    blended_score: Optional[float] = Field(
         default=None,
-        description="Acronym queries only (debug): the score before the acronym bonus, "
-                    "so score = relevance x (1 + acronym_bonus). None otherwise."
+        description="Acronym queries only (debug): the score before the acronym bonus or "
+                    "the field boosts, a blend of the query and expansion scores (see "
+                    "search_config.scoring_context.acronym_ranking). Bonus mode: score = "
+                    "blended_score x (1 + acronym_bonus). Field-boost mode: score = "
+                    "blended_score x title, summary and text multipliers, capped at 1.0. "
+                    "No blend runs when the query already spells out the expansion (one "
+                    "dense variant) or the rescore fails (see scoring_context.acronym_ranking."
+                    "rescore): bonus mode then shows the plain fused score, field-boost mode "
+                    "None. Field-boost mode is also None for keyword-injected rows and rows "
+                    "outside the rescored pool. None otherwise."
     )
-    acronym_grades: Optional[Dict[str, Optional[str]]] = Field(
+    title_acronym_bonus: Optional[float] = Field(
         default=None,
-        description="Acronym queries only (debug): the bonus grade each detected acronym "
-                    "earned: title_acronym, title_expansion, summary_acronym, "
-                    "summary_expansion, or null for none."
+        description="Acronym queries only (debug): bonus for the acronym in the title "
+                    "(body must back it). The four *_bonus fields sum to acronym_bonus "
+                    "before the cap."
     )
-    body_backed: Optional[Dict[str, Optional[str]]] = Field(
+    title_expansion_bonus: Optional[float] = Field(
+        default=None, description="Acronym queries only (debug): bonus for an expansion in the title."
+    )
+    summary_acronym_bonus: Optional[float] = Field(
         default=None,
-        description="Acronym queries only (debug): how the document's body backs each "
-                    "acronym: acronym (used in capitals), expansion (spelled out), "
-                    "dense_fallback (BM25 unavailable), or null (not backed)."
+        description="Acronym queries only (debug): bonus for the acronym in the summary "
+                    "(body must back it)."
+    )
+    summary_expansion_bonus: Optional[float] = Field(
+        default=None, description="Acronym queries only (debug): bonus for an expansion in the summary."
+    )
+    acronym_bonus_breakdown: Optional[Dict[str, Dict[str, Any]]] = Field(
+        default=None,
+        description="Acronym queries only (debug), per detected acronym: bonus_type "
+                    "(e.g. title_acronym_bonus, or none), bonus_value, matched_in (title/"
+                    "summary), matched_text (the acronym or the expansion that matched), "
+                    "body_evidence (acronym_in_body, expansion_in_body, dense_fallback, "
+                    "or null when not backed) and body_evidence_text (null when not backed)."
+    )
+    text_match: Optional[str] = Field(
+        default=None,
+        description="ACRONYM_USE_FIELD_BOOSTS only (debug): 'exact' when the body uses the "
+                    "acronym, 'partial' when it only spells out the expansion, else None."
+    )
+    text_multiplier: Optional[float] = Field(
+        default=None,
+        description="ACRONYM_USE_FIELD_BOOSTS only (debug): text boost applied "
+                    "(EXACT_TEXT_BOOST / PARTIAL_TEXT_BOOST, 1.0 when no match), else None."
     )
     title_match: Optional[str] = Field(
         default=None,
@@ -366,6 +397,10 @@ class AcronymBulkUploadResponse(BaseModel):
     # the fix is to clear the cache, not to re-upload.
     cache_refreshed: bool = True
     errors: List[AcronymUploadError]
+    # Which acronyms each count refers to, in CSV order.
+    created_acronyms: List[str] = []
+    updated_acronyms: List[str] = []
+    deactivated_acronyms: List[str] = []
 
 class AcronymItem(BaseModel):
     acronym: str

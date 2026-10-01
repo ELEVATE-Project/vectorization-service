@@ -429,19 +429,10 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
     now = datetime.now(timezone.utc)
     incoming_acronyms = list(valid_by_acronym.keys())
 
+    deactivated = [a for a in incoming_acronyms if not valid_by_acronym[a]["is_active"]]
+
     db = SessionLocal()
     try:
-        # Decide create vs update first: ON CONFLICT doesn't report which ran.
-        existing = {
-            row.acronym
-            for row in db.query(AcronymMapping.acronym)
-            .filter(AcronymMapping.acronym.in_(incoming_acronyms))
-            .all()
-        }
-        created = [a for a in incoming_acronyms if a not in existing]
-        updated = [a for a in incoming_acronyms if a in existing]
-        deactivated = [a for a in incoming_acronyms if not valid_by_acronym[a]["is_active"]]
-
         values = [
             {
                 "acronym": acronym,
@@ -463,7 +454,14 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
                 "updated_at": stmt.excluded.updated_at,
             },
         )
-        db.execute(stmt)
+        # One call: RETURNING says which rows were new. An inserted row has xmax = 0;
+        # a row updated by ON CONFLICT carries this transaction's id. Timestamps
+        # can't tell: two uploads may share the same `now`.
+        stmt = stmt.returning(
+            acronym_table.c.acronym,
+            sa.literal_column("xmax = 0").label("inserted"),
+        )
+        inserted = {row.acronym: row.inserted for row in db.execute(stmt)}
         db.commit()
     except Exception:
         db.rollback()
@@ -471,6 +469,8 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
     finally:
         db.close()
 
+    created = [a for a in incoming_acronyms if inserted.get(a)]
+    updated = [a for a in incoming_acronyms if a in inserted and not inserted[a]]
     return created, updated, deactivated, errors
 
 
