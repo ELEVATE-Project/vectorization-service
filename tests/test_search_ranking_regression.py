@@ -857,6 +857,27 @@ class TestAcronymFieldBoosts:
         assert seen == [{"B"}]
         assert [r.source_id for r in response.results] == ["B"]
 
+    def test_bm25_evidence_outside_the_checked_pool_still_counts(
+            self, service, monkeypatch):
+        """Only B can reach the page and it is a dense-only hit (no BM25 score); A
+        has one but cannot reach the page. The index is still BM25-backed, so B's
+        body is checked and boosted rather than the whole check being skipped."""
+        monkeypatch.setattr(settings, "HYBRID_DENSE_WEIGHT", 0.8)
+        monkeypatch.setattr(settings, "HYBRID_SPARSE_WEIGHT", 0.2)
+        seen = []
+        monkeypatch.setattr(
+            PrioritizedSearchService, "_text_matches_for_acronyms",
+            lambda self, sources, acronyms: seen.append(set(sources)) or {"B": "exact"})
+        response = TestAcronymRankingFollowsLexicalRanking()._run(
+            service, monkeypatch, "hybrid", top_k=1, include_scoring_debug=True,
+            titles={"A": "Annual handbook", "B": "Nutrition guide"},
+            field_scores={"pt-A": {"title": 0.30, "text": 0.10, SPARSE: 5.0},
+                          "pt-B": {"title": 0.90}})
+        assert seen == [{"B"}]
+        assert response.results[0].source_id == "B"
+        assert response.results[0].text_match == "exact"
+        assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == "bm25"
+
 
 class TestBodyCheckPool:
     """_body_check_pool: candidates that can still reach the page, best first, capped."""

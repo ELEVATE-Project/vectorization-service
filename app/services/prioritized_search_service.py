@@ -658,9 +658,11 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 # which would otherwise read as "no body matches".
                 if soft_acronym_ranking:
                     check_pool = self._body_check_pool(top_results, top_k)
+                    # Any BM25 score in the whole pool proves the index exists; the
+                    # reachable documents may all be dense-only hits.
                     bm25_indexed = any(
                         (r.get("field_scores") or {}).get(settings.SPARSE_VECTOR_NAME)
-                        for r in check_pool
+                        for r in top_results
                     )
                     text_matches = self._text_matches_for_acronyms(
                         {str(r["payload"].get("source_id")) for r in check_pool
