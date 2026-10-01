@@ -1,6 +1,6 @@
 import logging
 import json
-from typing import Optional
+from typing import List, Optional
 from fastapi import HTTPException, UploadFile
 from app.services.document_operations.base_operation import BaseDocumentOperation
 from app.services.document_operations.upload_service import UploadService
@@ -28,7 +28,9 @@ class UpdateService(BaseDocumentOperation):
             return {}
 
     async def _replace(self, file: UploadFile, priority: str, metadata_dict: dict,
-                       source_id: str, company_id: Optional[str], require_existing: bool):
+                       source_id: str, company_id: Optional[str], require_existing: bool,
+                       title: Optional[str] = None, summary: Optional[str] = None,
+                       tags: Optional[List[str]] = None, theme: Optional[str] = None):
         """Store the new version, then delete the old chunks by id; returns (old_ids, upload_result)"""
         # Snapshot the old version's point ids before anything is written; a Qdrant error
         # here propagates as a 500 instead of being mistaken for "no document".
@@ -43,8 +45,11 @@ class UpdateService(BaseDocumentOperation):
 
         # Upload before deleting: any validation, parsing, embedding or Qdrant failure raises
         # here while the old version is still intact (new chunks get fresh uuid point ids).
+        # title/summary/tags/theme go through the same validation as POST; a bad value is
+        # a 400 raised here, before the old version is touched.
         upload_result = await self.upload_service.process(
-            file, priority, metadata_dict, source_id, company_id
+            file, priority, metadata_dict, source_id, company_id,
+            title=title, summary=summary, tags=tags, theme=theme
         )
 
         # Delete exactly the old ids, never by filter: the new chunks share this source_id,
@@ -84,7 +89,9 @@ class UpdateService(BaseDocumentOperation):
         )
 
     async def update(self, file: UploadFile, priority: str, metadata: str = None,
-                     source_id: str = None, company_id: str = None):
+                     source_id: str = None, company_id: str = None,
+                     title: Optional[str] = None, summary: Optional[str] = None,
+                     tags: Optional[List[str]] = None, theme: Optional[str] = None):
         """Update existing documents by replacing all documents with the same source_id and company_id"""
         try:
             # Use the normalized ids: upload stores them stripped, so the exists-check
@@ -98,7 +105,8 @@ class UpdateService(BaseDocumentOperation):
 
             # Replace: 404 if nothing is stored yet; a failed upload leaves the old version as is
             old_ids, upload_result = await self._replace(
-                file, priority, metadata_dict, source_id, company_id, require_existing=True
+                file, priority, metadata_dict, source_id, company_id, require_existing=True,
+                title=title, summary=summary, tags=tags, theme=theme
             )
 
             return {
@@ -114,6 +122,10 @@ class UpdateService(BaseDocumentOperation):
                 "priority": upload_result["priority"],
                 "source_id": source_id,
                 "company_id": company_id,
+                "title": upload_result.get("title"),
+                "summary": upload_result.get("summary"),
+                "tags": upload_result.get("tags"),
+                "theme": upload_result.get("theme"),
                 "sample_chunk": upload_result.get("sample_chunk")
             }
 
@@ -124,7 +136,9 @@ class UpdateService(BaseDocumentOperation):
             raise HTTPException(status_code=500, detail=f"Update failed: {str(e)}")
 
     async def upsert(self, file: UploadFile, priority: str, metadata: str = None,
-                     source_id: str = None, company_id: str = None):
+                     source_id: str = None, company_id: str = None,
+                     title: Optional[str] = None, summary: Optional[str] = None,
+                     tags: Optional[List[str]] = None, theme: Optional[str] = None):
         """Upsert documents - update if exists, create if not"""
         try:
             # Use the normalized ids: with a padded id the exists-check missed the stored
@@ -138,7 +152,8 @@ class UpdateService(BaseDocumentOperation):
 
             # Replace if stored, create if not; a failed upload leaves any old version as is
             old_ids, upload_result = await self._replace(
-                file, priority, metadata_dict, source_id, company_id, require_existing=False
+                file, priority, metadata_dict, source_id, company_id, require_existing=False,
+                title=title, summary=summary, tags=tags, theme=theme
             )
 
             operation = "updated" if old_ids else "created"
@@ -156,6 +171,10 @@ class UpdateService(BaseDocumentOperation):
                 "priority": upload_result["priority"],
                 "source_id": source_id,
                 "company_id": company_id,
+                "title": upload_result.get("title"),
+                "summary": upload_result.get("summary"),
+                "tags": upload_result.get("tags"),
+                "theme": upload_result.get("theme"),
                 "sample_chunk": upload_result.get("sample_chunk")
             }
 

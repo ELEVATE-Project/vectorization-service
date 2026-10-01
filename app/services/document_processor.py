@@ -25,21 +25,32 @@ class DocumentProcessor:
 
     async def process_upload(self, file: UploadFile, priority: str, metadata: Dict[str, Any] = None,
                              source_id: str = None, company_id: str = None, 
-                             title: str = None, summary: str = None, tags: List[str] = None):
+                             title: str = None, summary: str = None, tags: List[str] = None,
+                             theme: str = None):
         """Process file upload"""
         return await self.upload_service.process(
-            file, priority, metadata, source_id, company_id, title, summary, tags
+            file, priority, metadata, source_id, company_id, title, summary, tags, theme=theme
         )
 
     async def update_documents(self, file: UploadFile, priority: str, metadata: str = None,
-                               source_id: str = None, company_id: str = None):
+                               source_id: str = None, company_id: str = None,
+                               title: str = None, summary: str = None, tags: List[str] = None,
+                               theme: str = None):
         """Update existing documents"""
-        return await self.update_service.update(file, priority, metadata, source_id, company_id)
+        return await self.update_service.update(
+            file, priority, metadata, source_id, company_id,
+            title=title, summary=summary, tags=tags, theme=theme
+        )
 
     async def upsert_documents(self, file: UploadFile, priority: str, metadata: str = None,
-                               source_id: str = None, company_id: str = None):
+                               source_id: str = None, company_id: str = None,
+                               title: str = None, summary: str = None, tags: List[str] = None,
+                               theme: str = None):
         """Upsert documents - update if exists, create if not"""
-        return await self.update_service.upsert(file, priority, metadata, source_id, company_id)
+        return await self.update_service.upsert(
+            file, priority, metadata, source_id, company_id,
+            title=title, summary=summary, tags=tags, theme=theme
+        )
 
     async def delete_documents(self, request: DeleteRequest):
         """Delete documents by source_id and optional company_id"""

@@ -77,10 +77,11 @@ async def create_documents(
         title: Optional[str] = Form(default=None),
         summary: Optional[str] = Form(default=None),
         metadata: Optional[Dict[str, Any]] = Depends(parse_metadata_form),
-        tags: Optional[List[str]] = Depends(parse_tags_form)
+        tags: Optional[List[str]] = Depends(parse_tags_form),
+        theme: Optional[str] = Form(default=None)
 ):
     """Create new documents by uploading and processing a file
-    
+
     Args:
         file: File to upload
         priority: Priority level (P1, P2, P3, etc.)
@@ -93,14 +94,16 @@ async def create_documents(
         tags: Tags as list/array or comma-separated string
              JSON format: ["tag1", "tag2", "tag3"]
              CSV format: "tag1, tag2, tag3"
-    
-    Note: 
+        theme: One theme string, stored on every chunk for filtering (never embedded)
+
+    Note:
     - metadata must be a JSON dict/object: {"key": "value"}
     - tags can be either JSON array ["tag1", "tag2"] OR comma-separated "tag1,tag2"
-    - Leave metadata/tags empty or don't send them if not needed
+    - Leave metadata/tags/theme empty or don't send them if not needed
+    - A blank theme is a 400; a theme also sent in metadata must match it
     """
     return await document_processor.process_upload(
-        file, priority, metadata, source_id, company_id, title, summary, tags
+        file, priority, metadata, source_id, company_id, title, summary, tags, theme=theme
     )
 
 
@@ -112,10 +115,20 @@ async def update_documents(
         file: UploadFile = File(...),
         priority: str = Form(default="P1"),
         metadata: Optional[str] = Form(default=None),
-        company_id: Optional[str] = Form(default=None)
+        company_id: Optional[str] = Form(default=None),
+        title: Optional[str] = Form(default=None),
+        summary: Optional[str] = Form(default=None),
+        tags: Optional[List[str]] = Depends(parse_tags_form),
+        theme: Optional[str] = Form(default=None)
 ):
-    """Update existing documents by replacing all documents with the same source_id and company_id"""
-    return await document_processor.update_documents(file, priority, metadata, source_id, company_id)
+    """Update existing documents by replacing all documents with the same source_id and company_id
+
+    title, summary, tags and theme work as on POST; a field left out is stored as null.
+    """
+    return await document_processor.update_documents(
+        file, priority, metadata, source_id, company_id,
+        title=title, summary=summary, tags=tags, theme=theme
+    )
 
 
 # Create-or-replace: if chunks already exist for this source_id they are replaced,
@@ -126,10 +139,20 @@ async def upsert_documents(
         file: UploadFile = File(...),
         priority: str = Form(default="P1"),
         metadata: Optional[str] = Form(default=None),
-        company_id: Optional[str] = Form(default=None)
+        company_id: Optional[str] = Form(default=None),
+        title: Optional[str] = Form(default=None),
+        summary: Optional[str] = Form(default=None),
+        tags: Optional[List[str]] = Depends(parse_tags_form),
+        theme: Optional[str] = Form(default=None)
 ):
-    """Upsert documents - update if exists, create if not"""
-    return await document_processor.upsert_documents(file, priority, metadata, source_id, company_id)
+    """Upsert documents - update if exists, create if not
+
+    title, summary, tags and theme work as on POST; a field left out is stored as null.
+    """
+    return await document_processor.upsert_documents(
+        file, priority, metadata, source_id, company_id,
+        title=title, summary=summary, tags=tags, theme=theme
+    )
 
 
 # Patch the metadata payload on every chunk of a source_id via set_payload.

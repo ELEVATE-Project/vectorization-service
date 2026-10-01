@@ -194,7 +194,8 @@ class UploadService(BaseDocumentOperation):
 
     async def process(self, file: UploadFile, priority: str, metadata: Dict[str, Any] = None,
                       source_id: str = None, company_id: str = None,
-                      title: str = None, summary: str = None, tags: List[str] = None):
+                      title: str = None, summary: str = None, tags: List[str] = None,
+                      theme: str = None):
         """Process file upload with company_id support"""
         try:
             # Validate and normalize every caller-controlled field before any processing,
@@ -204,6 +205,9 @@ class UploadService(BaseDocumentOperation):
             company_id, title, summary, tags, additional_metadata = self.validate_document_fields(
                 source_id, company_id, title, summary, tags, metadata
             )
+            # Runs on the validated copy: any metadata theme is moved to the top level here,
+            # so it never reaches the stored metadata or the metadata vector.
+            theme = self.validate_theme(theme, additional_metadata)
             logger.info(f"Received metadata: {additional_metadata}")
 
             # Add company_id to metadata if provided
@@ -245,7 +249,8 @@ class UploadService(BaseDocumentOperation):
 
             # Generate embeddings and upload
             upload_results = await self._upload_chunks(
-                processed_chunks, additional_metadata, source_id, company_id, title, summary, tags
+                processed_chunks, additional_metadata, source_id, company_id, title, summary, tags,
+                theme=theme
             )
 
             # upload_to_qdrant swallows per-batch errors and only counts them; a partial or
@@ -265,6 +270,7 @@ class UploadService(BaseDocumentOperation):
                 "title": title,
                 "summary": summary,
                 "tags": tags,
+                "theme": theme,
                 "supported_file_types": self.get_supported_file_types(),
                 # Report the metadata exactly as stored in Qdrant (merged, incl. source_id),
                 # not the raw processor metadata, which never contained source_id.
@@ -486,7 +492,8 @@ class UploadService(BaseDocumentOperation):
 
     async def _upload_chunks(self, processed_chunks: List[dict], additional_metadata: dict,
                              source_id: str, company_id: str = None,
-                             title: str = None, summary: str = None, tags: List[str] = None):
+                             title: str = None, summary: str = None, tags: List[str] = None,
+                             theme: str = None):
         """Generate embeddings and upload chunks to Qdrant with separate embeddings for title, summary, and text"""
         # Skipping a bad chunk would store the document with a silent gap and still report
         # success, so fail the whole request before anything is embedded or written.
@@ -535,7 +542,10 @@ class UploadService(BaseDocumentOperation):
                 "source_id": source_id,
                 "title": title if title else None,
                 "summary": summary if summary else None,
-                "tags": tags if tags else None
+                "tags": tags if tags else None,
+                # theme is a filter-only key: deliberately not embedded and not in metadata,
+                # so it can never move a search score.
+                "theme": theme,
             }
 
             sparse_vec = sparse_vectors[idx] if idx < len(sparse_vectors) else None
