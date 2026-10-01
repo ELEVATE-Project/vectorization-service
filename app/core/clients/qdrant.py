@@ -37,13 +37,15 @@ _PREFIX_TEXT_INDEX = models.TextIndexParams(
 )
 
 # Payload fields to index and their schema/params.
-# Keyword indexes support exact MatchAny/MatchValue filters (used for source_id, company, tags).
+# Keyword indexes support exact MatchAny/MatchValue filters (used for source_id, company, tags, theme).
 # Text indexes support MatchText substring/full-text filters (title, summary, DOCUMENT_TYPE).
 _PAYLOAD_INDEXES = [
     ("source_id",              PayloadSchemaType.KEYWORD),
     ("metadata.company",       PayloadSchemaType.KEYWORD),
     ("metadata.type",          PayloadSchemaType.KEYWORD),
     ("tags",                   PayloadSchemaType.KEYWORD),
+    # Top-level only and never embedded, so filtering on it can't move a score
+    ("theme",                  PayloadSchemaType.KEYWORD),
     ("metadata.DOCUMENT_TYPE", PayloadSchemaType.TEXT),
     ("title",                  _PREFIX_TEXT_INDEX),
     ("summary",                _PREFIX_TEXT_INDEX),

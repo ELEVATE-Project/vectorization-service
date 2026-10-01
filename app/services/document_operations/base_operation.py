@@ -7,6 +7,7 @@ from qdrant_client import models
 from app.core.clients.qdrant import qdrant_client, ensure_collections_exist
 from app.config import settings
 from app.constants import messages as msg
+from app.utils.generic import normalize_theme
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +222,39 @@ class BaseDocumentOperation:
             metadata["markdown_url"] = markdown_url.strip()
 
         return company_id, title, summary, tags, metadata
+
+    def validate_theme(self, theme: Optional[str], metadata: Dict[str, Any]) -> Optional[str]:
+        """Validate the theme form field and pull any metadata copy up to the top level.
+
+        Returns the normalized theme, or None when there is none. Removes every theme key
+        (any case) from `metadata` in place, so pass the copy from validate_document_fields.
+        Raises 400 for a blank form theme, a non-string metadata theme, or a mismatch.
+        """
+        theme = normalize_theme(self._validate_optional_text(theme, "theme"))
+
+        # theme is top-level only and never embedded, so every metadata copy is removed (it would
+        # feed the metadata vector). Any key case: caller keys arrive as THEME, TITLE, ...
+        theme_keys = [key for key in metadata if str(key).lower() == "theme"]
+        for meta_theme in [metadata.pop(key) for key in theme_keys]:
+            if meta_theme is None:
+                continue
+            if not isinstance(meta_theme, str):
+                raise HTTPException(status_code=400, detail=msg.THEME_NOT_A_STRING)
+
+            # A blank metadata theme is dropped, as an empty caller tag is; a real one
+            # fills in a missing form theme or must agree with it.
+            meta_theme = normalize_theme(meta_theme)
+            if meta_theme is None:
+                continue
+            if theme is None:
+                theme = meta_theme
+            elif meta_theme != theme:
+                raise HTTPException(
+                    status_code=400,
+                    detail=msg.METADATA_THEME_MISMATCH.format(metadata_theme=meta_theme, theme=theme)
+                )
+
+        return theme
 
     @staticmethod
     def _validate_optional_text(value: Optional[str], field: str) -> Optional[str]:

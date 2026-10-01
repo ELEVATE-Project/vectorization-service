@@ -186,6 +186,7 @@ class PrioritizedSearchService:
                     title=result_data['payload'].get('title'),
                     summary=result_data['payload'].get('summary'),
                     tags=result_data['payload'].get('tags'),
+                    theme=result_data['payload'].get('theme'),
                     metadata=result_data['payload'].get('metadata', {}),
                     source_id=result_data['payload'].get('source_id', ''),
                     score=result_data['weighted_score'],
@@ -664,7 +665,7 @@ class PrioritizedSearchService:
 
             # Project payload to retrieve only small metadata keys needed for filters and boosts.
             # Excludes the heavy 'text' payload field during candidate scoring.
-            metadata_payload_fields = ["source_id", "title", "summary", "tags", "metadata"]
+            metadata_payload_fields = ["source_id", "title", "summary", "tags", "theme", "metadata"]
 
             # 1. Build Query Requests for Dense Fields
             for field in search_fields:
@@ -1342,6 +1343,7 @@ class PrioritizedSearchService:
                     title=doc['payload'].get('title'),
                     summary=doc['payload'].get('summary'),
                     tags=doc['payload'].get('tags'),
+                    theme=doc['payload'].get('theme'),
                     metadata=doc['payload'].get('metadata', {}),
                     source_id=doc['payload'].get('source_id', ''),
                     score=1.0,

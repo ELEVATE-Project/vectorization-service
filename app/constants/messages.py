@@ -25,7 +25,7 @@ SOURCE_ID_TOO_LONG = "source_id must be at most {max_length} characters"
 SOURCE_ID_INVALID_CHARACTERS = "source_id contains invalid characters (allowed pattern: {pattern})"
 PRIORITY_INVALID_FORMAT = "Invalid priority format. Must be P1, P2, P3, etc."
 
-# Descriptive fields: metadata, title / summary, tags
+# Descriptive fields: metadata, title / summary, tags, theme
 METADATA_NOT_JSON_OBJECT = "metadata must be a JSON object"
 METADATA_SOURCE_ID_MISMATCH = "metadata.source_id ({metadata_source_id}) does not match source_id ({source_id})"
 METADATA_COMPANY_MISMATCH = "metadata.company ({metadata_company}) does not match company_id ({company_id})"
@@ -33,6 +33,8 @@ MARKDOWN_URL_NOT_HTTP = "metadata.markdown_url must be an http(s) URL"
 FIELD_BLANK_WHEN_PROVIDED = "{field} cannot be empty when provided"
 TAGS_NOT_A_LIST = "tags must be a list of strings"
 TAGS_BLANK_OR_NON_STRING = "tags must be non-empty strings"
+THEME_NOT_A_STRING = "theme must be a string"
+METADATA_THEME_MISMATCH = "metadata.theme ({metadata_theme}) does not match theme ({theme})"
 
 # Uploaded file checks (name, type, size) before any parsing
 FILE_WITH_FILENAME_REQUIRED = "A file with a filename is required"
