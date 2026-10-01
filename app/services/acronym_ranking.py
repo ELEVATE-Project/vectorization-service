@@ -238,8 +238,6 @@ class AcronymRankingMixin:
             from app.core.clients.sparse_encoder import generate_sparse_vector
 
             backed: Dict[str, Set[str]] = {}
-            # Full-body reads shared across acronyms in this search.
-            chunk_cache: Dict[str, List[str]] = {}
             for acronym, sources in sources_by_acronym.items():
                 found: Set[str] = set()
                 indices, values = generate_sparse_vector(acronym)
@@ -270,8 +268,7 @@ class AcronymRankingMixin:
                     # of a rejected BM25 hit before deciding.
                     rejected = {str(group.id) for group in response.groups} - found
                     if rejected:
-                        found |= self._sources_using_acronym_in_any_chunk(
-                            rejected, pattern, chunk_cache)
+                        found |= self._sources_using_acronym_in_any_chunk(rejected, pattern)
                 if backing_out is not None:
                     backing_out[acronym] = {source: ("acronym_in_body", acronym) for source in found}
                 # Expansion check only for sources the acronym did not back.
@@ -295,25 +292,19 @@ class AcronymRankingMixin:
             return None
 
     def _sources_using_acronym_in_any_chunk(
-        self, sources: Set[str], pattern: "re.Pattern[str]",
-        chunk_cache: Optional[Dict[str, List[str]]] = None,
+        self, sources: Set[str], pattern: "re.Pattern[str]"
     ) -> Set[str]:
         """Sources with any chunk matching `pattern`, reading all their chunks.
 
-        chunk_cache ({source: chunk texts}) is filled here and reused, so a source
-        checked for several acronyms in one search is read once.
         Raises on a Qdrant failure; the caller treats that as a failed body check.
         """
-        cache = {} if chunk_cache is None else chunk_cache
-        missing = sorted(sources - cache.keys())
-        for source in missing:
-            cache[source] = []
+        found: Set[str] = set()
         offset = None
-        while missing:
+        while True:
             points, offset = qdrant_client.scroll(
                 collection_name=self.collection_name,
                 scroll_filter=models.Filter(must=[models.FieldCondition(
-                    key="source_id", match=models.MatchAny(any=missing),
+                    key="source_id", match=models.MatchAny(any=sorted(sources - found)),
                 )]),
                 limit=256,
                 offset=offset,
@@ -322,10 +313,10 @@ class AcronymRankingMixin:
             )
             for point in points:
                 payload = point.payload or {}
-                cache.setdefault(str(payload.get("source_id")), []).append(payload.get("text") or "")
-            if offset is None:
-                break
-        return {s for s in sources if any(pattern.search(text) for text in cache.get(s, ()))}
+                if pattern.search(payload.get("text") or ""):
+                    found.add(str(payload.get("source_id")))
+            if offset is None or found == sources:
+                return found
 
     def _sources_with_expansion_in_body(
         self, sources: Set[str], expansions: List[str],

@@ -1402,39 +1402,6 @@ class TestExpansionInBodyBacksAcronymClaim:
         assert calls["expansion"] == 0
 
 
-# ── A full-body read is shared across the acronyms of one search ──────────
-
-class TestFullBodyReadOncePerSearch:
-    """Two acronyms reject the same source in their top BM25 chunks: its chunks are
-    read once and reused, and each acronym still gets its own answer."""
-
-    def test_overlapping_rejected_source_is_read_once(self, service, monkeypatch):
-        scrolls = []
-
-        def fake_groups(**kwargs):
-            wanted = kwargs["query_filter"].must[0].match.any
-            return types.SimpleNamespace(groups=[
-                types.SimpleNamespace(id=s, hits=[types.SimpleNamespace(
-                    payload={"text": "no acronym in this chunk"})])
-                for s in wanted])
-
-        def fake_scroll(**kwargs):
-            scrolls.append(sorted(kwargs["scroll_filter"].must[0].match.any))
-            return [types.SimpleNamespace(payload={"source_id": "A", "text": "The SMC met."}),
-                    types.SimpleNamespace(payload={"source_id": "B", "text": "The DIET met."})], None
-
-        monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", True)
-        monkeypatch.setattr(
-            "app.services.acronym_ranking.qdrant_client.query_points_groups", fake_groups)
-        monkeypatch.setattr("app.services.acronym_ranking.qdrant_client.scroll", fake_scroll)
-        monkeypatch.setattr(
-            "app.core.clients.sparse_encoder.generate_sparse_vector", lambda text: ([1], [1.0]))
-
-        backed = service._sources_with_acronym_in_body({"DIET": {"A", "B"}, "SMC": {"A", "B"}})
-        assert backed == {"DIET": {"B"}, "SMC": {"A"}}
-        assert scrolls == [["A", "B"]]
-
-
 # ── A bare-acronym BM25 hit must be the acronym, not the everyday word ────
 
 class TestBareAcronymHitMustUseCapitals:

@@ -287,9 +287,12 @@ class SearchResultItem(BaseModel):
                     "the field boosts, a blend of the query and expansion scores (see "
                     "search_config.scoring_context.acronym_ranking). Bonus mode: score = "
                     "blended_score x (1 + acronym_bonus). Field-boost mode: score = "
-                    "blended_score x title, summary and text multipliers, capped at 1.0; "
-                    "None there for keyword-injected rows and rows outside the rescored pool. "
-                    "None otherwise."
+                    "blended_score x title, summary and text multipliers, capped at 1.0. "
+                    "No blend runs when the query already spells out the expansion (one "
+                    "dense variant) or the rescore fails (see scoring_context.acronym_ranking."
+                    "rescore): bonus mode then shows the plain fused score, field-boost mode "
+                    "None. Field-boost mode is also None for keyword-injected rows and rows "
+                    "outside the rescored pool. None otherwise."
     )
     title_acronym_bonus: Optional[float] = Field(
         default=None,
