@@ -185,10 +185,14 @@ class AcronymRankingMixin:
 
     def _sources_with_acronym_in_body(
         self, sources_by_acronym: Dict[str, Set[str]],
+        scanned_out: Optional[Set[str]] = None,
     ) -> Optional[Dict[str, Set[str]]]:
         """{acronym: sources whose body uses the acronym as written (capitals)}.
 
-        Returns None when BM25 cannot answer. See design notes, Body check.
+        Chunks without a BM25 vector (indexed before BM25 was enabled) cannot answer the
+        BM25 query, so their text is read directly; scanned_out, if given, gets the
+        sources that needed it. Returns None when BM25 cannot answer. See design notes,
+        Body check.
         """
         if not sources_by_acronym:
             return {}
@@ -197,9 +201,13 @@ class AcronymRankingMixin:
         try:
             from app.core.clients.sparse_encoder import generate_sparse_vector
 
+            unindexed = self._chunks_without_bm25(set().union(*sources_by_acronym.values()))
+            if scanned_out is not None:
+                scanned_out.update(unindexed)
             backed: Dict[str, Set[str]] = {}
             for acronym, sources in sources_by_acronym.items():
                 found: Set[str] = set()
+                pattern = _acronym_use_pattern(acronym)
                 indices, values = generate_sparse_vector(acronym)
                 if indices:
                     # BM25 folds case ("diet" = "DIET"), so it only narrows to the
@@ -216,7 +224,6 @@ class AcronymRankingMixin:
                         limit=len(sources),
                         with_payload=["text"],
                     )
-                    pattern = _acronym_use_pattern(acronym)
                     found = {
                         str(group.id) for group in response.groups
                         if any(
@@ -229,11 +236,47 @@ class AcronymRankingMixin:
                     rejected = {str(group.id) for group in response.groups} - found
                     if rejected:
                         found |= self._sources_using_acronym_in_any_chunk(rejected, pattern)
+                found |= {
+                    source for source in sources - found
+                    if any(pattern.search(text) for text in unindexed.get(source, ()))
+                }
                 backed[acronym] = found
             return backed
         except Exception as exc:
             logger.warning(f"Acronym body check failed, skipping the text boost: {exc}")
             return None
+
+    def _chunks_without_bm25(self, sources: Set[str]) -> Dict[str, List[str]]:
+        """{source: texts of its chunks that have no BM25 vector}, for the given sources.
+
+        Usually empty. On a Qdrant without has_vector filtering (before 1.13) it is
+        empty too, and those chunks stay unchecked rather than failing the check.
+        """
+        texts: Dict[str, List[str]] = {}
+        offset = None
+        try:
+            while True:
+                points, offset = qdrant_client.scroll(
+                    collection_name=self.collection_name,
+                    scroll_filter=models.Filter(
+                        must=[models.FieldCondition(
+                            key="source_id", match=models.MatchAny(any=sorted(sources)),
+                        )],
+                        must_not=[models.HasVectorCondition(has_vector=settings.SPARSE_VECTOR_NAME)],
+                    ),
+                    limit=256,
+                    offset=offset,
+                    with_payload=["source_id", "text"],
+                    with_vectors=False,
+                )
+                for point in points:
+                    payload = point.payload or {}
+                    texts.setdefault(str(payload.get("source_id")), []).append(payload.get("text") or "")
+                if offset is None:
+                    return texts
+        except Exception as exc:
+            logger.warning(f"Could not list chunks without BM25 vectors, leaving them unchecked: {exc}")
+            return {}
 
     def _sources_using_acronym_in_any_chunk(
         self, sources: Set[str], pattern: "re.Pattern[str]"
@@ -264,11 +307,14 @@ class AcronymRankingMixin:
 
     def _text_matches_for_acronyms(
         self, source_ids: Set[str], acronyms_detected: Dict[str, List[str]],
+        scanned_out: Optional[Set[str]] = None,
     ) -> Optional[Dict[str, str]]:
         """{source: "exact"} for sources whose body uses a detected acronym, for the
-        text boost; None when BM25 cannot answer."""
+        text boost; None when BM25 cannot answer. scanned_out: see
+        _sources_with_acronym_in_body."""
         body_sources = self._sources_with_acronym_in_body(
-            {acronym: set(source_ids) for acronym in acronyms_detected}
+            {acronym: set(source_ids) for acronym in acronyms_detected},
+            scanned_out=scanned_out,
         )
         if body_sources is None:
             return None

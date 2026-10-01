@@ -664,12 +664,18 @@ class PrioritizedSearchService(AcronymRankingMixin):
                         (r.get("field_scores") or {}).get(settings.SPARSE_VECTOR_NAME)
                         for r in top_results
                     )
+                    # Sources with chunks lacking a BM25 vector are read directly.
+                    scanned: Set[str] = set()
                     text_matches = self._text_matches_for_acronyms(
                         {str(r["payload"].get("source_id")) for r in check_pool
                          if r["payload"].get("source_id") is not None},
                         acronyms_detected,
+                        scanned_out=scanned,
                     ) if bm25_indexed else None
-                    scoring_context["acronym_body_check"] = "bm25" if text_matches is not None else "unavailable"
+                    scoring_context["acronym_body_check"] = (
+                        "unavailable" if text_matches is None
+                        else "bm25+scan" if scanned else "bm25"
+                    )
                     # Text matches are only ever "exact", so the partial tier is unused.
                     top_results = self._apply_field_boost(
                         top_results, text_matches or {}, "text", settings.EXACT_TEXT_BOOST, 1.0,

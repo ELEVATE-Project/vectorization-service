@@ -668,7 +668,7 @@ class TestAcronymRankingFollowsLexicalRanking:
         seen = []
         monkeypatch.setattr(
             PrioritizedSearchService, "_text_matches_for_acronyms",
-            lambda self, sources, acronyms: seen.append(sources) or {})
+            lambda self, sources, acronyms, **kw: seen.append(sources) or {})
         self._run(service, monkeypatch, search_mode, field_scores={
             "pt-A": {"title": 0.30, "text": 0.10, SPARSE: 5.0}, "pt-B": {"title": 0.90}})
         assert bool(seen) is expected
@@ -775,7 +775,7 @@ class TestAcronymFieldBoosts:
              include_scoring_debug=True):
         monkeypatch.setattr(
             PrioritizedSearchService, "_text_matches_for_acronyms",
-            lambda self, sources, acronyms: dict(text_matches or {}))
+            lambda self, sources, acronyms, **kw: dict(text_matches or {}))
         # Copied per run: the search writes match keys into these dicts.
         field_scores = {pid: dict(s) for pid, s in (field_scores or self.INDEXED).items()}
         response = TestAcronymRankingFollowsLexicalRanking()._run(
@@ -829,7 +829,7 @@ class TestAcronymFieldBoosts:
         monkeypatch.setattr(settings, "HYBRID_SPARSE_WEIGHT", 0.4)
         monkeypatch.setattr(
             PrioritizedSearchService, "_text_matches_for_acronyms",
-            lambda self, sources, acronyms: {"A": "exact"})
+            lambda self, sources, acronyms, **kw: {"A": "exact"})
         response = TestAcronymRankingFollowsLexicalRanking()._run(
             service, monkeypatch, "hybrid", top_k=1, include_scoring_debug=True,
             titles={"A": "Annual handbook", "B": "Nutrition guide"},
@@ -848,7 +848,7 @@ class TestAcronymFieldBoosts:
         seen = []
         monkeypatch.setattr(
             PrioritizedSearchService, "_text_matches_for_acronyms",
-            lambda self, sources, acronyms: seen.append(set(sources)) or {})
+            lambda self, sources, acronyms, **kw: seen.append(set(sources)) or {})
         response = TestAcronymRankingFollowsLexicalRanking()._run(
             service, monkeypatch, "hybrid", top_k=1,
             titles={"A": "Annual handbook", "B": "Nutrition guide"},
@@ -867,7 +867,7 @@ class TestAcronymFieldBoosts:
         seen = []
         monkeypatch.setattr(
             PrioritizedSearchService, "_text_matches_for_acronyms",
-            lambda self, sources, acronyms: seen.append(set(sources)) or {"B": "exact"})
+            lambda self, sources, acronyms, **kw: seen.append(set(sources)) or {"B": "exact"})
         response = TestAcronymRankingFollowsLexicalRanking()._run(
             service, monkeypatch, "hybrid", top_k=1, include_scoring_debug=True,
             titles={"A": "Annual handbook", "B": "Nutrition guide"},
@@ -877,6 +877,20 @@ class TestAcronymFieldBoosts:
         assert response.results[0].source_id == "B"
         assert response.results[0].text_match == "exact"
         assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == "bm25"
+
+    def test_body_check_reports_a_direct_read(self, service, monkeypatch):
+        """Sources whose chunks lack a BM25 vector are read directly; the debug
+        status says so instead of claiming a plain BM25 check."""
+        def text_matches(self, sources, acronyms, scanned_out=None):
+            scanned_out.add("A")
+            return {"A": "exact"}
+
+        monkeypatch.setattr(PrioritizedSearchService, "_text_matches_for_acronyms", text_matches)
+        response = TestAcronymRankingFollowsLexicalRanking()._run(
+            service, monkeypatch, "hybrid", include_scoring_debug=True,
+            field_scores={pid: dict(s) for pid, s in self.INDEXED.items()})
+        assert {r.source_id: r for r in response.results}["A"].text_match == "exact"
+        assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == "bm25+scan"
 
 
 class TestBodyCheckPool:
@@ -993,22 +1007,26 @@ class TestBodyCheckUsesTheAcronym:
     only spells out the expansion does not count: retrieval and the relevance
     blend already cover expansion matches."""
 
-    def _stub_qdrant(self, monkeypatch, acronym_hits, all_chunks=None):
+    def _stub_qdrant(self, monkeypatch, acronym_hits, all_chunks=None, unindexed=None):
         """acronym_hits: source -> body text the bare-acronym BM25 query returns
         (a list is shorthand for chunks that use "DIET" in capitals).
         all_chunks: source -> every chunk's text, for the full-scan scroll
-        (defaults to just the BM25 chunk)."""
+        (defaults to just the BM25 chunk).
+        unindexed: source -> texts of its chunks without a BM25 vector (none by default)."""
         if not isinstance(acronym_hits, dict):
             acronym_hits = {s: "The DIET faculty met." for s in acronym_hits}
         all_chunks = all_chunks or {s: [t] for s, t in acronym_hits.items()}
-        calls = {"acronym": 0, "scroll": 0}
+        unindexed = unindexed or {}
+        calls = {"acronym": 0, "scroll": 0, "unindexed": 0}
 
         def fake_scroll(**kwargs):
-            calls["scroll"] += 1
             wanted = set(kwargs["scroll_filter"].must[0].match.any)
+            # The "chunks without a BM25 vector" lookup filters with must_not has_vector.
+            source = unindexed if kwargs["scroll_filter"].must_not else all_chunks
+            calls["unindexed" if kwargs["scroll_filter"].must_not else "scroll"] += 1
             points = [
                 types.SimpleNamespace(payload={"source_id": s, "text": t})
-                for s, texts in all_chunks.items() if s in wanted for t in texts]
+                for s, texts in source.items() if s in wanted for t in texts]
             return points, None
 
         def fake_groups(**kwargs):
@@ -1048,6 +1066,44 @@ class TestBodyCheckUsesTheAcronym:
     def test_text_matches_none_without_bm25(self, service, monkeypatch):
         monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", False)
         assert service._text_matches_for_acronyms({"A"}, ACR) is None
+
+    def test_chunks_without_a_bm25_vector_are_read_directly(self, service, monkeypatch):
+        """B has no BM25 vector, so the BM25 query never returns it; its text is read
+        directly instead. C is unindexed too but only uses the everyday word."""
+        calls = self._stub_qdrant(
+            monkeypatch, acronym_hits={"A": "The DIET faculty met."},
+            unindexed={"B": ["Prepared by the DIET faculty, Pune."], "C": ["A healthy diet."]})
+        scanned = set()
+        assert service._sources_with_acronym_in_body(
+            {"DIET": {"A", "B", "C"}}, scanned_out=scanned) == {"DIET": {"A", "B"}}
+        assert scanned == {"B", "C"}
+        assert calls["unindexed"] == 1
+
+    def test_fully_indexed_sources_report_no_scan(self, service, monkeypatch):
+        self._stub_qdrant(monkeypatch, acronym_hits={"A": "The DIET faculty met."})
+        scanned = set()
+        assert service._text_matches_for_acronyms({"A"}, ACR, scanned_out=scanned) == {"A": "exact"}
+        assert scanned == set()
+
+    def test_a_failed_unindexed_lookup_keeps_the_bm25_answer(self, service, monkeypatch):
+        """An older Qdrant without has_vector filtering: the lookup fails, those chunks
+        stay unchecked, and the BM25 result still stands."""
+        from app.services import acronym_ranking
+
+        self._stub_qdrant(monkeypatch, acronym_hits={"A": "The DIET faculty met."})
+        stub_scroll = acronym_ranking.qdrant_client.scroll
+
+        def scroll_without_has_vector(**kwargs):
+            if kwargs["scroll_filter"].must_not:
+                raise RuntimeError("has_vector is not supported")
+            return stub_scroll(**kwargs)
+
+        monkeypatch.setattr(
+            "app.services.acronym_ranking.qdrant_client.scroll", scroll_without_has_vector)
+        scanned = set()
+        assert service._sources_with_acronym_in_body(
+            {"DIET": {"A"}}, scanned_out=scanned) == {"DIET": {"A"}}
+        assert scanned == set()
 
 
 # ── A bare-acronym BM25 hit must be the acronym, not the everyday word ────
