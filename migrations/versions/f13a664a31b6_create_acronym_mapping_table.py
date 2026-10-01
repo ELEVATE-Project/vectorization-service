@@ -4,6 +4,12 @@ Revision ID: f13a664a31b6
 Revises: fcd65d39a795
 Create Date: 2026-08-11 16:21:22.416872
 
+This revision was edited before the table reached production: it now creates an
+identity `id` primary key, while databases that ran an earlier version of it hold a
+UUID `code` primary key (with or without a separate unique `id`). The next revision,
+5b7dea819fa4, converts every one of those shapes to the current one and leaves an
+already-current table untouched, so `alembic upgrade head` gives the same table
+everywhere. See release-doc/acronym-design-notes.md, Schema history.
 """
 import csv
 import logging
