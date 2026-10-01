@@ -105,6 +105,11 @@ class Settings(BaseSettings):
     # Summary boosts are lower than title (summary carries less weight than title).
     EXACT_SUMMARY_BOOST: float = float(os.getenv("EXACT_SUMMARY_BOOST", "1.4"))
     PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.2"))
+    # Acronym queries only: true replaces the acronym bonus with the title/summary boosts
+    # above plus a text boost (body uses the acronym: exact; only the expansion: partial).
+    ACRONYM_USE_FIELD_BOOSTS: bool = os.getenv("ACRONYM_USE_FIELD_BOOSTS", "false").lower() == "true"
+    EXACT_TEXT_BOOST: float = float(os.getenv("EXACT_TEXT_BOOST", "2.0"))
+    PARTIAL_TEXT_BOOST: float = float(os.getenv("PARTIAL_TEXT_BOOST", "1.5"))
     METADATA_MATCH_BOOST: float = float(os.getenv("METADATA_MATCH_BOOST", "1.2"))
     # How many keyword-matched documents we are willing to score per search. Scoring
     # each one downloads 5 vectors, and a short query can match thousands of titles.

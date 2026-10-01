@@ -988,7 +988,7 @@ class TestAcronymScoringContext:
         assert ranking["applied"] is True
         assert ranking["expansion_score_weight"] == settings.ACRONYM_EXPANSION_SCORE_WEIGHT
         assert ranking["bonus_cap"] == settings.ACRONYM_BONUS_MULTI_MATCH_CAP
-        assert ranking["bonus_grades"]["title_acronym"] == settings.ACRONYM_BONUS_TITLE_ACRONYM
+        assert ranking["bonus_values"]["title_acronym_bonus"] == settings.ACRONYM_BONUS_TITLE_ACRONYM
         assert ranking["dense_variants"] == 2
         assert ranking["rescore"] == {
             "applied": True, "candidate_pool": 2, "rescored": 2,
@@ -1025,26 +1025,41 @@ class TestAcronymScoringContext:
         assert "acronym_ranking" not in ctx
 
 
-# ── Per-document acronym breakdown: grades, body backing, relevance ───────
+# ── Per-document acronym breakdown: named bonus, matched text, body evidence ──
 
 class TestPerDocumentAcronymBreakdown:
-    """Each result explains its bonus: which grade each acronym earned, how the
-    body backs it, and the relevance before the bonus."""
+    """Each result explains its bonus in named fields: which bonus each acronym
+    earned, the text that matched, how the body backs it, and the relevance."""
 
-    def test_grades_name_the_grade_earned(self, service):
-        bonus, grades = service._acronym_bonus_detail(
-            "DIET Handbook", None, dict(ACR), {"DIET"})
+    EXP = ACR["DIET"][0]
+
+    def test_title_acronym_bonus_names_the_match(self, service):
+        bonus, breakdown = service._acronym_bonus_detail(
+            "DIET Handbook", None, dict(ACR), {"DIET"},
+            {"DIET": ("expansion_in_body", self.EXP)})
         assert bonus == settings.ACRONYM_BONUS_TITLE_ACRONYM
-        assert grades == {"DIET": "title_acronym"}
+        assert breakdown == {"DIET": {
+            "bonus_type": "title_acronym_bonus",
+            "bonus_value": settings.ACRONYM_BONUS_TITLE_ACRONYM,
+            "matched_in": "title", "matched_text": "DIET",
+            "body_evidence": "expansion_in_body", "body_evidence_text": self.EXP,
+        }}
 
-    def test_unbacked_title_falls_to_expansion_grade_or_none(self, service):
-        both = f"DIET — {ACR['DIET'][0]}"
-        assert service._acronym_bonus_detail(both, None, dict(ACR), set())[1] == {
-            "DIET": "title_expansion"}
-        assert service._acronym_bonus_detail("DIET Handbook", None, dict(ACR), set())[1] == {
-            "DIET": None}
+    def test_expansion_bonus_names_the_expansion_that_matched(self, service):
+        acr = {"SSC": ["Staff Selection Commission", "Sainik School Society"]}
+        _, breakdown = service._acronym_bonus_detail(
+            "Sainik School Society admissions", None, acr, set())
+        assert breakdown["SSC"]["bonus_type"] == "title_expansion_bonus"
+        assert breakdown["SSC"]["matched_text"] == "Sainik School Society"
+        assert breakdown["SSC"]["body_evidence"] is None
+        assert breakdown["SSC"]["body_evidence_text"] is None
 
-    def test_backing_labels_acronym_and_expansion(self, service, monkeypatch):
+    def test_unbacked_title_acronym_earns_none(self, service):
+        _, breakdown = service._acronym_bonus_detail("DIET Handbook", None, dict(ACR), set())
+        assert breakdown["DIET"]["bonus_type"] == "none"
+        assert breakdown["DIET"]["bonus_value"] == 0.0
+
+    def test_backing_records_evidence_and_text(self, service, monkeypatch):
         TestExpansionInBodyBacksAcronymClaim._stub_qdrant(
             self, monkeypatch, acronym_hits=["A"],
             chunk_text={"B": "District Institute of Education and Training staff."})
@@ -1052,24 +1067,27 @@ class TestPerDocumentAcronymBreakdown:
         backed = service._sources_with_acronym_in_body(
             {"DIET": {"A", "B"}}, acronyms_detected=ACR, backing_out=backing)
         assert backed == {"DIET": {"A", "B"}}
-        assert backing == {"DIET": {"A": "acronym", "B": "expansion"}}
+        assert backing == {"DIET": {"A": ("acronym_in_body", "DIET"),
+                                    "B": ("expansion_in_body", self.EXP)}}
 
-    def test_results_carry_the_breakdown_in_debug(self, service, monkeypatch):
+    def test_results_carry_named_fields_in_debug(self, service, monkeypatch):
         response = TestAcronymBonusFollowsLexicalRanking()._run(
             service, monkeypatch, "hybrid", include_scoring_debug=True)
         by_source = {r.source_id: r for r in response.results}
         a = by_source["A"]
         # Sparse is off in this fixture, so backing comes from the dense fallback.
-        assert a.body_backed == {"DIET": "dense_fallback"}
-        assert a.acronym_grades == {"DIET": "title_acronym"}
-        assert a.score == pytest.approx(a.relevance * (1 + a.acronym_bonus))
-        assert by_source["B"].acronym_grades == {"DIET": None}
+        assert a.acronym_bonus_breakdown["DIET"]["bonus_type"] == "title_acronym_bonus"
+        assert a.acronym_bonus_breakdown["DIET"]["body_evidence"] == "dense_fallback"
+        assert a.title_acronym_bonus == settings.ACRONYM_BONUS_TITLE_ACRONYM
+        assert a.title_expansion_bonus == a.summary_acronym_bonus == a.summary_expansion_bonus == 0.0
+        assert a.score == pytest.approx(a.blended_score * (1 + a.acronym_bonus))
+        assert by_source["B"].acronym_bonus_breakdown["DIET"]["bonus_type"] == "none"
 
-    def test_breakdown_hidden_without_debug(self, service, monkeypatch):
+    def test_named_fields_hidden_without_debug(self, service, monkeypatch):
         response = TestAcronymBonusFollowsLexicalRanking()._run(
             service, monkeypatch, "hybrid", include_scoring_debug=False)
-        assert all(r.acronym_grades is None and r.body_backed is None and r.relevance is None
-                   for r in response.results)
+        assert all(r.acronym_bonus_breakdown is None and r.title_acronym_bonus is None
+                   and r.blended_score is None for r in response.results)
 
 
 # ── Acronym debug fields stay null on ordinary queries ────────────────────
@@ -1087,17 +1105,65 @@ class TestAcronymDebugFieldsOnlyOnAcronymPath:
     def test_ordinary_injected_row_hides_acronym_fields(self, service):
         item = service._build_result_items(
             [self._row(relevance=0.8, acronym_bonus=0.0)], True)[0]
-        assert item.relevance is None and item.acronym_bonus is None
-        assert item.acronym_grades is None and item.body_backed is None
+        assert item.blended_score is None and item.acronym_bonus is None
+        assert item.acronym_bonus_breakdown is None and item.title_acronym_bonus is None
         assert item.match_source == "title_keyword_match"
 
     def test_acronym_injected_row_keeps_acronym_fields(self, service):
         item = service._build_result_items([self._row(
             weighted_score=0.8 * 1.4, relevance=0.8, acronym_bonus=0.4,
-            acronym_grades={"DIET": "title_acronym"}, body_backed={"DIET": "acronym"})], True)[0]
-        assert item.relevance == 0.8 and item.acronym_bonus == 0.4
-        assert item.acronym_grades == {"DIET": "title_acronym"}
-        assert item.score == pytest.approx(item.relevance * (1 + item.acronym_bonus))
+            acronym_bonus_breakdown={"DIET": {
+                "bonus_type": "title_acronym_bonus", "bonus_value": 0.4,
+                "matched_in": "title", "matched_text": "DIET",
+                "body_evidence": "acronym_in_body", "body_evidence_text": "DIET"}})], True)[0]
+        assert item.blended_score == 0.8 and item.acronym_bonus == 0.4
+        assert item.title_acronym_bonus == 0.4 and item.title_expansion_bonus == 0.0
+        assert item.score == pytest.approx(item.blended_score * (1 + item.acronym_bonus))
+
+
+# ── ACRONYM_USE_FIELD_BOOSTS swaps the acronym bonus for field boosts ──────
+
+class TestAcronymFieldBoostSwitch:
+    """Switch on: acronym queries get title/summary boosts plus a text boost (body
+    uses the acronym = exact, only the expansion = partial) instead of the bonus."""
+
+    def _run(self, service, monkeypatch, switch_on, text_matches=None):
+        monkeypatch.setattr(settings, "ACRONYM_USE_FIELD_BOOSTS", switch_on)
+        monkeypatch.setattr(
+            PrioritizedSearchService, "_text_matches_for_acronyms",
+            lambda self, sources, acronyms: dict(text_matches or {}))
+        response = TestAcronymBonusFollowsLexicalRanking()._run(
+            service, monkeypatch, "hybrid", include_scoring_debug=True)
+        return response, {r.source_id: r for r in response.results}
+
+    def test_switch_on_applies_text_boost_instead_of_bonus(self, service, monkeypatch):
+        _, off = self._run(service, monkeypatch, False)
+        base_a, base_b = off["A"].blended_score, off["B"].blended_score
+        response, on = self._run(service, monkeypatch, True, {"A": "exact", "B": "partial"})
+        assert on["A"].acronym_bonus is None and on["A"].acronym_bonus_breakdown is None
+        assert (on["A"].text_match, on["A"].text_multiplier) == ("exact", settings.EXACT_TEXT_BOOST)
+        assert (on["B"].text_match, on["B"].text_multiplier) == ("partial", settings.PARTIAL_TEXT_BOOST)
+        # Title boosts apply too: A's title "DIET Handbook" is a partial title match.
+        assert on["A"].title_multiplier == settings.PARTIAL_TITLE_BOOST
+        assert on["A"].score == pytest.approx(
+            min(base_a * settings.PARTIAL_TITLE_BOOST * settings.EXACT_TEXT_BOOST, 1.0))
+        assert on["B"].title_multiplier == 1.0
+        assert on["B"].score == pytest.approx(min(base_b * settings.PARTIAL_TEXT_BOOST, 1.0))
+
+    def test_switch_on_reports_field_boost_mode(self, service, monkeypatch):
+        response, _ = self._run(service, monkeypatch, True)
+        ctx = response.search_config["scoring_context"]
+        assert ctx["boost_config"]["mode"] == "acronym_field_boost"
+        assert ctx["boost_config"]["exact_text_boost"] == settings.EXACT_TEXT_BOOST
+        assert ctx["boost_config"]["exact_title_boost"] == settings.EXACT_TITLE_BOOST
+        assert ctx["acronym_ranking"]["bonus_mode"] == "field_boosts"
+        assert "bonus_values" not in ctx["acronym_ranking"]
+
+    def test_switch_off_keeps_the_acronym_bonus(self, service, monkeypatch):
+        response, off = self._run(service, monkeypatch, False, {"A": "exact"})
+        assert off["A"].acronym_bonus_breakdown is not None
+        assert off["A"].text_match is None and off["A"].text_multiplier is None
+        assert response.search_config["scoring_context"]["acronym_ranking"]["bonus_mode"] == "acronym_bonus"
 
 
 # ── The acronym rescore cap is skipped in RRF mode ────────────────────────
