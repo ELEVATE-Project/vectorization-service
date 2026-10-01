@@ -103,12 +103,17 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
     try:
         created, updated, deactivated, errors = await run_in_threadpool(bulk_upsert, rows)
     except SQLAlchemyError as e:
-        # One transaction: a database failure rolls back the whole batch.
-        logger.error(f"Acronym bulk upload failed in the database, nothing saved: {e}")
+        # One transaction, so usually nothing was saved — but a connection lost during
+        # the commit can leave it saved without confirmation. Retrying is safe: the
+        # upload is an upsert, so repeating the file gives the same rows.
+        logger.error(f"Acronym bulk upload failed in the database, outcome unconfirmed: {e}")
         raise HTTPException(
             status_code=503 if isinstance(e, OperationalError) else 500,
-            detail="Database error: no rows were saved. Fix the cause or retry the whole file.",
-        )
+            detail=(
+                "Database error: the upload could not be confirmed. Retrying the whole "
+                "file is safe; check the saved acronyms if unsure."
+            ),
+        ) from e
 
     # Committed already; now refresh active rows and mark deactivated ones.
     # cache_refreshed=False means stale entries may be served. See design notes.

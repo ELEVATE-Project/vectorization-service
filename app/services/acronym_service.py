@@ -433,7 +433,6 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
 
     db = SessionLocal()
     try:
-
         values = [
             {
                 "acronym": acronym,
@@ -455,11 +454,12 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
                 "updated_at": stmt.excluded.updated_at,
             },
         )
-        # One call: RETURNING says which rows were new. A new row has created_at =
-        # updated_at (both `now`); an updated row keeps its older created_at.
+        # One call: RETURNING says which rows were new. An inserted row has xmax = 0;
+        # a row updated by ON CONFLICT carries this transaction's id. Timestamps
+        # can't tell: two uploads may share the same `now`.
         stmt = stmt.returning(
             acronym_table.c.acronym,
-            (acronym_table.c.created_at == acronym_table.c.updated_at).label("inserted"),
+            sa.literal_column("xmax = 0").label("inserted"),
         )
         inserted = {row.acronym: row.inserted for row in db.execute(stmt)}
         db.commit()

@@ -123,7 +123,9 @@ class PrioritizedSearchService(AcronymRankingMixin):
 
         if relevance_override:
             for r in ranked_results:
-                r['weighted_score'] = relevance_override.get(r['id'], r['weighted_score'])
+                if r['id'] in relevance_override:
+                    # Kept as blended_score (debug): field boosts change weighted_score later.
+                    r['weighted_score'] = r['blended_score'] = relevance_override[r['id']]
             ranked_results.sort(key=lambda r: r['weighted_score'], reverse=True)
 
         if acronyms_detected:
@@ -260,7 +262,11 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     # Real relevance of a re-injected document; None if never measured.
                     measured_relevance=result_data.get('measured_relevance') if include_scoring_debug else None,
                     # Acronym queries only: why this document got its bonus.
-                    blended_score=result_data.get('relevance') if acronym_debug else None,
+                    # Bonus mode: the bonus base. Field-boost mode: the rescored score
+                    # before the title, summary and text boosts.
+                    blended_score=(result_data.get('relevance') if acronym_debug
+                                   else result_data.get('blended_score') if include_scoring_debug
+                                   else None),
                     acronym_bonus_breakdown=breakdown if acronym_debug else None,
                     title_acronym_bonus=bonus_by_type.get("title_acronym_bonus"),
                     title_expansion_bonus=bonus_by_type.get("title_expansion_bonus"),
@@ -606,6 +612,12 @@ class PrioritizedSearchService(AcronymRankingMixin):
             if lexical_ranking_enabled:
                 logger.info("Applying hybrid title + summary boost")
 
+                # Field-boost mode: boost every unique candidate and cut to top_k only
+                # after the text boost, so a boost can lift a document onto the page
+                # (the acronym bonus does the same, before the cut).
+                if acronym_field_boosts:
+                    top_results = list(unique_source_results)
+
                 # Acronym queries: the bonus already is the title/summary signal, so the
                 # multipliers go neutral; the match passes still run for injection.
                 if soft_acronym_ranking and not acronym_field_boosts:
@@ -689,13 +701,19 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     logger.info(f"Injected {len(injected)} summary-match docs missing from semantic results")
 
                 # Text boost (field-boost mode): body uses the acronym = exact, only the
-                # expansion = partial. Skipped, and reported, when BM25 cannot answer.
+                # expansion = partial. Skipped, and reported, when BM25 cannot answer —
+                # including when no candidate has a BM25 score (documents not indexed
+                # for BM25 yet), which would otherwise read as "no body matches".
                 if acronym_field_boosts:
+                    bm25_indexed = any(
+                        (r.get("field_scores") or {}).get(settings.SPARSE_VECTOR_NAME)
+                        for r in top_results
+                    )
                     text_matches = self._text_matches_for_acronyms(
                         {str(r["payload"].get("source_id")) for r in top_results
                          if r["payload"].get("source_id") is not None},
                         acronyms_detected,
-                    )
+                    ) if bm25_indexed else None
                     scoring_context["acronym_body_check"] = "bm25" if text_matches is not None else "unavailable"
                     top_results = self._apply_field_boost(
                         top_results, text_matches or {}, "text",
@@ -1892,6 +1910,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
             entry["relevance"] = relevance
             entry["measured_relevance"] = measured_relevance
             entry["acronym_bonus"] = bonus
+            # The score is now the floor, not the blend; measured_relevance keeps the real one.
+            entry.pop("blended_score", None)
             entry[mult_key] = boost
             # Marks the score as a keyword-match floor, not a semantic one; otherwise an
             # all-injected response is indistinguishable from a real result set.

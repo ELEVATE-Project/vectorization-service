@@ -283,10 +283,13 @@ class SearchResultItem(BaseModel):
     )
     blended_score: Optional[float] = Field(
         default=None,
-        description="Acronym queries only (debug): the score before the acronym bonus, a "
-                    "blend of the query and expansion scores (see search_config."
-                    "scoring_context.acronym_ranking). score = blended_score x "
-                    "(1 + acronym_bonus). None otherwise."
+        description="Acronym queries only (debug): the score before the acronym bonus or "
+                    "the field boosts, a blend of the query and expansion scores (see "
+                    "search_config.scoring_context.acronym_ranking). Bonus mode: score = "
+                    "blended_score x (1 + acronym_bonus). Field-boost mode: score = "
+                    "blended_score x title, summary and text multipliers, capped at 1.0; "
+                    "None there for keyword-injected rows and rows outside the rescored pool. "
+                    "None otherwise."
     )
     title_acronym_bonus: Optional[float] = Field(
         default=None,

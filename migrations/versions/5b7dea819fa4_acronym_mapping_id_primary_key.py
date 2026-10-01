@@ -9,6 +9,9 @@ earlier version of it still have one of these shapes, which this converts:
   - `code` (UUID) primary key only;
   - `code` primary key plus a separate unique auto-increment `id`.
 A table that already has `id` as its key and no `code` is left untouched.
+
+Downgrade restores a UUID `code` primary key (with new UUIDs; the old ones are
+gone) and keeps `id` as a unique non-key column, a shape every model version reads.
 """
 from typing import Sequence, Union
 
@@ -56,5 +59,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Downgrade schema."""
-    # No-op: f13a664a31b6 itself now defines `id` as the key, so the table
-    # already matches the previous revision.
+    # An app rolled back to a version that reads `code` needs the column back.
+    # Postgres fills new UUIDs for the existing rows; the original ones are gone.
+    pk = sa.inspect(op.get_bind()).get_pk_constraint(TABLE)
+    op.execute(f'ALTER TABLE {TABLE} ADD COLUMN code UUID NOT NULL DEFAULT gen_random_uuid()')
+    if pk['name']:
+        op.drop_constraint(pk['name'], TABLE, type_='primary')
+    op.create_unique_constraint('acronym_mapping_id_key', TABLE, ['id'])
+    op.create_primary_key(PK_NAME, TABLE, ['code'])
