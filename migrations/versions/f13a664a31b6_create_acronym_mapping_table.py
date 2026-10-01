@@ -6,13 +6,14 @@ Create Date: 2026-08-11 16:21:22.416872
 
 """
 import csv
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 # revision identifiers, used by Alembic.
@@ -24,6 +25,10 @@ depends_on: Union[str, Sequence[str], None] = None
 # data/acronyms.csv, relative to repo root (migrations/versions/<file> -> repo root is 2 up)
 SEED_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "acronyms.csv"
 REQUIRED_CSV_COLUMNS = {"acronym", "expansions", "description"}
+# Matches the acronym column's String(length=32) below.
+ACRONYM_MAX_LENGTH = 32
+
+logger = logging.getLogger("alembic.runtime.migration")
 
 
 def _split_expansions(raw: str) -> list:
@@ -51,10 +56,35 @@ def _load_seed_rows() -> list:
                 f"{sorted(REQUIRED_CSV_COLUMNS)}, found {reader.fieldnames}"
             )
         now = datetime.now(timezone.utc)
-        rows = [
-            {
-                'acronym': row['acronym'].strip().upper(),
-                'expansions': _split_expansions(row['expansions']),
+        # Everything goes into ONE multi-row INSERT ... ON CONFLICT, so a single
+        # bad row aborts the whole migration: a repeated acronym ("command
+        # cannot affect row a second time") or one over the column length. An
+        # empty expansions list would insert as [] and never be usable. Such
+        # rows are skipped with a warning instead; a repeated acronym keeps its
+        # last occurrence, the same rule the bulk upload uses.
+        by_acronym = {}
+        for line_no, row in enumerate(reader, start=2):
+            acronym = (row.get('acronym') or '').strip().upper()
+            if not acronym:
+                continue
+            expansions = _split_expansions(row.get('expansions') or '')
+            if not expansions:
+                logger.warning(f"Seed CSV line {line_no}: {acronym!r} has no expansions, skipped")
+                continue
+            if len(acronym) > ACRONYM_MAX_LENGTH:
+                logger.warning(
+                    f"Seed CSV line {line_no}: {acronym!r} is longer than "
+                    f"{ACRONYM_MAX_LENGTH} characters, skipped"
+                )
+                continue
+            if acronym in by_acronym:
+                logger.warning(
+                    f"Seed CSV line {line_no}: {acronym!r} repeats an earlier row, "
+                    f"keeping this one"
+                )
+            by_acronym[acronym] = {
+                'acronym': acronym,
+                'expansions': expansions,
                 'description': (row.get('description') or '').strip() or None,
                 'is_active': True,
                 'created_by': 'SYSTEM',
@@ -62,9 +92,7 @@ def _load_seed_rows() -> list:
                 'created_at': now,
                 'updated_at': now,
             }
-            for row in reader
-            if row.get('acronym', '').strip()
-        ]
+        rows = list(by_acronym.values())
 
     if not rows:
         raise ValueError(f"Acronym seed CSV at {SEED_CSV_PATH} contains no usable rows")
@@ -78,14 +106,8 @@ def upgrade() -> None:
 
     op.create_table(
         'acronym_mapping',
-        # UUID PK
-        sa.Column(
-            'code', UUID(as_uuid=True), primary_key=True,
-            server_default=sa.text('gen_random_uuid()'),
-        ),
-        # Kept alongside `code` (not the PK) as a plain auto-incrementing identity
-        # column, still unique.
-        sa.Column('id', sa.BigInteger(), sa.Identity(always=False), nullable=False, unique=True),
+        # Auto-incrementing integer PK
+        sa.Column('id', sa.BigInteger(), sa.Identity(always=False), primary_key=True),
         sa.Column('acronym', sa.String(length=32), nullable=False),
         sa.Column(
             'expansions', JSONB(), nullable=False, server_default=sa.text("'[]'::jsonb")
@@ -115,6 +137,10 @@ def upgrade() -> None:
             server_default=sa.text('now()'),
         ),
         sa.UniqueConstraint('acronym', name='uq_acronym'),
+        # JSONB alone also accepts {}, "text" or null; expansions must be a list.
+        sa.CheckConstraint(
+            "jsonb_typeof(expansions) = 'array'", name='ck_acronym_expansions_array'
+        ),
     )
     op.create_index(
         'idx_acronym_active', 'acronym_mapping', ['acronym', 'is_active']

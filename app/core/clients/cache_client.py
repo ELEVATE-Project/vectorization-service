@@ -38,3 +38,22 @@ def set_many(items: Dict[str, Tuple[str, int]]) -> None:
     for key, (value, ttl) in items.items():
         pipe.setex(key, ttl, value)
     pipe.execute()
+
+
+def set_many_if_absent(items: Dict[str, Tuple[str, int]]) -> None:
+    """Like set_many, but each key is written ONLY if it does not already
+    exist (Redis SET ... NX). Existing keys are left untouched.
+
+    This is the safe way to write a value you computed from possibly-stale
+    information: the "does it exist" check and the write happen together
+    inside Redis, so a value someone else wrote between your read and your
+    write survives instead of being overwritten. Used for negative
+    ("not an acronym") entries, where a blind overwrite could bury a real
+    acronym an upload had just cached and hide it for the whole negative TTL.
+    """
+    if not items:
+        return
+    pipe = redis_client.pipeline()
+    for key, (value, ttl) in items.items():
+        pipe.set(key, value, ex=ttl, nx=True)
+    pipe.execute()

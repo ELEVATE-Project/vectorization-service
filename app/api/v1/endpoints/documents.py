@@ -153,7 +153,9 @@ async def check_similarity(request: SimilarityCheckRequest) -> SimilarityCheckRe
 
 
 @router.post("/documents/search", response_model=PrioritizedSearchResponse)
-async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSearchResponse:
+# Deliberately sync: search() blocks (Qdrant, Redis, Postgres), and as `async` one
+# stalled dependency froze every request. FastAPI runs `def` in its threadpool.
+def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSearchResponse:
     """
     Perform prioritized multi-field search across documents with optional filters.
     
