@@ -807,13 +807,36 @@ class TestAcronymFieldBoosts:
                                  include_scoring_debug=False)
         assert all(r.pre_boost_score is None for r in by_source.values())
 
-    def test_unindexed_pool_skips_the_text_boost(self, service, monkeypatch):
-        """No candidate has a BM25 score (documents not indexed yet): the body
-        check is not trusted, so no text boost, and it is reported unavailable."""
+    def _status(self, service, monkeypatch, scanned_sources, result=True):
+        """body_check for a run whose body check read `scanned_sources` directly;
+        result=False makes the check unable to answer."""
+        def text_matches(self, sources, acronyms, scanned_out=None):
+            scanned_out.update(scanned_sources)
+            return {"A": "exact"} if result else None
+
+        monkeypatch.setattr(PrioritizedSearchService, "_text_matches_for_acronyms", text_matches)
         unindexed = {"pt-A": {"title": 0.30, "text": 0.10}, "pt-B": {"title": 0.90}}
-        response, by_source = self._run(service, monkeypatch, {"A": "exact"}, unindexed)
-        assert by_source["A"].text_match is None and by_source["A"].text_multiplier == 1.0
-        assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == "unavailable"
+        response = TestAcronymRankingFollowsLexicalRanking()._run(
+            service, monkeypatch, "hybrid", include_scoring_debug=True, field_scores=unindexed)
+        return response, {r.source_id: r for r in response.results}
+
+    def test_unindexed_pool_still_gets_the_body_check(self, service, monkeypatch):
+        """No candidate has a BM25 score (documents indexed before BM25): their
+        chunks are read directly, so A still earns the text boost."""
+        response, by_source = self._status(service, monkeypatch, {"A", "B"})
+        assert by_source["A"].text_match == "exact"
+        assert by_source["A"].text_multiplier == settings.EXACT_TEXT_BOOST
+        assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == "scan"
+
+    @pytest.mark.parametrize("scanned, result, expected", [
+        (set(), True, "bm25"),
+        ({"A"}, True, "bm25+scan"),
+        ({"A", "B"}, True, "scan"),
+        (set(), False, "unavailable"),
+    ])
+    def test_body_check_status(self, service, monkeypatch, scanned, result, expected):
+        response, _ = self._status(service, monkeypatch, scanned, result)
+        assert response.search_config["scoring_context"]["acronym_ranking"]["body_check"] == expected
 
     def test_indexed_pool_runs_the_text_boost(self, service, monkeypatch):
         response, by_source = self._run(service, monkeypatch, {"A": "exact"})

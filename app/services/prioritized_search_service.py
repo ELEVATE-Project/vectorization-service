@@ -653,27 +653,21 @@ class PrioritizedSearchService(AcronymRankingMixin):
 
                 # Text boost (acronym queries): the body uses the acronym as written.
                 # Only candidates that can still reach the page are checked (capped).
-                # Skipped, and reported, when BM25 cannot answer — including when no
-                # candidate has a BM25 score (documents not indexed for BM25 yet),
-                # which would otherwise read as "no body matches".
+                # Chunks without a BM25 vector are read directly, so the check also
+                # works on documents indexed before BM25. Skipped, and reported, when
+                # it cannot run (sparse search off, encoder or query failure).
                 if soft_acronym_ranking:
                     check_pool = self._body_check_pool(top_results, top_k)
-                    # Any BM25 score in the whole pool proves the index exists; the
-                    # reachable documents may all be dense-only hits.
-                    bm25_indexed = any(
-                        (r.get("field_scores") or {}).get(settings.SPARSE_VECTOR_NAME)
-                        for r in top_results
-                    )
-                    # Sources with chunks lacking a BM25 vector are read directly.
+                    checked = {str(r["payload"].get("source_id")) for r in check_pool
+                               if r["payload"].get("source_id") is not None}
                     scanned: Set[str] = set()
                     text_matches = self._text_matches_for_acronyms(
-                        {str(r["payload"].get("source_id")) for r in check_pool
-                         if r["payload"].get("source_id") is not None},
-                        acronyms_detected,
-                        scanned_out=scanned,
-                    ) if bm25_indexed else None
+                        checked, acronyms_detected, scanned_out=scanned,
+                    ) if checked else {}
                     scoring_context["acronym_body_check"] = (
-                        "unavailable" if text_matches is None
+                        "none" if not checked
+                        else "unavailable" if text_matches is None
+                        else "scan" if scanned >= checked
                         else "bm25+scan" if scanned else "bm25"
                     )
                     # Text matches are only ever "exact", so the partial tier is unused.

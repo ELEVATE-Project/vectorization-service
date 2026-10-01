@@ -118,10 +118,16 @@ Feeds the text boost: a document whose body uses the acronym gets
   most `ACRONYM_BODY_CHECK_MAX_SOURCES`. The rule alone never changes a
   ranking; the cap only can when more candidates than that could still reach
   the page.
-- Returns None when BM25 cannot answer (sparse search off, encoder missing,
-  query failed). A BM25 index with no vectors would reject everything, so if no
-  checked row has a sparse score, BM25 is treated as unavailable. Either way the
-  text boost is skipped and `body_check` reports "unavailable".
+- Chunks without a BM25 vector (indexed before BM25 was enabled) never answer
+  the BM25 query, so they are listed with a `has_vector` filter and their text is
+  checked directly with the same pattern. This also covers a fully pre-BM25
+  collection. On a Qdrant without `has_vector` filtering (before 1.13) the
+  lookup is skipped with a warning and those chunks stay unchecked.
+- Returns None when the check cannot run (sparse search off, encoder missing,
+  query failed); the text boost is then skipped.
+- `body_check` in the debug output: "bm25" (every checked document indexed),
+  "bm25+scan" (some read directly), "scan" (all read directly), "unavailable"
+  (the check could not run), "none" (nothing to check).
 
 ## Field boosts (acronym queries)
 
