@@ -172,6 +172,22 @@ async def update_document_metadata(
     return await document_processor.update_metadata(source_id, metadata_dict, company_id)
 
 
+# Set the top-level theme on every chunk of a source_id via set_payload. No file is
+# read and nothing is embedded; only theme and metadata.updated_at change.
+@router.patch("/documents/{source_id}/theme")
+async def update_document_theme(
+        source_id: str,
+        theme: Optional[str] = Form(default=None),
+        company_id: Optional[str] = Form(default=None)
+):
+    """Update only the theme of documents without reprocessing content
+
+    theme is required: a missing or blank value is a 400. It is Optional here because
+    FastAPI answers a required form field sent empty with a 422 instead.
+    """
+    return await document_processor.update_theme(source_id, theme, company_id)
+
+
 # Delete every chunk stored under this source_id (optionally scoped to company_id),
 # scrolling and removing the matching points from Qdrant in batches.
 @router.delete("/documents/{source_id}")

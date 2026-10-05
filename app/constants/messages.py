@@ -96,3 +96,23 @@ UPLOAD_FAILED = "Upload failed: {error}"
 
 # Success response
 UPLOAD_SUCCEEDED = "Successfully processed {chunk_count} chunks from {filename}"
+
+
+# =============================================================================
+# Theme update (PATCH /api/documents/{source_id}/theme)
+# =============================================================================
+
+# Validation and lookup; a missing and a blank theme are the same 400
+THEME_REQUIRED = "theme is required and cannot be empty"
+DOCUMENTS_NOT_FOUND = "No documents found with source_id: {source_id}"
+DOCUMENTS_NOT_FOUND_FOR_COMPANY = "No documents found with source_id: {source_id} and company_id: {company_id}"
+
+# Storing the theme; a stale updated_at is reported but the theme write is kept
+THEME_UPDATED_AT_NOT_REFRESHED = (
+    "Theme was set on {count} chunks of source_id {source_id}, but metadata.updated_at "
+    "could not be refreshed: {error}. Retrying this request is safe."
+)
+THEME_UPDATE_FAILED = "Theme update failed: {error}"
+
+# Success response
+THEME_UPDATE_SUCCEEDED = "Successfully updated theme for {count} documents"

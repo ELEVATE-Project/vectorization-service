@@ -43,13 +43,17 @@ class UpdateService(BaseDocumentOperation):
             detail_msg += ". Use upload endpoint for new documents."
             raise HTTPException(status_code=404, detail=detail_msg)
 
+        # updated_at follows the stored document: refreshed if it has one, left out if it never
+        # did. A new document (no old ids) is stamped as on POST.
+        add_updated_at = self.existing_has_updated_at(source_id, company_id) if old_ids else True
+
         # Upload before deleting: any validation, parsing, embedding or Qdrant failure raises
         # here while the old version is still intact (new chunks get fresh uuid point ids).
         # title/summary/tags/theme go through the same validation as POST; a bad value is
         # a 400 raised here, before the old version is touched.
         upload_result = await self.upload_service.process(
             file, priority, metadata_dict, source_id, company_id,
-            title=title, summary=summary, tags=tags, theme=theme
+            title=title, summary=summary, tags=tags, theme=theme, add_updated_at=add_updated_at
         )
 
         # Delete exactly the old ids, never by filter: the new chunks share this source_id,

@@ -77,6 +77,22 @@ class BaseDocumentOperation:
             if offset is None:
                 return point_ids
 
+    def existing_has_updated_at(self, source_id: str, company_id: Optional[str] = None) -> bool:
+        """True when the stored chunks of source_id (+ company_id) carry metadata.updated_at"""
+        # Every chunk of one upload gets the same metadata keys, so one point answers it.
+        # Errors propagate like collect_point_ids: a replace must not guess before writing.
+        points, _ = qdrant_client.scroll(
+            collection_name=settings.COLLECTION_NAME,
+            scroll_filter=self.build_filter(source_id, company_id),
+            limit=1,
+            with_payload=["metadata"],
+            with_vectors=False,
+        )
+        if not points:
+            return False
+        metadata = (points[0].payload or {}).get("metadata")
+        return isinstance(metadata, dict) and "updated_at" in metadata
+
     def count_documents(self, source_id: str, company_id: Optional[str] = None) -> int:
         """Count documents with given source_id and company_id"""
         try:

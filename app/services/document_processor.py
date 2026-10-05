@@ -5,6 +5,7 @@ from app.services.document_operations.upload_service import UploadService
 from app.services.document_operations.update_service import UpdateService
 from app.services.document_operations.delete_service import DeleteService
 from app.services.document_operations.metadata_service import MetadataService
+from app.services.document_operations.theme_service import ThemeService
 from app.models.api_models import DeleteRequest
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ class DocumentProcessor:
         self.update_service = UpdateService()
         self.delete_service = DeleteService()
         self.metadata_service = MetadataService()
+        self.theme_service = ThemeService()
 
     def get_supported_file_types(self):
         """Get list of all supported file types"""
@@ -60,3 +62,8 @@ class DocumentProcessor:
                               company_id: Optional[str] = None):
         """Update only metadata without reprocessing documents"""
         return await self.metadata_service.update_metadata(source_id, metadata_updates, company_id)
+
+    async def update_theme(self, source_id: str, theme: Optional[str],
+                           company_id: Optional[str] = None):
+        """Update only the theme without reprocessing documents"""
+        return await self.theme_service.update_theme(source_id, theme, company_id)
