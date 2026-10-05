@@ -1,0 +1,54 @@
+site_name: Vectorization Service Documentation
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.instant
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+    - toc.integrate
+
+nav:
+  - Home: index.md
+  - Knowledge Transfer Guide: KT_GUIDE.md
+
+  - Getting Started:
+      - Developer Setup: setup/developer_setup.md
+      - Configuration Reference: setup/configuration.md
+      - Deployment: setup/deployment.md
+
+  - Architecture:
+      - System Architecture: architecture/system_architecture.md
+      - Qdrant Data Model: architecture/qdrant_data_model.md
+
+  - API:
+      - Endpoints: api/endpoints.md
+      - Request/Response Models: api/models.md
+
+  - Services:
+      - Search:
+          - Search Pipeline Overview: services/search/overview.md
+          - Ranking and Fusion: services/search/ranking_and_fusion.md
+          - Boosts, Filters and Results: services/search/boosts_filters_and_results.md
+      - Ingestion:
+          - Upload Pipeline: services/ingestion/pipeline.md
+          - File Processors: services/ingestion/file_processors.md
+          - Update, Delete and Metadata: services/ingestion/document_operations.md
+      - Auxiliary Services: services/auxiliary_services.md
+
+  - Backend:
+      - Clients (Qdrant, Embedding, Sparse, Redis): backend/clients.md
+      - App Lifecycle: backend/app_lifecycle.md
+      - Utilities: backend/utils.md
+
+  - Operations:
+      - Scripts: operations/scripts.md
+      - Testing: operations/testing.md
+      - Qdrant Compatibility (client 1.18 / server 1.12): operations/qdrant_compatibility.md
+      - Migration and Restore: operations/migration_and_restore.md
+      - Failure Modes and Recovery: operations/failure_modes_and_recovery.md
+      - Troubleshooting: operations/troubleshooting.md
