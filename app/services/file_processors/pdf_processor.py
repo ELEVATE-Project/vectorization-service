@@ -11,6 +11,7 @@ from langchain_core.documents import Document as LangchainDocument
 from .base_processor import BaseFileProcessor
 from app.config import settings
 from app.services.translation_service import process_chunk
+from app.constants import messages as msg
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +67,7 @@ class PDFProcessor(BaseFileProcessor):
                 logger.error(f"No text extracted from {filename} after processing all pages")
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Could not extract any text from PDF: {filename}. "
-                           "The document may be corrupted or contain no readable content."
+                    detail=msg.PDF_NO_TEXT_EXTRACTED.format(filename=filename)
                 )
             
             # Step 4: Determine extraction method
@@ -102,8 +102,8 @@ class PDFProcessor(BaseFileProcessor):
 
             # Step 6: Split text into chunks
             text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=settings.CHUNK_SIZE,
-                chunk_overlap=settings.CHUNK_OVERLAP,
+                chunk_size=settings.PDF_CHUNK_SIZE,
+                chunk_overlap=settings.PDF_CHUNK_OVERLAP,
                 length_function=len,
             )
 
@@ -133,7 +133,7 @@ class PDFProcessor(BaseFileProcessor):
 
         except Exception as e:
             logger.error(f"PDF processing error: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+            raise HTTPException(status_code=500, detail=msg.PDF_PROCESSING_FAILED.format(error=e))
 
     async def _extract_page_with_ocr(self, file_content: bytes, page_num: int, filename: str) -> str:
         """Extract text from a single PDF page using OCR with pytesseract"""
@@ -180,8 +180,7 @@ class PDFProcessor(BaseFileProcessor):
             logger.error(f"Required OCR library not installed: {str(e)}")
             raise HTTPException(
                 status_code=500, 
-                detail="OCR libraries not available. Please install pytesseract, pdf2image, and Pillow. "
-                       "Also ensure tesseract-ocr is installed on your system."
+                detail=msg.PDF_OCR_LIBRARIES_MISSING
             )
         except Exception as e:
             logger.error(f"OCR extraction error for page {page_num + 1} of {filename}: {str(e)}")

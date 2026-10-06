@@ -13,20 +13,20 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 class Settings(BaseSettings):
+    # BaseSettings reads an env var (or .env entry) of the same name for every field, so a
+    # bare literal like `CHUNK_SIZE: int = 3000` is only the default, not a hardcoded value.
     QDRANT_HOST: str = os.getenv("QDRANT_HOST", "127.0.0.1")
     QDRANT_PORT: int = int(os.getenv("QDRANT_PORT", 6333))
-    # QA runs Qdrant server 1.12 while the client is pinned at 1.18 (required for BM25 sparse search).
-    # The 6-minor-version gap exceeds Qdrant's allowed ≤1 diff, causing a blanket UserWarning on every
-    # startup. Setting this to false suppresses that check. All operations the service uses have been
-    # verified to work on server 1.12 — the warning is a false alarm for our feature set.
-    # Set to true once QA server is upgraded to 1.18 to re-enable the check.
-    QDRANT_CHECK_COMPATIBILITY: bool = os.getenv("QDRANT_CHECK_COMPATIBILITY", "false").lower() == "true"
+    # Every environment runs Qdrant server 1.18.2, within the client's allowed ≤1 minor-version gap,
+    # so the client/server version check stays on. Set false only to silence a known-safe gap warning.
+    QDRANT_CHECK_COMPATIBILITY: bool = os.getenv("QDRANT_CHECK_COMPATIBILITY", "true").lower() == "true"
     COLLECTION_NAME: str = os.getenv("COLLECTION_NAME", "documents")
     QA_CACHE_COLLECTION: str = os.getenv("QA_CACHE_COLLECTION", "qa_cache")
     AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
     LLAMA_MODEL_ID: str = os.getenv("LLAMA_MODEL_ID", "meta.llama3-70b-instruct-v1:0")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
     TRANSLATION_API_URL: str = "https://demo-api.models.ai4bharat.org/inference/translation/v2"
+    # PDF chunking (pdf_processor); other file types use CHUNK_SIZE / MARKDOWN_CHUNK_SIZE
     PDF_CHUNK_SIZE: int = 3000
     PDF_CHUNK_OVERLAP: int = 500
     PAGE_TEXT_THRESHOLD: int = 20  # Minimum characters per page before OCR is triggered
@@ -56,6 +56,26 @@ class Settings(BaseSettings):
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
 
+    # Partial-upload rollback: if some Qdrant batches fail, delete the chunks this request stored.
+    # Tries while the request is open; the wait between tries doubles (0.5s, 1s).
+    UPLOAD_ROLLBACK_MAX_ATTEMPTS: int = int(os.getenv("UPLOAD_ROLLBACK_MAX_ATTEMPTS", 3))
+    UPLOAD_ROLLBACK_RETRY_WAIT_SECONDS: float = float(os.getenv("UPLOAD_ROLLBACK_RETRY_WAIT_SECONDS", 0.5))
+    # Still failing: a background task keeps retrying after the 502 is returned.
+    # Waits double from FIRST_WAIT up to MAX_WAIT (2, 4, 8, 16, 32, 60, 60, 60, 60s ≈ 5 min).
+    UPLOAD_ROLLBACK_BACKGROUND_MAX_ATTEMPTS: int = int(os.getenv("UPLOAD_ROLLBACK_BACKGROUND_MAX_ATTEMPTS", 9))
+    UPLOAD_ROLLBACK_BACKGROUND_FIRST_WAIT_SECONDS: float = float(os.getenv("UPLOAD_ROLLBACK_BACKGROUND_FIRST_WAIT_SECONDS", 2))
+    UPLOAD_ROLLBACK_BACKGROUND_MAX_WAIT_SECONDS: float = float(os.getenv("UPLOAD_ROLLBACK_BACKGROUND_MAX_WAIT_SECONDS", 60))
+
+    # Ingestion validation rules (POST /api/documents). source_id is the key every chunk
+    # is stored/deleted/filtered by, so it must be short and unambiguous.
+    MAX_SOURCE_ID_LENGTH: int = int(os.getenv("MAX_SOURCE_ID_LENGTH", 255))
+    SOURCE_ID_PATTERN: str = os.getenv("SOURCE_ID_PATTERN", r"^[A-Za-z0-9_\-.:]+$")
+    PRIORITY_PATTERN: str = os.getenv("PRIORITY_PATTERN", r"^P\d+$")  # P1, P2, ...
+
+
+    # Document-level fields stored once at the payload top level (indexed, embedded, filtered);
+    # upload drops their copy from payload["metadata"]. Caller keys like TITLE are not affected.
+    OMITTED_FIELDS_FROM_METADATA: list = ["title", "summary", "tags"]
 
     # Prioritized Search Configuration
     # Order determines search priority: Title > Chunk > Tags > Summary > Metadata

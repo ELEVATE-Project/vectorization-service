@@ -11,21 +11,24 @@ logger = logging.getLogger(__name__)
 
 
 class MetadataService(BaseDocumentOperation):
-    def _validate_metadata_update(self, source_id: str, metadata_updates: Dict):
-        """Validate metadata update inputs"""
-        self.validate_source_id(source_id)
+    def _validate_metadata_update(self, source_id: str, metadata_updates: Dict, company_id: Optional[str]):
+        """Validate metadata update inputs and return the normalized (source_id, company_id)"""
+        # Upload stores both ids stripped, so the set_payload filter must use the same
+        # values; normalize first so the company check below compares stripped ids too.
+        source_id = self.validate_source_id(source_id)
+        company_id = self.normalize_company_id(company_id)
+        # A JSON list/string/number would otherwise fail later as a 500
+        if not isinstance(metadata_updates, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="metadata_updates must be a JSON object"
+            )
         if not metadata_updates:
             raise HTTPException(
                 status_code=400,
                 detail="metadata_updates cannot be empty"
             )
-    
-    def _merge_and_validate_metadata(self, point_metadata: Dict, metadata_updates: Dict, company_id: Optional[str]) -> Dict:
-        """Merge existing metadata with updates and validate company_id"""
-        updated_metadata = point_metadata.copy()
-        updated_metadata.update(metadata_updates)
-        updated_metadata["updated_at"] = datetime.now().isoformat()
-        
+
         # Prevent changing company_id through metadata update
         if company_id and 'company' in metadata_updates:
             if metadata_updates['company'] != company_id:
@@ -33,37 +36,15 @@ class MetadataService(BaseDocumentOperation):
                     status_code=400,
                     detail="Cannot change company_id through metadata update"
                 )
-        
-        return updated_metadata
-    
-    def _update_point_metadata(self, point, metadata_updates: Dict, company_id: Optional[str]):
-        """Update metadata for a single point"""
-        existing_metadata = point.payload.get("metadata", {})
-        updated_metadata = self._merge_and_validate_metadata(
-            existing_metadata, metadata_updates, company_id
-        )
-        
-        updated_payload = point.payload.copy()
-        updated_payload["metadata"] = updated_metadata
-        
-        qdrant_client.set_payload(
-            collection_name=settings.COLLECTION_NAME,
-            payload=updated_payload,
-            points=[point.id],
-        )
-    
-    def _process_batch(self, points, metadata_updates: Dict, company_id: Optional[str]) -> int:
-        """Process a batch of points for metadata update"""
-        for point in points:
-            self._update_point_metadata(point, metadata_updates, company_id)
-        return len(points)
+
+        return source_id, company_id
 
     async def update_metadata(self, source_id: str, metadata_updates: Dict,
                               company_id: Optional[str] = None):
         """Update only the metadata of existing documents without reprocessing"""
         try:
-            # Validate inputs
-            self._validate_metadata_update(source_id, metadata_updates)
+            # Validate inputs; the filter, 404 message and response use the normalized ids
+            source_id, company_id = self._validate_metadata_update(source_id, metadata_updates, company_id)
 
             # Ensure collections exist
             await self.ensure_collections()
@@ -71,32 +52,12 @@ class MetadataService(BaseDocumentOperation):
             # Build filter with company_id if provided
             scroll_filter = self.build_filter(source_id, company_id)
 
-            total_updated = 0
-            batch_size = 100
-
-            while True:
-                # Get documents to update
-                search_response = qdrant_client.scroll(
-                    collection_name=settings.COLLECTION_NAME,
-                    scroll_filter=scroll_filter,
-                    limit=batch_size,
-                    with_payload=True,
-                    with_vectors=False,
-                )
-
-                if not search_response[0]:
-                    break
-
-                # Process batch
-                batch_count = self._process_batch(
-                    search_response[0], metadata_updates, company_id
-                )
-                total_updated += batch_count
-                logger.info(
-                    f"Updated metadata for batch of {batch_count} documents. Total updated: {total_updated}")
-
-                if len(search_response[0]) < batch_size:
-                    break
+            # Count matching chunks up front; count errors surface as 500, not a false 404
+            total_updated = qdrant_client.count(
+                collection_name=settings.COLLECTION_NAME,
+                count_filter=scroll_filter,
+                exact=True,
+            ).count
 
             if total_updated == 0:
                 detail_msg = f"No documents found with source_id: {source_id}"
@@ -106,6 +67,16 @@ class MetadataService(BaseDocumentOperation):
                     status_code=404,
                     detail=detail_msg
                 )
+
+            # Merge only the given keys into the nested metadata object, server-side, in one call.
+            # No stale payload is written back, so concurrent updates to other keys are kept.
+            qdrant_client.set_payload(
+                collection_name=settings.COLLECTION_NAME,
+                payload={**metadata_updates, "updated_at": datetime.now().isoformat()},
+                key="metadata",
+                points=models.FilterSelector(filter=scroll_filter),
+            )
+            logger.info(f"Updated metadata for {total_updated} documents with source_id: {source_id}")
 
             return {
                 "status": "success",
