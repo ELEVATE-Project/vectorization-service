@@ -3,10 +3,10 @@ from typing import Any, Optional
 
 
 def normalize_theme(value: Optional[Any]) -> Optional[str]:
-    """Strip and collapse inner whitespace; None for a missing or blank value"""
+    """Strip leading and trailing whitespace only; None for a missing or blank value"""
     if value is None:
         return None
-    # No case-folding: themes are stored and filtered exactly as sent,
-    # like categories and organizations.
-    collapsed = " ".join(str(value).split())
-    return collapsed or None
+    # A theme is a unique code from Commons, so inner spacing and case are kept
+    # exactly as sent; upload and search filters must see the same string.
+    stripped = str(value).strip()
+    return stripped or None
