@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Depends
 from typing import Optional, Dict, Any, List
 import json
 import logging
+from app.constants import messages as msg
 from app.services.document_processor import DocumentProcessor
 from app.services.similarity_service import SimilarityService
 from app.services.prioritized_search_service import PrioritizedSearchService
@@ -34,10 +35,10 @@ def parse_metadata_form(metadata: Optional[str] = Form(default=None)) -> Optiona
     try:
         parsed = json.loads(metadata)
         if not isinstance(parsed, dict):
-            raise HTTPException(status_code=400, detail="Metadata must be a JSON object/dict")
+            raise HTTPException(status_code=400, detail=msg.METADATA_FORM_NOT_JSON_OBJECT)
         return parsed
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid metadata JSON: {str(e)}")
+        raise HTTPException(status_code=400, detail=msg.METADATA_FORM_INVALID_JSON.format(error=e))
 
 
 def parse_tags_form(tags: Optional[str] = Form(default=None)) -> Optional[List[str]]:
@@ -52,15 +53,21 @@ def parse_tags_form(tags: Optional[str] = Form(default=None)) -> Optional[List[s
         try:
             parsed = json.loads(tags)
             if not isinstance(parsed, list):
-                raise HTTPException(status_code=400, detail="Tags must be a JSON array/list")
+                raise HTTPException(status_code=400, detail=msg.TAGS_FORM_NOT_JSON_ARRAY)
+            # Every tag is used as a filter value and embedded as text, so numbers,
+            # nulls or blank strings inside the array are rejected here.
+            if any(not isinstance(tag, str) or not tag.strip() for tag in parsed):
+                raise HTTPException(status_code=400, detail=msg.TAGS_FORM_BLANK_OR_NON_STRING_TAG)
             return parsed
         except json.JSONDecodeError as e:
-            raise HTTPException(status_code=400, detail=f"Invalid tags JSON: {str(e)}")
+            raise HTTPException(status_code=400, detail=msg.TAGS_FORM_INVALID_JSON.format(error=e))
     
     # Otherwise, treat as comma-separated string
     return [tag.strip() for tag in tags.split(',') if tag.strip()]
 
 
+# Upload a file (or metadata.markdown_url) and ingest it: extract text, chunk, embed
+# every chunk across the 5 dense fields (+ BM25 when enabled), and store the points in Qdrant.
 @router.post("/documents", status_code=201)
 async def create_documents(
         file: UploadFile = File(...),
@@ -97,6 +104,8 @@ async def create_documents(
     )
 
 
+# Replace an existing document: ingest the uploaded file as a fresh set of chunks, then
+# delete the old chunks by id; a failed upload leaves the old version untouched.
 @router.put("/documents/{source_id}")
 async def update_documents(
         source_id: str,
@@ -109,6 +118,8 @@ async def update_documents(
     return await document_processor.update_documents(file, priority, metadata, source_id, company_id)
 
 
+# Create-or-replace: if chunks already exist for this source_id they are replaced,
+# otherwise the uploaded file is ingested as a new document.
 @router.put("/documents/{source_id}/upsert")
 async def upsert_documents(
         source_id: str,
@@ -121,6 +132,8 @@ async def upsert_documents(
     return await document_processor.upsert_documents(file, priority, metadata, source_id, company_id)
 
 
+# Patch the metadata payload on every chunk of a source_id via set_payload.
+# Text and vectors are not regenerated, so the "metadata" embedding is left as-is.
 @router.patch("/documents/{source_id}/metadata")
 async def update_document_metadata(
         source_id: str,
@@ -136,6 +149,8 @@ async def update_document_metadata(
     return await document_processor.update_metadata(source_id, metadata_dict, company_id)
 
 
+# Delete every chunk stored under this source_id (optionally scoped to company_id),
+# scrolling and removing the matching points from Qdrant in batches.
 @router.delete("/documents/{source_id}")
 async def delete_documents(
         source_id: str,
@@ -146,12 +161,16 @@ async def delete_documents(
     return await document_processor.delete_documents(request)
 
 
+# Duplicate detection: embed the given content and compare it against stored chunk
+# text vectors to report whether sufficiently similar content already exists.
 @router.post("/documents/check-similarity")
 async def check_similarity(request: SimilarityCheckRequest) -> SimilarityCheckResponse:
     """Check if similar content already exists"""
     return similarity_service.check_similarity(request)
 
 
+# Primary search: weighted multi-field dense search (fused with BM25 when sparse is enabled),
+# then filtering, title/summary boosts and one best result per source_id; no query lists all sources.
 @router.post("/documents/search", response_model=PrioritizedSearchResponse)
 async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSearchResponse:
     """
@@ -300,6 +319,8 @@ async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSe
     return prioritized_search_service.search(request)
 
 
+# Simple search against the "text" vector only, above a similarity threshold,
+# returning the top-scoring chunk for each unique source_id.
 @router.post("/documents/text-search", response_model=TextSearchResponse)
 async def text_embedding_search(request: TextSearchRequest) -> TextSearchResponse:
     """
@@ -359,6 +380,8 @@ async def text_embedding_search(request: TextSearchRequest) -> TextSearchRespons
     return text_embedding_search_service.search(request)
 
 
+# Check a list of source_ids against Qdrant and return them split into
+# found and not-found lists, for syncing callers with what is actually indexed.
 @router.post("/documents/verify-sources", response_model=SourceVerificationResponse)
 async def verify_sources(request: SourceVerificationRequest) -> SourceVerificationResponse:
     """
