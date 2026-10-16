@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from app.api.v1.api import api_router
 from app.core.clients.qdrant import ensure_collections_exist
 from app.core.clients.embedding import EmbeddingError
+from app.services.file_processors.pdf_processor import missing_ocr_binaries
 from app.utils.json_handler import CustomJSONResponse
 from app.config import settings
 import logging
@@ -14,6 +15,16 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
+    # Report OCR readiness at startup; never blocks it, since text PDFs and other file types still work
+    missing = missing_ocr_binaries()
+    if missing:
+        logger.error(
+            f"OCR unavailable: {', '.join(missing)} not found on PATH. "
+            "PDF uploads with pages that need OCR will fail with 503."
+        )
+    else:
+        logger.info(f"OCR dependencies found on PATH: {', '.join(settings.OCR_BINARIES)}")
+
     try:
         await ensure_collections_exist()
         logger.info("Application startup completed")
