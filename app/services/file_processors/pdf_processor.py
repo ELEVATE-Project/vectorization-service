@@ -1,5 +1,6 @@
 import io
 import uuid
+import shutil
 import PyPDF2
 import logging
 from datetime import datetime
@@ -13,6 +14,21 @@ from app.config import settings
 from app.services.translation_service import process_chunk
 
 logger = logging.getLogger(__name__)
+
+OCR_UNAVAILABLE_DETAIL = (
+    "This PDF has pages that need OCR, but OCR is not available on the server. "
+    "Please try again later."
+)
+
+
+class OCRUnavailableError(Exception):
+    """The OCR engine is missing on the server, so the upload fails instead of storing blank pages."""
+
+
+def missing_ocr_binaries() -> List[str]:
+    """Return the OCR binaries (settings.OCR_BINARIES) not found on PATH (same lookup subprocess uses)."""
+    return [name for name in settings.OCR_BINARIES if shutil.which(name) is None]
+
 
 class PDFProcessor(BaseFileProcessor):
     def get_supported_extensions(self) -> List[str]:
@@ -49,6 +65,9 @@ class PDFProcessor(BaseFileProcessor):
                         pages_text.append(ocr_text)
                         pages_with_ocr += 1
                         ocr_page_numbers.append(page_num)
+                    except OCRUnavailableError:
+                        # Server problem, not a page problem: fail the whole upload (handled below)
+                        raise
                     except Exception as e:
                         logger.warning(f"OCR failed for page {page_num}, using extracted text: {str(e)}")
                         pages_text.append(page_text)
@@ -131,6 +150,10 @@ class PDFProcessor(BaseFileProcessor):
 
             return processed_chunks
 
+        except OCRUnavailableError as e:
+            # Log the missing binary; the caller gets a safe 503 and nothing is stored
+            logger.error(f"OCR unavailable while processing {filename}: {str(e)}")
+            raise HTTPException(status_code=503, detail=OCR_UNAVAILABLE_DETAIL)
         except Exception as e:
             logger.error(f"PDF processing error: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
@@ -140,8 +163,16 @@ class PDFProcessor(BaseFileProcessor):
         try:
             import pytesseract
             from pdf2image import convert_from_bytes
-            from PIL import Image
-            
+            from pdf2image.exceptions import PDFInfoNotInstalledError
+        except ImportError as e:
+            raise OCRUnavailableError(f"OCR Python library not installed: {str(e)}")
+
+        # Check binaries first so a broken server fails fast, before pdf2image writes the PDF to a temp file
+        missing = missing_ocr_binaries()
+        if missing:
+            raise OCRUnavailableError(f"not found on PATH: {', '.join(missing)}")
+
+        try:
             # Convert specific page to image
             # Note: page_num is 0-indexed, but first_page/last_page are 1-indexed
             images = convert_from_bytes(
@@ -176,16 +207,11 @@ class PDFProcessor(BaseFileProcessor):
             
             return extracted_text
                     
-        except ImportError as e:
-            logger.error(f"Required OCR library not installed: {str(e)}")
-            raise HTTPException(
-                status_code=500, 
-                detail="OCR libraries not available. Please install pytesseract, pdf2image, and Pillow. "
-                       "Also ensure tesseract-ocr is installed on your system."
-            )
+        except (PDFInfoNotInstalledError, pytesseract.TesseractNotFoundError) as e:
+            # Backstop: binary on PATH but could not be run
+            raise OCRUnavailableError(str(e))
         except Exception as e:
+            # Page-level failure: the caller keeps this page's extracted text and continues
             logger.error(f"OCR extraction error for page {page_num + 1} of {filename}: {str(e)}")
-            # Don't raise exception, just return empty string to allow processing to continue
-            logger.warning(f"Returning empty string for page {page_num + 1} due to OCR error")
-            return ""
+            raise
 

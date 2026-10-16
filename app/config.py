@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     PDF_CHUNK_SIZE: int = 3000
     PDF_CHUNK_OVERLAP: int = 500
     PAGE_TEXT_THRESHOLD: int = 20  # Minimum characters per page before OCR is triggered
+    # System binaries OCR needs on PATH: poppler (pdfinfo, pdftoppm) for pdf2image, tesseract for pytesseract.
+    # Installed by deployment/ansible.yml. Env override is a JSON list, e.g. OCR_BINARIES='["pdfinfo","pdftoppm","tesseract"]'
+    OCR_BINARIES: list = ["pdfinfo", "pdftoppm", "tesseract"]
     VECTOR_SEARCH_LIMIT: int = 1
     SIMILARITY_THRESHOLD: float = 0.40
 

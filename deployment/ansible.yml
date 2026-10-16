@@ -9,6 +9,30 @@
     uvicorn_workers: 4
 
   tasks:
+    # OCR system packages: poppler for pdf2image, tesseract for pytesseract.
+    # Runs first so a failure never tears down the running deployment.
+    - name: Install OCR system packages
+      apt:
+        name:
+          - poppler-utils
+          - tesseract-ocr
+          - tesseract-ocr-eng
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Verify OCR binaries are on PATH
+      shell: command -v {{ item }}
+      loop:
+        - pdfinfo
+        - pdftoppm
+        - tesseract
+      changed_when: false
+
+    - name: Verify Tesseract English language data
+      shell: tesseract --list-langs 2>&1 | grep -qx eng
+      changed_when: false
+
     - name: Read Vault token
       slurp:
         src: "{{ project_path }}/.token"
