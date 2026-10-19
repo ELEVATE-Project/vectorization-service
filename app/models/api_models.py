@@ -182,6 +182,11 @@ class SearchResultItem(BaseModel):
     title: Optional[str] = None
     summary: Optional[str] = None
     tags: Optional[List[str]] = None
+    theme: Optional[str] = Field(
+        default=None,
+        description="Document theme (top-level payload key, KEYWORD-indexed, never embedded). "
+                    "None when the document has no theme."
+    )
     metadata: Dict[str, Any]
     source_id: str
     score: float
