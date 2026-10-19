@@ -4,7 +4,6 @@ from typing import Optional
 from bs4 import BeautifulSoup
 from fastapi import HTTPException
 from app.config import settings
-from app.constants import messages as msg
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +33,7 @@ class URLTextExtractor:
         if not url or not url.strip():
             raise HTTPException(
                 status_code=400,
-                detail=msg.URL_EMPTY
+                detail="URL cannot be empty"
             )
         
         # Validate URL format
@@ -42,7 +41,7 @@ class URLTextExtractor:
         if not url.startswith(('http://', 'https://')):  # NOSONAR
             raise HTTPException(
                 status_code=400,
-                detail=msg.URL_INVALID_FORMAT.format(url=url)
+                detail=f"Invalid URL format: {url}. URL must start with http:// or https://"
             )
         
         try:
@@ -74,7 +73,7 @@ class URLTextExtractor:
             if not text or not text.strip():
                 raise HTTPException(
                     status_code=400,
-                    detail=msg.URL_NO_TEXT_EXTRACTED.format(url=url)
+                    detail=f"No text content could be extracted from URL: {url}"
                 )
             
             logger.info(f"Successfully extracted {len(text)} characters from URL")
@@ -84,19 +83,19 @@ class URLTextExtractor:
             logger.error(f"Timeout while fetching URL: {url}")
             raise HTTPException(
                 status_code=408,
-                detail=msg.URL_FETCH_TIMEOUT.format(url=url)
+                detail=f"Request timeout while fetching URL: {url}"
             )
         except httpx.ConnectError:
             logger.error(f"Connection error while fetching URL: {url}")
             raise HTTPException(
                 status_code=503,
-                detail=msg.URL_CONNECTION_FAILED.format(url=url)
+                detail=f"Could not connect to URL: {url}"
             )
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error while fetching URL: {url}, Status: {e.response.status_code}")
             raise HTTPException(
                 status_code=e.response.status_code,
-                detail=msg.URL_HTTP_ERROR.format(status_code=e.response.status_code, url=url)
+                detail=f"HTTP error {e.response.status_code} while fetching URL: {url}"
             )
         except HTTPException:
             raise
@@ -104,7 +103,7 @@ class URLTextExtractor:
             logger.error(f"Unexpected error extracting text from URL {url}: {str(e)}")
             raise HTTPException(
                 status_code=500,
-                detail=msg.URL_EXTRACTION_FAILED.format(error=e)
+                detail=f"Failed to extract text from URL: {str(e)}"
             )
     
     def _extract_from_html(self, html_content: str, url: str) -> str:

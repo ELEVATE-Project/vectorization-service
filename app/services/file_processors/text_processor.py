@@ -10,7 +10,6 @@ from langchain_core.documents import Document as LangchainDocument
 from .base_processor import BaseFileProcessor
 from app.config import settings
 from app.services.translation_service import process_chunk
-from app.constants import messages as msg
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +72,7 @@ class TextProcessor(BaseFileProcessor):
             if not text_content.strip():
                 raise HTTPException(
                     status_code=400,
-                    detail=msg.TEXT_FILE_NO_READABLE_TEXT.format(filename=filename)
+                    detail=f"File {filename} is empty or contains no readable text"
                 )
 
             # Detect if content is markdown
@@ -131,7 +130,7 @@ class TextProcessor(BaseFileProcessor):
             logger.error(f"Text/Markdown processing error: {str(e)}")
             raise HTTPException(
                 status_code=500,
-                detail=msg.TEXT_PROCESSING_FAILED.format(error=e)
+                detail=f"Error processing text/markdown file: {str(e)}"
             )
 
     def _split_markdown(self, doc: LangchainDocument, 
