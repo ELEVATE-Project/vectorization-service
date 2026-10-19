@@ -60,8 +60,8 @@ class BaseDocumentOperation:
         scroll_filter = self.build_filter(source_id, company_id)
         point_ids, offset = [], None
 
-        # Errors are not swallowed (unlike check_documents_exist): a failed lookup read
-        # as "no document" made upsert upload a second copy next to the existing one.
+        # Don't swallow errors here — a failed lookup misread as "no document"
+        # once caused upsert to duplicate the upload.
         while True:
             points, offset = qdrant_client.scroll(
                 collection_name=settings.COLLECTION_NAME,
@@ -73,7 +73,7 @@ class BaseDocumentOperation:
             )
             point_ids.extend(point.id for point in points)
 
-            # Ids only, one page at a time, until Qdrant reports no next page
+            # Keep paging until Qdrant has no more results
             if offset is None:
                 return point_ids
 
@@ -248,8 +248,8 @@ class BaseDocumentOperation:
         """
         theme = normalize_theme(self._validate_optional_text(theme, "theme"))
 
-        # theme is top-level only and never embedded, so every metadata copy is removed (it would
-        # feed the metadata vector). Any key case: caller keys arrive as THEME, TITLE, ...
+        # theme lives top-level only, never embedded — strip every metadata copy
+        # (key case varies: THEME, Theme, theme, ...)
         theme_keys = [key for key in metadata if str(key).lower() == "theme"]
         for meta_theme in [metadata.pop(key) for key in theme_keys]:
             if meta_theme is None:
@@ -257,8 +257,8 @@ class BaseDocumentOperation:
             if not isinstance(meta_theme, str):
                 raise HTTPException(status_code=400, detail=msg.THEME_NOT_A_STRING)
 
-            # A blank metadata theme is dropped, as an empty caller tag is; a real one
-            # fills in a missing form theme or must agree with it.
+            # Blank metadata theme is dropped; a real one fills a missing form
+            # theme or must match it.
             meta_theme = normalize_theme(meta_theme)
             if meta_theme is None:
                 continue

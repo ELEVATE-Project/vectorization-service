@@ -32,8 +32,7 @@ class UpdateService(BaseDocumentOperation):
                        title: Optional[str] = None, summary: Optional[str] = None,
                        tags: Optional[List[str]] = None, theme: Optional[str] = None):
         """Store the new version, then delete the old chunks by id; returns (old_ids, upload_result)"""
-        # Snapshot the old version's point ids before anything is written; a Qdrant error
-        # here propagates as a 500 instead of being mistaken for "no document".
+        # Snapshot old ids first; a Qdrant error here is a 500, not a false "no document".
         old_ids = self.collect_point_ids(source_id, company_id)
 
         if require_existing and not old_ids:
@@ -43,21 +42,17 @@ class UpdateService(BaseDocumentOperation):
             detail_msg += ". Use upload endpoint for new documents."
             raise HTTPException(status_code=404, detail=detail_msg)
 
-        # updated_at follows the stored document: refreshed if it has one, left out if it never
-        # did. A new document (no old ids) is stamped as on POST.
+        # Keep updated_at only if the existing doc already had one; new docs get it like POST.
         add_updated_at = self.existing_has_updated_at(source_id, company_id) if old_ids else True
 
-        # Upload before deleting: any validation, parsing, embedding or Qdrant failure raises
-        # here while the old version is still intact (new chunks get fresh uuid point ids).
-        # title/summary/tags/theme go through the same validation as POST; a bad value is
-        # a 400 raised here, before the old version is touched.
+        # Upload the new version first — any failure here leaves the old version intact.
+        # title/summary/tags/theme are validated the same as POST (400 before old version is touched).
         upload_result = await self.upload_service.process(
             file, priority, metadata_dict, source_id, company_id,
             title=title, summary=summary, tags=tags, theme=theme, add_updated_at=add_updated_at
         )
 
-        # Delete exactly the old ids, never by filter: the new chunks share this source_id,
-        # so a filter delete would also remove the version that was just stored.
+        # Delete by old ids only — a filter delete would also catch the new chunks (same source_id).
         if old_ids:
             await self._delete_old_version(old_ids, source_id, company_id)
 
@@ -65,15 +60,13 @@ class UpdateService(BaseDocumentOperation):
 
     async def _delete_old_version(self, old_ids: list, source_id: str, company_id: Optional[str]):
         """Remove the replaced chunks, retrying; 502 if they are still there afterwards"""
-        # Same in-request retries as a partial-upload rollback (UPLOAD_ROLLBACK_* settings);
-        # the reason label keeps these log lines from reading as a failed upload.
+        # Same retry logic as a partial-upload rollback; the reason label just keeps logs accurate.
         if await self.upload_service._rollback_points(
             old_ids, source_id, reason=const.ROLLBACK_REASON_OLD_VERSION_CLEANUP
         ):
             return
 
-        # The new version is stored but the old one could not be removed: log every id for
-        # manual cleanup, keep retrying in the background, and tell the caller the truth.
+        # New version is stored but old cleanup failed — log ids, retry in background, tell the caller.
         logger.error(
             f"Could not remove the old version of source_id {source_id} (company_id {company_id}) after "
             f"storing the new one; {len(old_ids)} old points may remain searchable. Point IDs: {old_ids}"
@@ -82,7 +75,7 @@ class UpdateService(BaseDocumentOperation):
             old_ids, source_id, reason=const.ROLLBACK_REASON_OLD_VERSION_CLEANUP
         )
 
-        # A retry is safe: it snapshots old + new ids, stores another copy, then deletes both
+        # Retrying this request is safe — it just re-snapshots and tries again
         raise HTTPException(
             status_code=502,
             detail=(
