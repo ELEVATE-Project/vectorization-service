@@ -578,12 +578,12 @@
                 },
                 {
                   "key": "metadata",
-                  "value": "{\"theme\": \"  School   Leadership \"}",
+                  "value": "{\"theme\": \"  School_Leadership \"}",
                   "type": "text"
                 }
               ]
             },
-            "description": "A theme sent only inside metadata (any key case) is moved to the top-level theme, with whitespace collapsed, and removed from metadata.\n\n**Expected:** 201 Created"
+            "description": "A theme sent only inside metadata (any key case) is moved to the top-level theme with only leading and trailing spaces removed (inner spacing and case are kept exactly), and removed from metadata.\n\n**Expected:** 201 Created"
           },
           "response": [
             {
@@ -622,7 +622,7 @@
                     },
                     {
                       "key": "metadata",
-                      "value": "{\"theme\": \"  School   Leadership \"}",
+                      "value": "{\"theme\": \"  School_Leadership \"}",
                       "type": "text"
                     }
                   ]

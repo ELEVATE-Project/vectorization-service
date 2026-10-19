@@ -20,7 +20,7 @@ class ThemeService(BaseDocumentOperation):
         company_id = self.normalize_company_id(company_id)
 
         # theme is optional on upload but required here; an empty value never clears it.
-        # validate_theme then applies the shared normalization (strip, collapse whitespace).
+        # validate_theme then applies the shared normalization (outer whitespace only).
         if theme is None or (isinstance(theme, str) and not theme.strip()):
             raise HTTPException(status_code=400, detail=msg.THEME_REQUIRED)
         if not isinstance(theme, str):
