@@ -978,7 +978,7 @@ class TestAcronymRankingFollowsLexicalRanking:
     @pytest.mark.parametrize("method, keyword_or, phrase", [
         ("max", False, "searched separately"),
         ("max", True, "searched separately"),
-        ("inline", True, "once per full form"),
+        ("inline", True, "once more for each meaning"),
         ("inline", False, "one keyword search"),
     ])
     def test_acronym_info_describes_the_method(
@@ -1007,7 +1007,6 @@ class TestAcronymScoringContext:
         ctx = self._context(service, monkeypatch, method=method)
         # The same boosts as any other query, plus the expansion boosts.
         assert ctx["boost_config"] == {
-            "mode": "title_summary_boost",
             "exact_title_boost": settings.EXACT_TITLE_BOOST,
             "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
             "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,
@@ -1052,8 +1051,13 @@ class TestAcronymScoringContext:
             self, service, monkeypatch, search_mode, hybrid_enabled, reason):
         ctx = self._context(service, monkeypatch, search_mode=search_mode,
                             hybrid_enabled=hybrid_enabled)
-        assert ctx["boost_config"]["mode"] == "off"
-        assert "expansion_exact_title_boost" not in ctx["boost_config"]
+        # Boosts off: every multiplier reads 1.0, and no expansion boosts.
+        assert ctx["boost_config"] == {
+            "exact_title_boost": 1.0,
+            "partial_title_boost": 1.0,
+            "exact_summary_boost": 1.0,
+            "partial_summary_boost": 1.0,
+        }
         assert ctx["acronym_ranking"] == {
             "applied": False, "reason": reason, "dense_variants": 1,
         }
@@ -1061,7 +1065,6 @@ class TestAcronymScoringContext:
     def test_ordinary_query_keeps_configured_boosts(self, service, monkeypatch):
         ctx = self._context(service, monkeypatch, acronyms={})
         assert ctx["boost_config"] == {
-            "mode": "title_summary_boost",
             "exact_title_boost": settings.EXACT_TITLE_BOOST,
             "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
             "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,

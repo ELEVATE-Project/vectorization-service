@@ -1769,7 +1769,7 @@ class PrioritizedSearchService(AcronymRankingMixin):
 
     @staticmethod
     def _boost_config(lexical_ranking_enabled: bool) -> Dict[str, Any]:
-        """The title/summary multipliers actually applied, and why ("mode")."""
+        """The title/summary multipliers actually applied (all 1.0 when boosts are off)."""
         configured = {
             "exact_title_boost": settings.EXACT_TITLE_BOOST,
             "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
@@ -1777,8 +1777,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
             "partial_summary_boost": settings.PARTIAL_SUMMARY_BOOST,
         }
         if not lexical_ranking_enabled:
-            return {"mode": "off", **dict.fromkeys(configured, 1.0)}
-        return {"mode": "title_summary_boost", **configured}
+            return dict.fromkeys(configured, 1.0)
+        return configured
 
     def _apply_field_boost(
         self,

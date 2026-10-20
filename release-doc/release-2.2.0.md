@@ -93,9 +93,9 @@ Always an object for a request with query text (`null` only without query text):
 
 | Setting | `method_description` |
 |---|---|
-| `max` | The query as typed and the query with each acronym written out are searched separately, for meaning and for keywords; each field keeps the higher score. |
+| `max` | The query and the query with each acronym written out are searched separately, for meaning and for keywords; each field keeps the higher score. |
 | `inline` | One search text with each acronym's full form written next to it, e.g. "PTM (Parent Teacher Meeting) documents"; one keyword search with the words of the query and of every full form. |
-| `inline` + `ACRONYM_KEYWORD_OR=true` | (same first part); the keyword search runs once for the query as typed and once per full form, and each chunk keeps the higher keyword score. |
+| `inline` + `ACRONYM_KEYWORD_OR=true` | (same first part); the keyword search runs once for the query and once more for each meaning, with every acronym replaced by that meaning ("Parent Teacher Meeting documents"), and each chunk keeps the higher keyword score. |
 
 </details>
 
@@ -110,7 +110,7 @@ Per result:
 | `title_expansion_multiplier`, `summary_expansion_multiplier` | Acronym queries | Title / summary boost from the query with the acronym written out (1.0 = none); `title_multiplier` / `summary_multiplier` then carry only the boost from the query as typed |
 | `title_expansion_match`, `summary_expansion_match` | Acronym queries | How the title / summary matched the query with the acronym written out: `exact`, `partial` or none; `title_match` / `summary_match` then cover only the query as typed |
 
-`search_config.scoring_context` also reports `boost_config` (mode `title_summary_boost` with the multipliers in effect, the same as for any query) and `acronym_ranking` (method, number of dense texts); the candidate pool size is `scoring_context.candidate_pool_size`, as for any query.
+`search_config.scoring_context` also reports `boost_config` (the multipliers in effect: the same as for any query, plus the four expansion boosts; all 1.0 when boosts are off) and `acronym_ranking` (method, number of dense texts); the candidate pool size is `scoring_context.candidate_pool_size`, as for any query.
 
 </details>
 
@@ -210,10 +210,10 @@ Response: `received`, `created`, `updated`, `deactivated`, `cache_refreshed`, `e
    ```bash
    curl -s -X POST "http://<HOST>:<PORT>/api/documents/search" -H 'Content-Type: application/json' \
      -d '{"query":"DIET","top_k":5,"filter_score":0.35,"include_scoring_debug":true}' \
-     | jq '{acronym_info, mode: .search_config.scoring_context.boost_config.mode,
+     | jq '{acronym_info, boost_config: .search_config.scoring_context.boost_config,
             top: [.results[] | {title, score, normalized_dense, normalized_sparse, title_multiplier}]}'
    ```
-   Expect `acronym_info` with `"enabled": true, "detected": true` and the DIET expansion, mode `title_summary_boost`, and `title_multiplier` above 1.0 only on titles that contain "diet".
+   Expect `acronym_info` with `"enabled": true, "detected": true` and the DIET expansion, `boost_config` with the configured multipliers (not 1.0), and `title_multiplier` above 1.0 only on titles that contain "diet".
 8. **Optional — add or update acronyms:**
    ```bash
    curl -X POST "http://<HOST>:<PORT>/api/acronyms/bulk" \

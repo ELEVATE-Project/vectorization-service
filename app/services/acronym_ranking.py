@@ -93,13 +93,14 @@ class AcronymRankingMixin:
     def _acronym_method_description() -> str:
         """acronym_info.method_description: ACRONYM_SEARCH_METHOD (and keyword OR) in words."""
         if settings.ACRONYM_SEARCH_METHOD == "max":
-            return ("The query as typed and the query with each acronym written out are searched "
+            return ("The query and the query with each acronym written out are searched "
                     "separately, for meaning and for keywords; each field keeps the higher score.")
         text = ("One search text with each acronym's full form written next to it, e.g. "
                 "\"PTM (Parent Teacher Meeting) documents\"")
         if settings.ACRONYM_KEYWORD_OR:
-            return (text + "; the keyword search runs once for the query as typed and once per "
-                           "full form, and each chunk keeps the higher keyword score.")
+            return (text + "; the keyword search runs once for the query and once more for each "
+                           "meaning, with every acronym replaced by that meaning (\"Parent Teacher "
+                           "Meeting documents\"), and each chunk keeps the higher keyword score.")
         return text + "; one keyword search with the words of the query and of every full form."
 
     @staticmethod
