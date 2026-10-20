@@ -23,10 +23,10 @@
 ## What's New
 
 - **Acronym detection in search queries.** A query containing a registered acronym (e.g. `DIET`, `PTM`, `SSC`) is detected and expanded before retrieval, so a search for the acronym also finds documents that only spell out its full meaning. Gated by `ACRONYM_SEARCH_ENABLED` (default `true`).
-- **Acronym-aware ranking.** Acronym queries blend the score for the query with the score for its expansion, then apply the title and summary boosts on the acronym and a text boost when the document body uses the acronym. A title that merely contains the everyday word ("Healthy Diet Guide") does not earn the body boost.
+- **Acronym-aware ranking.** Acronym queries are searched with the acronym written out (`ACRONYM_SEARCH_METHOD`: `inline`, the default, or `max`), then get the same title and summary boosts as any other query (the query as typed). A title that spells the acronym out gets its own boost: x1.7 when it has the query with the acronym written out ("PTM Doc" → "Parent Teachers Meeting Doc"), x1.4 when it has an expansion.
 - **Acronym dictionary.** New Postgres table `acronym_mapping`, seeded with 486 acronyms. One acronym can have several meanings (`SSC` → "Staff Selection Commission" / "Sainik School Society"). Lookups go through a Redis cache.
 - **Bulk upload endpoint.** `POST /api/acronyms/bulk` creates, updates, enables or disables acronyms from a CSV, and reports which acronyms were created, updated and deactivated.
-- **`acronym_info` in the search response**, showing whether acronym search is enabled, whether an acronym was detected, and its expansions.
+- **`acronym_info` in the search response**, showing whether acronym search is enabled, the search method in use, whether an acronym was detected, and its expansions.
 - **Scoring debug output** for acronym queries (with `include_scoring_debug=true`), so the final score can be rebuilt from its parts.
 
 ---
@@ -38,7 +38,11 @@
 
 1. **Detect** (`acronym_query_service.detect_acronyms`): every token of 2+ letters, and every contiguous phrase of 2 to `ACRONYM_MAX_PHRASE_WORDS` words, is checked against the dictionary, whatever its case. Multi-word entries (`RTE ACT`, `PM SHRI`) are found too. The dictionary is the filter: a lowercase word that is not registered resolves to nothing. Stopwords are kept out of the ordinary candidate list but still looked up, so an acronym that is also a stopword (`BE`, `ME`) is found. Two recovery passes handle text commons has already changed: a plural retry (`DIETS` → `DIET`) and gluing single-letter runs (`D.I.E.T.` arrives as `d i e t` → `DIET`).
 2. **Look up** (`acronym_service.get_expansions_batch`): one batched Redis round trip for every candidate, with Postgres for the misses (written back to Redis).
-3. **Expand and retrieve**: up to `ACRONYM_MAX_DENSE_VARIANTS` dense query texts (the original plus one per expansion meaning, each with the acronym replaced by the expansion, never concatenated), and one BM25 query with every expansion's words appended. A query that already spells out the expansion gets no duplicate variant.
+3. **Expand and retrieve**, by `ACRONYM_SEARCH_METHOD`:
+   - `inline` (default; empty also means inline): one dense text with every meaning written next to its acronym ("PTM documents" → "PTM (Parent Teacher Meeting) documents").
+   - `max`: up to `ACRONYM_MAX_DENSE_VARIANTS` dense texts (the original plus one per meaning, the acronym replaced by the expansion); each field keeps its higher score (OR), and keyword OR is on.
+
+   Both send one BM25 query with every expansion's words appended (or one per form with keyword OR). A query that already spells out the expansion gets no duplicate.
 
 </details>
 
@@ -46,38 +50,16 @@
 <summary>Ranking</summary>
 
 ```
-acronym_pre_boost_score = (1 - W) × score vs query + W × score vs expansion     (W = ACRONYM_EXPANSION_SCORE_WEIGHT, 0.5)
-score = acronym_pre_boost_score × title multiplier × summary multiplier × text multiplier,  capped at 1.0
+score before boosts = the retrieval score (0.7 × normalized dense + 0.3 × normalized BM25)
+score = score before boosts × title multiplier × summary multiplier,  capped at 1.0
 ```
 
-- **Blend.** Retrieval merges the query and expansion results; scoring then averages them, so a document must match both. Only the top `ACRONYM_RESCORE_POOL_LIMIT` candidates are blended; the rest keep their retrieval score.
-- **Title / summary multipliers.** The standard `EXACT_TITLE_BOOST` / `PARTIAL_TITLE_BOOST` / `EXACT_SUMMARY_BOOST` / `PARTIAL_SUMMARY_BOOST`, matched on the query and the acronym as **whole words**: "DIET" never matches inside "dietary"; "_DIET_" in file-name titles does.
-- **Text multiplier.** `EXACT_TEXT_BOOST` when the body uses the acronym **as written** (capitals for single-word keys, so "a healthy diet" does not count), else 1.0.
-- `filter_score` judges the pre-boost score. The boosts are applied before the `top_k` cut, so they can lift a document onto the page.
+- **Title / summary multipliers.** The standard `EXACT_TITLE_BOOST` / `PARTIAL_TITLE_BOOST` / `EXACT_SUMMARY_BOOST` / `PARTIAL_SUMMARY_BOOST`, matched exactly as for any query: the query as typed, anywhere in the title or summary, in any case.
+- **Expansion title multiplier.** The ordinary title rule applied to the query with the acronym written out ("PTM document" -> "Parent Teacher Meeting document"): `ACRONYM_EXPANSION_EXACT_TITLE_BOOST` (1.7) when the title equals it, `ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST` (1.4) when the title contains it. It stacks with the ordinary title multiplier: a title with both forms gets both (e.g. ×1.5 × ×1.4), shown as `title_multiplier` and `title_expansion_multiplier`.
+- **Expansion summary multiplier.** The same two matches in the summary (equals / contains): `ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST` (1.4) or `ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST` (1.2). It stacks with the ordinary summary multiplier the same way (`summary_multiplier`, `summary_expansion_multiplier`).
+- `filter_score` judges the pre-boost score. Title/summary matches outside the `top_k` are injected, as for any query.
 - Many strong documents reach the 1.0 cap; their order then follows the score before the cap.
 - Ordinary (non-acronym) queries and `search_mode="semantic"` keep the existing ranking. In semantic mode, acronym expansion still widens retrieval.
-
-</details>
-
-<details>
-<summary>Body check (text multiplier)</summary>
-
-1. One grouped BM25 query per acronym over the checked documents; their top `ACRONYM_BODY_CHECK_TOP_CHUNKS` chunks must use the acronym in capitals. A BM25 hit that fails there has all its chunks read before it is rejected.
-2. Chunks without a BM25 vector (indexed before BM25 was enabled) are listed with a `has_vector` filter and checked directly with the same rule.
-3. Only candidates that can still reach the page are checked (score × `EXACT_TEXT_BOOST`, capped at 1.0, reaches the k-th score), at most `ACRONYM_BODY_CHECK_MAX_SOURCES`.
-
-Reported as `search_config.scoring_context.acronym_ranking.body_check`:
-
-| Value | Meaning |
-|---|---|
-| `bm25` | Every checked document has BM25 vectors |
-| `bm25+scan` | Some documents were read directly |
-| `scan` | All checked documents were read directly |
-| `bm25 (scan unsupported)` | Qdrant before 1.13 rejected the `has_vector` filter; chunks without BM25 vectors were not checked. Remembered until restart |
-| `unavailable` | The check could not run (sparse search off, encoder or query failure); no text boost |
-| `none` | Nothing to check |
-
-⚠️ The direct read needs **Qdrant server 1.13 or newer**. On an older server it is skipped with a warning, and documents without BM25 vectors get no text boost; run the BM25 backfill ([Deployment](#deployment), step 2).
 
 </details>
 
@@ -104,8 +86,16 @@ Always an object for a request with query text (`null` only without query text):
 | Situation | Value |
 |---|---|
 | `ACRONYM_SEARCH_ENABLED=false` | `{"enabled": false, "detected": false}` |
-| Enabled, no acronym in the query | `{"enabled": true, "detected": false}` |
-| Acronym detected | `{"enabled": true, "detected": true, "mapping": {"DIET": ["District Institute of Education and Training"]}}`, plus `"ambiguous": ["SSC"]` for acronyms with several meanings |
+| Enabled, no acronym in the query | `{"enabled": true, "detected": false, "method": "inline", "method_description": "..."}` |
+| Acronym detected | `{"enabled": true, "detected": true, "method": "inline", "method_description": "...", "mapping": {"DIET": ["District Institute of Education and Training"]}}`, plus `"ambiguous": ["SSC"]` for acronyms with several meanings |
+
+`method` is the `ACRONYM_SEARCH_METHOD` in use (`inline` or `max`), so any response shows how acronym queries are searched. `method_description` says the same in words, including whether keyword OR is on:
+
+| Setting | `method_description` |
+|---|---|
+| `max` | The query as typed and the query with each acronym written out are searched separately, for meaning and for keywords; each field keeps the higher score. |
+| `inline` | One search text with each acronym's full form written next to it, e.g. "PTM (Parent Teacher Meeting) documents"; one keyword search with the words of the query and of every full form. |
+| `inline` + `ACRONYM_KEYWORD_OR=true` | (same first part); the keyword search runs once for the query as typed and once per full form, and each chunk keeps the higher keyword score. |
 
 </details>
 
@@ -116,12 +106,11 @@ Per result:
 
 | Field | When set | Meaning |
 |---|---|---|
-| `acronym_pre_boost_score` | Acronym queries, rescored documents | The score before the title, summary and text boosts |
 | `title_multiplier`, `summary_multiplier` | All queries | Title / summary boost applied (1.0 = none) |
-| `acronym_in_body_match`, `acronym_in_body_multiplier` | Acronym queries | `"exact"` and `EXACT_TEXT_BOOST` when the body uses the acronym |
-| `pre_floor_score` | Keyword-injected rows (`match_source` set) | The relevance measured before the threshold dropped the document; its `score` is the floor value |
+| `title_expansion_multiplier`, `summary_expansion_multiplier` | Acronym queries | Title / summary boost from the query with the acronym written out (1.0 = none); `title_multiplier` / `summary_multiplier` then carry only the boost from the query as typed |
+| `title_expansion_match`, `summary_expansion_match` | Acronym queries | How the title / summary matched the query with the acronym written out: `exact`, `partial` or none; `title_match` / `summary_match` then cover only the query as typed |
 
-`search_config.scoring_context` also reports `boost_config` (mode `acronym_field_boost` with the multipliers in effect) and `acronym_ranking` (blend weight, rescore pool, `body_check`).
+`search_config.scoring_context` also reports `boost_config` (mode `title_summary_boost` with the multipliers in effect, the same as for any query) and `acronym_ranking` (method, number of dense texts); the candidate pool size is `scoring_context.candidate_pool_size`, as for any query.
 
 </details>
 
@@ -153,12 +142,12 @@ Response: `received`, `created`, `updated`, `deactivated`, `cache_refreshed`, `e
 | `INTERNAL_API_TOKEN` | — (required) | Header `internal_access_token` for the acronym endpoints |
 | `ADMIN_API_TOKEN` | — (required) | Header `admin_auth_token`, additionally required for bulk upload |
 | `ACRONYM_BULK_UPLOAD_MAX_SIZE_MB` | `5` | Largest CSV accepted |
-| `EXACT_TEXT_BOOST` | `2.0` | Text multiplier when the body uses the acronym |
-| `ACRONYM_EXPANSION_SCORE_WEIGHT` | `0.5` | Expansion share of the pre-boost blend |
-| `ACRONYM_RESCORE_POOL_LIMIT` | `200` | Candidates the blend rescores |
-| `ACRONYM_BODY_CHECK_TOP_CHUNKS` | `3` | Top BM25 chunks per document read by the body check |
-| `ACRONYM_BODY_CHECK_MAX_SOURCES` | `200` | Most documents the body check reads per query |
-| `ACRONYM_MAX_DENSE_VARIANTS` | `3` | Dense query variants per acronym query, including the original |
+| `ACRONYM_EXPANSION_EXACT_TITLE_BOOST` | `1.7` | Title multiplier when the title equals the query with the acronym written out |
+| `ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST` | `1.4` | Title multiplier when the title contains the query with the acronym written out |
+| `ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST` | `1.4` | Summary multiplier when the summary equals the query with the acronym written out |
+| `ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST` | `1.2` | Summary multiplier when the summary contains the query with the acronym written out |
+| `ACRONYM_SEARCH_METHOD` | `inline` | `inline` (one text with the meanings written in) or `max` (one text per meaning, higher score per field); empty means `inline` |
+| `ACRONYM_MAX_DENSE_VARIANTS` | `3` | Dense query variants per acronym query, including the original (max and keyword OR) |
 | `ACRONYM_MAX_PHRASE_WORDS` | `4` | Longest multi-word acronym detected and accepted on upload |
 | `ACRONYM_MIN_PREFIX_MATCH_LEN` | `4` | Shortest word stem allowed to prefix-match an expansion word |
 | `ACRONYM_PREFIX_SUFFIX_CAP` | `3` | Most extra characters in such a prefix match ("tests" ~ "test") |
@@ -167,8 +156,6 @@ Response: `received`, `created`, `updated`, `deactivated`, `cache_refreshed`, `e
 | `REDIS_CACHE_TTL` / `REDIS_NEGATIVE_CACHE_TTL` / `REDIS_DB_ERROR_CACHE_TTL` | `86400` / `3600` / `30` | Cache lifetimes (seconds) for hits, "not an acronym" and database-outage misses |
 | `REDIS_SOCKET_CONNECT_TIMEOUT` / `REDIS_SOCKET_TIMEOUT` | `1` / `1` | Redis timeouts (seconds) |
 | `POSTGRES_CONNECT_TIMEOUT` / `POSTGRES_STATEMENT_TIMEOUT_MS` | `3` / `5000` | Postgres connect timeout (seconds) and per-statement timeout |
-
-`SPARSE_SEARCH_ENABLED=true` (BM25) is needed for the text boost; without it, `body_check` reports `unavailable`.
 
 ---
 
@@ -179,7 +166,6 @@ Response: `received`, `created`, `updated`, `deactivated`, `cache_refreshed`, `e
 - **`click`** is an explicit dependency: `spacy` imports it, and recent `typer` releases no longer pull it in.
 - The stopword list is `spacy`'s built-in list; no extra model download. The `en_core_web_sm` model is installed by the Ansible deploy step.
 - **`data/acronyms.csv`** (486 acronyms) is committed; the migration seeds the table from it.
-- **Qdrant server 1.13+** is needed for the body check's direct read of chunks without BM25 vectors.
 
 ---
 
@@ -188,7 +174,7 @@ Response: `received`, `created`, `updated`, `deactivated`, `cache_refreshed`, `e
 ### Pre-deploy checklist
 
 1. **Postgres is reachable.** `acronym_mapping` is new; the existing `translations` table is untouched.
-2. **BM25 coverage** (recommended; required on a Qdrant server older than 1.13): add BM25 vectors to any chunks that lack them. Already-indexed points are skipped, so it is safe to re-run:
+2. **BM25 coverage** (recommended): add BM25 vectors to any chunks that lack them; a chunk without one gets no keyword score. Already-indexed points are skipped, so it is safe to re-run:
    ```bash
    PYTHONPATH=. COLLECTION_NAME=<collection> SPARSE_SEARCH_ENABLED=true \
      .venv/bin/python3 scripts/migrate_to_sparse_vectors.py --dry-run   # report only
@@ -225,10 +211,9 @@ Response: `received`, `created`, `updated`, `deactivated`, `cache_refreshed`, `e
    curl -s -X POST "http://<HOST>:<PORT>/api/documents/search" -H 'Content-Type: application/json' \
      -d '{"query":"DIET","top_k":5,"filter_score":0.35,"include_scoring_debug":true}' \
      | jq '{acronym_info, mode: .search_config.scoring_context.boost_config.mode,
-            body_check: .search_config.scoring_context.acronym_ranking.body_check,
-            top: [.results[] | {title, score, acronym_pre_boost_score, title_multiplier, acronym_in_body_multiplier}]}'
+            top: [.results[] | {title, score, normalized_dense, normalized_sparse, title_multiplier}]}'
    ```
-   Expect `acronym_info` with `"enabled": true, "detected": true` and the DIET expansion, mode `acronym_field_boost`, `body_check` `bm25` or `bm25+scan`, and `acronym_in_body_multiplier: 2.0` on documents that use "DIET" in their body.
+   Expect `acronym_info` with `"enabled": true, "detected": true` and the DIET expansion, mode `title_summary_boost`, and `title_multiplier` above 1.0 only on titles that contain "diet".
 8. **Optional — add or update acronyms:**
    ```bash
    curl -X POST "http://<HOST>:<PORT>/api/acronyms/bulk" \

@@ -259,33 +259,19 @@ class SearchResultItem(BaseModel):
                     "Applied after title_multiplier, each capped at 1.0. "
                     "Debug-only (include_scoring_debug=true)."
     )
-    pre_floor_score: Optional[float] = Field(
+    title_expansion_multiplier: Optional[float] = Field(
         default=None,
-        description="Keyword-injected rows only (debug, see match_source): the relevance "
-                    "the search measured before the threshold dropped this document and "
-                    "it was re-added as a title/summary match. Its score is the floor, "
-                    "not this value. None when debug is off, for documents that were "
-                    "never scored, and for normal results."
+        description="Acronym queries: boost factor applied because the title matched the "
+                    "query with the acronym written out (ACRONYM_EXPANSION_EXACT_TITLE_BOOST / "
+                    "ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST). Stacks with title_multiplier: a document "
+                    "matching both gets both. 1.0 means no boost. Debug-only (include_scoring_debug=true)."
     )
-    acronym_pre_boost_score: Optional[float] = Field(
+    summary_expansion_multiplier: Optional[float] = Field(
         default=None,
-        description="Acronym queries only (debug): the score before the title, summary and "
-                    "text boosts, a blend of the query and expansion scores (see "
-                    "search_config.scoring_context.acronym_ranking). score = acronym_pre_boost_score "
-                    "x title, summary and text multipliers, capped at 1.0. None when no blend "
-                    "ran (the query already spells out the expansion, or the rescore failed; "
-                    "see scoring_context.acronym_ranking.rescore), for keyword-injected rows, "
-                    "for rows outside the rescored pool, and for ordinary queries."
-    )
-    acronym_in_body_match: Optional[str] = Field(
-        default=None,
-        description="Acronym queries only (debug): 'exact' when the body uses the acronym "
-                    "as written (capitals), else None."
-    )
-    acronym_in_body_multiplier: Optional[float] = Field(
-        default=None,
-        description="Acronym queries only (debug): text boost applied (EXACT_TEXT_BOOST, "
-                    "1.0 when the body does not use the acronym), else None."
+        description="Acronym queries: the same for the summary "
+                    "(ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST / ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST). "
+                    "Stacks with summary_multiplier. 1.0 means no "
+                    "boost. Debug-only (include_scoring_debug=true)."
     )
     title_match: Optional[str] = Field(
         default=None,
@@ -294,6 +280,18 @@ class SearchResultItem(BaseModel):
     summary_match: Optional[str] = Field(
         default=None,
         description="Summary match type: 'exact', 'partial', or None if no summary match"
+    )
+    title_expansion_match: Optional[str] = Field(
+        default=None,
+        description="Acronym queries: how the title matched the query with the acronym "
+                    "written out ('PTM document' -> 'Parent Teacher Meeting document'): "
+                    "'exact', 'partial', or None. Goes with title_expansion_multiplier; "
+                    "title_match covers the query as typed only. Debug-only (include_scoring_debug=true)."
+    )
+    summary_expansion_match: Optional[str] = Field(
+        default=None,
+        description="Acronym queries: the same for the summary. Goes with "
+                    "summary_expansion_multiplier. Debug-only (include_scoring_debug=true)."
     )
 
 class PrioritizedSearchResponse(BaseModel):
@@ -308,7 +306,9 @@ class PrioritizedSearchResponse(BaseModel):
     acronym_info: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Acronym detection for this query: enabled (ACRONYM_SEARCH_ENABLED), "
-                    "detected (an acronym was found), and when detected the mapping "
+                    "detected (an acronym was found), method (ACRONYM_SEARCH_METHOD: inline "
+                    "or max; only when enabled) with method_description (the method in words), "
+                    "and when detected the mapping "
                     "{acronym: expansions} plus ambiguous (acronyms with several meanings). "
                     "None only when the request had no query text."
     )

@@ -105,9 +105,20 @@ class Settings(BaseSettings):
     # Summary boosts are lower than title (summary carries less weight than title).
     EXACT_SUMMARY_BOOST: float = float(os.getenv("EXACT_SUMMARY_BOOST", "1.4"))
     PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.2"))
-    # Acronym queries only: text boost on top of the title/summary boosts above, when
-    # the body uses the acronym as written (capitals).
-    EXACT_TEXT_BOOST: float = float(os.getenv("EXACT_TEXT_BOOST", "2.0"))
+    # Acronym queries only: the title boost rule above, applied to the query with the
+    # acronym written out ("PTM document" -> "Parent Teacher Meeting document"). It
+    # stacks with the title boost above (a document matching both gets both). Default 1.0
+    # (off); set a value above 1.0 to turn it on. Title equals the written-out query:
+    ACRONYM_EXPANSION_EXACT_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_TITLE_BOOST", "1.0"))
+    # Title contains the written-out query ("Parent Teacher Meeting document in school"):
+    ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST", "1.0"))
+    # The same two matches in the summary (equals / contains), against the summary boost
+    # above (stacks with it, like the title). Default 1.0 (off).
+    ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST", "1.0"))
+    ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST", "1.0"))
+    # The written-out query is matched by the title/summary scroll (OR with the query as
+    # typed, no extra call), over the whole collection, so documents outside the candidate
+    # pool can be boosted and injected too.
     METADATA_MATCH_BOOST: float = float(os.getenv("METADATA_MATCH_BOOST", "1.2"))
     # How many keyword-matched documents we are willing to score per search. Scoring
     # each one downloads 5 vectors, and a short query can match thousands of titles.
@@ -125,22 +136,21 @@ class Settings(BaseSettings):
     ACRONYM_PREFIX_SUFFIX_CAP: int = int(os.getenv("ACRONYM_PREFIX_SUFFIX_CAP", "3"))
 
     # Dense variants per query, including the original: one per expansion meaning
-    # (SSC, DM, MIP have two). See design notes, Settings.
+    # (SSC, DM, MIP have two). Used by max (and keyword OR). See design notes, Settings.
     ACRONYM_MAX_DENSE_VARIANTS: int = int(os.getenv("ACRONYM_MAX_DENSE_VARIANTS", "3"))
 
-    # Acronym ranking: pre-boost score = (1 - W) x query score + W x expansion score,
-    # then the title, summary and text boosts. W: see design notes, Settings.
-    ACRONYM_EXPANSION_SCORE_WEIGHT: float = float(os.getenv("ACRONYM_EXPANSION_SCORE_WEIGHT", "0.5"))
-
-    # Only the top N candidates are rescored by the blend (uncapped it tripled latency).
-    ACRONYM_RESCORE_POOL_LIMIT: int = int(os.getenv("ACRONYM_RESCORE_POOL_LIMIT", "200"))
+    # How an acronym query searches the query and its expansions (see design notes, Settings):
+    #   "inline" one text that writes each expansion next to its acronym
+    #            ("PTM (Parent Teacher Meeting) documents"); default, also used when empty
+    #   "max"    the query and each expansion searched separately, each field keeps its
+    #            higher score (OR), keyword OR on
+    ACRONYM_SEARCH_METHOD: str = os.getenv("ACRONYM_SEARCH_METHOD", "inline")
+    # Keyword OR: one BM25 search per variant ("diet" OR "District Institute of Education
+    # and Training"), each chunk keeping its higher raw BM25 score, instead of one BM25
+    # search with every expansion's words. See design notes, Settings.
+    ACRONYM_KEYWORD_OR: bool = os.getenv("ACRONYM_KEYWORD_OR", "false").lower() == "true"
     # Longest multi-word acronym (in words) that detection finds and upload accepts.
     ACRONYM_MAX_PHRASE_WORDS: int = int(os.getenv("ACRONYM_MAX_PHRASE_WORDS", "4"))
-    # Top BM25 chunks per document read when checking its body backs an acronym claim.
-    ACRONYM_BODY_CHECK_TOP_CHUNKS: int = int(os.getenv("ACRONYM_BODY_CHECK_TOP_CHUNKS", "3"))
-    # Most documents whose body the text boost checks per query: only candidates that
-    # can still reach the page are checked, best first, up to this many.
-    ACRONYM_BODY_CHECK_MAX_SOURCES: int = int(os.getenv("ACRONYM_BODY_CHECK_MAX_SOURCES", "200"))
 
     # Master switch for acronym search; off gives exactly the pre-feature ranking.
     ACRONYM_SEARCH_ENABLED: bool = os.getenv("ACRONYM_SEARCH_ENABLED", "true").lower() == "true"
@@ -179,6 +189,18 @@ class Settings(BaseSettings):
                 f"HYBRID_FUSION_METHOD must be one of {sorted(valid_methods)}, "
                 f"got {self.HYBRID_FUSION_METHOD!r}"
             )
+        # BaseSettings reads the env var as typed, so normalize here: empty means inline.
+        self.ACRONYM_SEARCH_METHOD = (self.ACRONYM_SEARCH_METHOD or "").strip().lower() or "inline"
+        if self.ACRONYM_SEARCH_METHOD not in ("inline", "max"):
+            raise ValueError(
+                "ACRONYM_SEARCH_METHOD must be inline or max (empty means inline), "
+                f"got {self.ACRONYM_SEARCH_METHOD!r}"
+            )
+        for name in ("ACRONYM_EXPANSION_EXACT_TITLE_BOOST", "ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST",
+                     "ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST", "ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST"):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value >= 1.0):
+                raise ValueError(f"{name} must be a finite number >= 1.0, got {value}")
         dw, sw = self.HYBRID_DENSE_WEIGHT, self.HYBRID_SPARSE_WEIGHT
         if not (math.isfinite(dw) and dw >= 0.0):
             raise ValueError(
