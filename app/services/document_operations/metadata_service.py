@@ -6,6 +6,8 @@ from qdrant_client import models
 from app.services.document_operations.base_operation import BaseDocumentOperation
 from app.core.clients.qdrant import qdrant_client
 from app.config import settings
+from app.constants import constants as const
+from app.constants import messages as msg
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,14 @@ class MetadataService(BaseDocumentOperation):
             raise HTTPException(
                 status_code=400,
                 detail="metadata_updates cannot be empty"
+            )
+
+        # theme lives top-level only; merged here it would become a metadata copy that
+        # search never reads. Reject the whole request (even null) before any Qdrant call.
+        if const.THEME_KEY in metadata_updates:
+            raise HTTPException(
+                status_code=400,
+                detail=msg.METADATA_UPDATE_THEME_NOT_ALLOWED
             )
 
         # Prevent changing company_id through metadata update

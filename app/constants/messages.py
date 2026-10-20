@@ -116,3 +116,14 @@ THEME_UPDATE_FAILED = "Theme update failed: {error}"
 
 # Success response
 THEME_UPDATE_SUCCEEDED = "Successfully updated theme for {count} documents"
+
+
+# =============================================================================
+# Metadata update (PATCH /api/documents/{source_id}/metadata)
+# =============================================================================
+
+# theme is a top-level field, so a metadata update cannot set the "theme" key
+METADATA_UPDATE_THEME_NOT_ALLOWED = (
+    "'theme' cannot be updated through metadata. Theme is a top-level field; "
+    "use the theme update API instead."
+)
