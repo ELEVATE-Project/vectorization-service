@@ -167,8 +167,8 @@ slower than inline (p50 971 ms vs 475 ms at top_k 1000) and worse on real data
 Selection Commission or Sainik School Society) used to get a dense variant for
 its first expansion only. Now one variant per expansion, capped by this setting
 (including the original query). Only SSC, DM and MIP are ambiguous today.
-Used by max (one search per variant) and by keyword OR; inline writes every
-meaning into one text instead.
+Used by max (one search per variant); inline writes every meaning into one text
+instead. Keyword OR is not capped: it runs one BM25 search per meaning.
 
 **`ACRONYM_SEARCH_METHOD` = inline.** Picks how an acronym query searches the
 query and its expansions: `inline` (default; empty also means inline) or `max`,
@@ -182,8 +182,8 @@ text with each expansion written next to its acronym, as if the user had typed
 it: "PTM documents" -> "PTM (Parent Teacher Meeting) documents"; an ambiguous
 acronym gets every meaning ("MIP (Micro Improvement Project, Micro Improvement
 Plan)"); an expansion the query already spells out is not added again. One text
-means one embedding and no max() merge (`ACRONYM_MAX_DENSE_VARIANTS` then only
-affects keyword OR). The sparse text is unchanged.
+means one embedding and no max() merge (`ACRONYM_MAX_DENSE_VARIANTS` then has no
+effect). The sparse text is unchanged.
 
 **Inline text form.** The inline text gets the usual query clean-up, as if the
 user had typed it: "PTM (Parent Teacher Meeting) documents" becomes "ptm parent
@@ -372,7 +372,8 @@ spaced and glued key are tried, so "d i e t" maps back to DIET. A variant is
 skipped when the query already spells the expansion out (a doubled phrase embeds
 to a distorted point), and when it differs only in case (embeddings ignore case).
 One variant per expansion index (AC-11), capped by `ACRONYM_MAX_DENSE_VARIANTS`;
-max searches every variant, inline writes all meanings into one text. The sparse query appends every expansion's words: BM25 is a bag of
+max searches every variant, inline writes all meanings into one text. Keyword OR
+takes every variant, not capped. The sparse query appends every expansion's words: BM25 is a bag of
 words, so extra words cannot dilute it, and its tokenizer has no OR or phrases.
 All dense texts are embedded in one `encode()` call and validated before Qdrant.
 Retrieval merges same-field hits across embeddings with `max()`.

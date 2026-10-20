@@ -23,7 +23,7 @@
 ## What's New
 
 - **Acronym detection in search queries.** A query containing a registered acronym (e.g. `DIET`, `PTM`, `SSC`) is detected and expanded before retrieval, so a search for the acronym also finds documents that only spell out its full meaning. Gated by `ACRONYM_SEARCH_ENABLED` (default `true`).
-- **Acronym-aware ranking.** Acronym queries are searched with the acronym written out (`ACRONYM_SEARCH_METHOD`: `inline`, the default, or `max`), then get the same title and summary boosts as any other query (the query as typed). A title that spells the acronym out gets its own boost: x1.7 when it has the query with the acronym written out ("PTM Doc" → "Parent Teachers Meeting Doc"), x1.4 when it has an expansion.
+- **Acronym-aware ranking.** Acronym queries are searched with the acronym written out (`ACRONYM_SEARCH_METHOD`: `inline`, the default, or `max`), then get the same title and summary boosts as any other query (the query as typed). A title that has the query with the acronym written out ("PTM Doc" → "Parent Teacher Meeting Doc") gets an extra boost on top: x1.7 when the title equals it, x1.4 when the title contains it. The summary gets the same rule (x1.4 / x1.2).
 - **Acronym dictionary.** New Postgres table `acronym_mapping`, seeded with 486 acronyms. One acronym can have several meanings (`SSC` → "Staff Selection Commission" / "Sainik School Society"). Lookups go through a Redis cache.
 - **Bulk upload endpoint.** `POST /api/acronyms/bulk` creates, updates, enables or disables acronyms from a CSV, and reports which acronyms were created, updated and deactivated.
 - **`acronym_info` in the search response**, showing whether acronym search is enabled, the search method in use, whether an acronym was detected, and its expansions.
@@ -147,7 +147,7 @@ Response: `received`, `created`, `updated`, `deactivated`, `cache_refreshed`, `e
 | `ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST` | `1.4` | Summary multiplier when the summary equals the query with the acronym written out |
 | `ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST` | `1.2` | Summary multiplier when the summary contains the query with the acronym written out |
 | `ACRONYM_SEARCH_METHOD` | `inline` | `inline` (one text with the meanings written in) or `max` (one text per meaning, higher score per field); empty means `inline` |
-| `ACRONYM_MAX_DENSE_VARIANTS` | `3` | Dense query variants per acronym query, including the original (max and keyword OR) |
+| `ACRONYM_MAX_DENSE_VARIANTS` | `3` | Dense query variants per acronym query, including the original (max only; keyword OR searches every meaning) |
 | `ACRONYM_MAX_PHRASE_WORDS` | `4` | Longest multi-word acronym detected and accepted on upload |
 | `ACRONYM_MIN_PREFIX_MATCH_LEN` | `4` | Shortest word stem allowed to prefix-match an expansion word |
 | `ACRONYM_PREFIX_SUFFIX_CAP` | `3` | Most extra characters in such a prefix match ("tests" ~ "test") |

@@ -10,10 +10,10 @@ path only — it must never disturb an ordinary query. These tests pin:
    takes the untouched Release 2.0 floor.
 4. Title/summary multipliers unchanged.
 5. Acronym queries: the same title/summary boosts as any other query (the query
-   as typed, anywhere in the field); no acronym-only, full-name or body boost.
-   Retrieval and the relevance blend cover expansions. Expansion phrase matching
-   (_phrase_in_text, on content words) is still used to decide whether the query
-   already spells out an expansion.
+   as typed, anywhere in the field), plus the expansion title/summary boosts on
+   the query written out, stacked on top. No acronym-only or body boost.
+   Expansion phrase matching (_phrase_in_text, on content words) is still used
+   to decide whether the query already spells out an expansion.
 6. The prefix-length floor (_words_match / ACRONYM_MIN_PREFIX_MATCH_LEN): content-word
    matching tolerates inflections via a prefix relationship, which unbounded
    let a single document letter satisfy a whole expansion word ("S M C
@@ -50,6 +50,37 @@ def _weighted_dense(field_scores):
         for field, score in field_scores.items()
         if field in WEIGHTS and score is not None
     )
+
+
+PTM = {"PTM": ["Parent Teacher Meeting"]}
+
+# The expansion boost defaults, set by the tests themselves so a local .env does not
+# change the results.
+EXPANSION_BOOSTS = {
+    "ACRONYM_EXPANSION_EXACT_TITLE_BOOST": 1.7,
+    "ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST": 1.4,
+    "ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST": 1.4,
+    "ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST": 1.2,
+}
+
+
+def _set_expansion_boosts(monkeypatch, **overrides):
+    for name, value in {**EXPANSION_BOOSTS, **overrides}.items():
+        monkeypatch.setattr(settings, name, value)
+
+
+def _fake_scroll(monkeypatch, points, calls=None):
+    """Stub qdrant_client.scroll to return `points` whatever the filter.
+
+    The title/summary match scroll then classifies them itself, as it does the real
+    MatchText hits, and the add-back fetch keeps only the source_ids it asked for.
+    """
+    def scroll(**kwargs):
+        if calls is not None:
+            calls.append(kwargs)
+        return list(points), None
+
+    monkeypatch.setattr("app.services.prioritized_search_service.qdrant_client.scroll", scroll)
 
 
 # ── 1. Expansion phrase matching (used to build the expansion query) ──────
@@ -176,13 +207,14 @@ class TestWordsMatch:
 
 class TestAcronymFieldMatch:
     """Acronym queries use the title/summary match of any other query: the query as
-    typed, anywhere in the field, any case. The acronym alone and the full name are
-    not matched separately."""
+    typed, anywhere in the field, any case. The query written out gets its own
+    expansion match (TestExpansionTitleBoost); the acronym alone and the full name
+    alone are not matched."""
 
     @pytest.mark.parametrize("title, expected", [
         ("DIET Stakeholder Identity Map", "partial"),
         ("DIET", "exact"),
-        # The full name is not matched in titles.
+        # The full name does not match the query as typed.
         ("Strengthening of District Institutes of Education and Training", None),
         ("Establishing Discipline Through Clear School Rules", None),
         # A plain substring, as for any query.
@@ -192,79 +224,137 @@ class TestAcronymFieldMatch:
     def test_title_match(self, service, title, expected):
         assert service._classify_text_match("diet", title.lower()) == expected
 
-    def test_only_the_expansion_title_boost_differs_from_acronym_search_off(
+    def test_only_the_expansion_boost_differs_from_acronym_search_off(
             self, service, monkeypatch):
+        _set_expansion_boosts(monkeypatch)
         titles = {"A": "DIET Handbook", "B": "District Institute of Education and Training"}
         run = TestAcronymRankingFollowsLexicalRanking()._run
 
         def multipliers(response):
-            return {r.source_id: (r.title_multiplier, r.summary_multiplier)
+            return {r.source_id: (r.title_multiplier, r.title_expansion_multiplier,
+                                  r.summary_multiplier, r.summary_expansion_multiplier)
                     for r in response.results}
 
-        on = run(service, monkeypatch, "hybrid", titles=titles, include_scoring_debug=True)
-        off = run(service, monkeypatch, "hybrid", titles=titles, include_scoring_debug=True,
-                  acronym_search_enabled=False)
-        # "DIET" written out is the expansion itself, so B's title is the expanded query.
+        on = run(service, monkeypatch, "hybrid", titles=titles, scroll=True,
+                 include_scoring_debug=True)
+        off = run(service, monkeypatch, "hybrid", titles=titles, scroll=True,
+                  include_scoring_debug=True, acronym_search_enabled=False)
+        # "DIET" written out is the full name itself, so B's title equals the written-out query.
         assert multipliers(on) == {
-            "A": (settings.PARTIAL_TITLE_BOOST, 1.0),
-            "B": (settings.ACRONYM_EXPANDED_QUERY_TITLE_BOOST, 1.0)}
-        assert multipliers(off) == {"A": (settings.PARTIAL_TITLE_BOOST, 1.0), "B": (1.0, 1.0)}
+            "A": (settings.PARTIAL_TITLE_BOOST, 1.0, 1.0, 1.0),
+            "B": (1.0, settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST, 1.0, 1.0)}
+        assert multipliers(off) == {
+            "A": (settings.PARTIAL_TITLE_BOOST, 1.0, 1.0, 1.0),
+            "B": (1.0, 1.0, 1.0, 1.0)}
 
 
 class TestExpansionTitleBoost:
-    """Acronym queries: the ordinary title rule on the query written out ("PTM Doc" ->
-    "Parent Teacher Meeting Doc"): ACRONYM_EXPANDED_QUERY_TITLE_BOOST when the title
-    equals it, ACRONYM_EXPANSION_TITLE_BOOST when it contains it; the higher of that
-    and the ordinary title boost applies, never both."""
-
-    PTM = {"PTM": ["Parent Teacher Meeting"]}
+    """Acronym queries: the ordinary title/summary rule on the query written out ("PTM Doc"
+    -> "Parent Teacher Meeting Doc"): "exact" when the field equals it, "partial" when it
+    contains it, any case. ACRONYM_EXPANSION_{EXACT,PARTIAL}_TITLE_BOOST (and the _SUMMARY_
+    pair) apply on top of the ordinary boost, so a document matching both gets both. They
+    are recorded as title/summary_expansion_match and _multiplier, next to the ordinary
+    title/summary_match and _multiplier."""
 
     @staticmethod
-    def _rows(*titles):
-        return [{"payload": {"source_id": str(i), "title": t}} for i, t in enumerate(titles)]
+    def _points(field, *texts):
+        return [_point(f"pt-{i}", str(i), **{field: t}) for i, t in enumerate(texts)]
 
-    def test_match_levels(self, service):
-        matches = service._expansion_field_matches(
-            self._rows("Parent Teacher Meeting Doc",            # equals, any case
-                       "parent teacher meeting doc in school",  # contains
-                       "Parent teachers meeting Doc",           # plural: no match
-                       "Doc on the Parent Teacher Meeting",     # other order: no match
-                       "Parent Teacher Meeting Guidelines",     # expansion only: no match
-                       "PTM Doc"),                              # the acronym: ordinary boost
-            ["Parent Teacher Meeting Doc"])
-        assert matches == {"0": "exact", "1": "partial"}
+    def test_match_levels(self, service, monkeypatch):
+        _fake_scroll(monkeypatch, self._points(
+            "title",
+            "Parent Teacher Meeting Doc",            # equals, any case
+            "parent teacher meeting doc in school",  # contains
+            "Parent teachers meeting Doc",           # plural: no match
+            "Doc on the Parent Teacher Meeting",     # other order: no match
+            "Parent Teacher Meeting Guidelines",     # full name only: no match
+            "PTM Doc"))                              # the query as typed: ordinary match
+        expansion_matches = {}
+        matches = service._get_field_match_sources(
+            "PTM Doc", None, "title", expansions=["Parent Teacher Meeting Doc"],
+            expansion_matches_out=expansion_matches)
+        assert expansion_matches == {"0": "exact", "1": "partial"}
+        assert matches == {"5": "exact"}
 
-    def test_best_match_over_meanings(self, service):
-        matches = service._expansion_field_matches(
-            self._rows("Micro Improvement Plan", "Micro Improvement Project for schools"),
-            ["Micro Improvement Project", "Micro Improvement Plan"])
-        assert matches == {"0": "exact", "1": "partial"}
+    def test_best_match_over_meanings(self, service, monkeypatch):
+        _fake_scroll(monkeypatch, self._points(
+            "title", "Micro Improvement Plan", "Micro Improvement Project for schools"))
+        expansion_matches = {}
+        service._get_field_match_sources(
+            "MIP", None, "title",
+            expansions=["Micro Improvement Project", "Micro Improvement Plan"],
+            expansion_matches_out=expansion_matches)
+        assert expansion_matches == {"0": "exact", "1": "partial"}
 
-    def _search(self, service, monkeypatch, titles, query, field="title"):
+    def test_one_scroll_matches_the_query_and_every_written_out_query(
+            self, service, monkeypatch):
+        """No extra Qdrant call: the written-out queries are OR'ed into the same filter."""
+        calls = []
+        _fake_scroll(monkeypatch, [], calls)
+        service._get_field_match_sources(
+            "MIP Doc", None, "summary",
+            expansions=["Micro Improvement Project Doc", "Micro Improvement Plan Doc"],
+            expansion_matches_out={})
+        assert len(calls) == 1
+        (any_of,) = calls[0]["scroll_filter"].must
+        assert {(c.key, c.match.text) for c in any_of.should} == {
+            ("summary", "mip doc"),
+            ("summary", "micro improvement project doc"),
+            ("summary", "micro improvement plan doc")}
+
+    def test_hard_filters_still_apply(self, service, monkeypatch):
+        """The written-out queries must not re-admit documents the filters exclude."""
+        from qdrant_client import models
+
+        calls = []
+        _fake_scroll(monkeypatch, [], calls)
+        org = models.FieldCondition(key="organization", match=models.MatchValue(value="X"))
+        hidden = models.FieldCondition(key="file_type", match=models.MatchValue(value="zip"))
+        service._get_field_match_sources(
+            "PTM", models.Filter(must=[org], must_not=[hidden]), "title",
+            expansions=["Parent Teacher Meeting"], expansion_matches_out={})
+        scroll_filter = calls[0]["scroll_filter"]
+        assert scroll_filter.must[0] == org
+        assert scroll_filter.must_not == [hidden]
+
+    def _search(self, service, monkeypatch, docs, query="PTM Doc", field="title",
+                acronyms=None, scroll_only=None, search_mode="hybrid"):
+        """docs: {source_id: text}, the candidates; the text goes in `field`, the other of
+        title/summary matches nothing. scroll_only: {source_id: (title, summary)} found
+        only by the title/summary scroll, not among the candidates."""
         from app.models.api_models import PrioritizedSearchRequest
 
         monkeypatch.setattr("app.services.prioritized_search_service.detect_acronyms",
-                            lambda q: dict(self.PTM))
+                            lambda q: dict(PTM if acronyms is None else acronyms))
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", True)
+        monkeypatch.setattr(settings, "ACRONYM_SEARCH_METHOD", "inline")
+        monkeypatch.setattr(settings, "ACRONYM_KEYWORD_OR", False)
         monkeypatch.setattr(settings, "HYBRID_SEARCH_ENABLED", True)
         monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", False)
         monkeypatch.setattr("app.services.prioritized_search_service.embedding.embed_query",
                             lambda texts: [[0.0] * 8 for _ in texts])
-        # The texts go in `field`; the other of title/summary matches nothing.
         neutral = {"title": "Annual report", "summary": ""}
         all_results = {f"pt-{s}": _point(f"pt-{s}", s, text="x", **{**neutral, field: t})
-                       for s, t in titles.items()}
-        field_scores = {f"pt-{s}": {"title": 0.5} for s in titles}
+                       for s, t in docs.items()}
+        field_scores = {pid: {"title": 0.5} for pid in all_results}
         monkeypatch.setattr(PrioritizedSearchService, "_parallel_batch_search",
                             lambda self, **kw: (all_results, field_scores))
-        monkeypatch.setattr(PrioritizedSearchService, "_get_field_match_sources",
-                            lambda self, *a, **kw: {})
-        response = service.search(PrioritizedSearchRequest(
-            query=query, top_k=10, search_mode="hybrid", include_scoring_debug=True))
-        return {r.source_id: getattr(r, f"{field}_multiplier") for r in response.results}
+        scroll_only_points = [_point(f"pt-{s}", s, text="x", title=title, summary=summary)
+                              for s, (title, summary) in (scroll_only or {}).items()]
+        _fake_scroll(monkeypatch, list(all_results.values()) + scroll_only_points)
+        return service.search(PrioritizedSearchRequest(
+            query=query, top_k=10, search_mode=search_mode, include_scoring_debug=True))
 
-    def test_search_applies_the_higher_boost_once(self, service, monkeypatch):
-        multipliers = self._search(service, monkeypatch, {
+    @staticmethod
+    def _multipliers(response, field="title"):
+        """{source_id: (ordinary multiplier, expansion multiplier)} for `field`."""
+        return {r.source_id: (getattr(r, f"{field}_multiplier"),
+                              getattr(r, f"{field}_expansion_multiplier"))
+                for r in response.results}
+
+    def test_search_stacks_the_two_boosts(self, service, monkeypatch):
+        _set_expansion_boosts(monkeypatch)
+        response = self._search(service, monkeypatch, {
             "written_out": "Parent Teacher Meeting Doc",
             "contains_written_out": "Parent Teacher Meeting Doc in school",
             "plural": "Parent teachers meeting Doc",
@@ -273,194 +363,118 @@ class TestExpansionTitleBoost:
             "contains_query": "PTM Doc in school",
             "both": "PTM Doc - Parent Teacher Meeting Doc",
             "none": "Annual report",
-        }, "PTM Doc")
-        assert multipliers == {
-            "written_out": settings.ACRONYM_EXPANDED_QUERY_TITLE_BOOST,
-            "contains_written_out": settings.ACRONYM_EXPANSION_TITLE_BOOST,
-            "plural": 1.0,
-            "expansion_only": 1.0,
-            "acronym": settings.EXACT_TITLE_BOOST,          # the whole title is the query
-            "contains_query": settings.PARTIAL_TITLE_BOOST,
-            # Contains the query (x1.5) and the written-out query (x1.4): the higher only.
-            "both": settings.PARTIAL_TITLE_BOOST,
-            "none": 1.0,
+        })
+        assert self._multipliers(response) == {
+            "written_out": (1.0, settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST),
+            "contains_written_out": (1.0, settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST),
+            "plural": (1.0, 1.0),
+            "expansion_only": (1.0, 1.0),
+            "acronym": (settings.EXACT_TITLE_BOOST, 1.0),   # the whole title is the query
+            "contains_query": (settings.PARTIAL_TITLE_BOOST, 1.0),
+            # Contains the query and the written-out query: both boosts.
+            "both": (settings.PARTIAL_TITLE_BOOST, settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST),
+            "none": (1.0, 1.0),
         }
+        both = next(r for r in response.results if r.source_id == "both")
+        assert (both.title_match, both.title_expansion_match) == ("partial", "partial")
+        assert both.score == pytest.approx(min(
+            0.5 * WEIGHTS["title"] * settings.PARTIAL_TITLE_BOOST
+            * settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST, 1.0))
 
     def test_boost_values_come_from_settings(self, service, monkeypatch):
-        monkeypatch.setattr(settings, "ACRONYM_EXPANDED_QUERY_TITLE_BOOST", 1.9)
-        monkeypatch.setattr(settings, "ACRONYM_EXPANSION_TITLE_BOOST", 1.0)
-        multipliers = self._search(service, monkeypatch, {
+        _set_expansion_boosts(monkeypatch, ACRONYM_EXPANSION_EXACT_TITLE_BOOST=1.9,
+                              ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST=1.0)
+        response = self._search(service, monkeypatch, {
             "written_out": "Parent Teacher Meeting Doc",
             "contains_written_out": "Parent Teacher Meeting Doc in school",
-        }, "PTM Doc")
-        assert multipliers == {"written_out": 1.9, "contains_written_out": 1.0}
+        })
+        assert self._multipliers(response) == {
+            "written_out": (1.0, 1.9), "contains_written_out": (1.0, 1.0)}
 
     def test_summary_gets_the_same_rule_with_summary_boosts(self, service, monkeypatch):
-        monkeypatch.setattr(settings, "ACRONYM_EXPANDED_QUERY_SUMMARY_BOOST", 1.3)
-        monkeypatch.setattr(settings, "ACRONYM_EXPANSION_SUMMARY_BOOST", 1.25)
-        multipliers = self._search(service, monkeypatch, {
+        _set_expansion_boosts(monkeypatch, ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST=1.3,
+                              ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST=1.25)
+        response = self._search(service, monkeypatch, {
             "written_out": "parent teacher meeting doc",
             "contains_written_out": "Notes on the Parent Teacher Meeting Doc",
             "expansion_only": "Parent Teacher Meeting Guidelines",
             "acronym": "About the PTM Doc",
             "both": "PTM Doc - Parent Teacher Meeting Doc",
             "none": "Annual report",
-        }, "PTM Doc", field="summary")
-        assert multipliers == {
-            "written_out": 1.3,
-            "contains_written_out": 1.25,
-            "expansion_only": 1.0,
-            "acronym": settings.PARTIAL_SUMMARY_BOOST,
-            # Contains the query (x1.2) and the written-out query (x1.25): the higher only.
-            "both": 1.25,
-            "none": 1.0,
+        }, field="summary")
+        assert self._multipliers(response, "summary") == {
+            "written_out": (1.0, 1.3),
+            "contains_written_out": (1.0, 1.25),
+            "expansion_only": (1.0, 1.0),
+            "acronym": (settings.PARTIAL_SUMMARY_BOOST, 1.0),
+            "both": (settings.PARTIAL_SUMMARY_BOOST, 1.25),
+            "none": (1.0, 1.0),
         }
+        # Summary matches leave the title multipliers alone.
+        assert set(self._multipliers(response, "title").values()) == {(1.0, 1.0)}
 
-    @pytest.mark.parametrize("name", ["ACRONYM_EXPANDED_QUERY_TITLE_BOOST",
-                                      "ACRONYM_EXPANSION_TITLE_BOOST",
-                                      "ACRONYM_EXPANDED_QUERY_SUMMARY_BOOST",
-                                      "ACRONYM_EXPANSION_SUMMARY_BOOST",
-                                      "ACRONYM_TEXT_BOOST",
-                                      "ACRONYM_EXPANSION_TEXT_BOOST"])
+    def test_ordinary_queries_get_no_expansion_boost(self, service, monkeypatch):
+        _set_expansion_boosts(monkeypatch)
+        response = self._search(service, monkeypatch, {
+            "written_out": "Parent Teacher Meeting Doc", "acronym": "PTM Doc"}, acronyms={})
+        assert self._multipliers(response) == {
+            "written_out": (1.0, 1.0), "acronym": (settings.EXACT_TITLE_BOOST, 1.0)}
+        assert all(r.title_expansion_match is None for r in response.results)
+
+    def test_semantic_mode_gets_no_expansion_boost(self, service, monkeypatch):
+        _set_expansion_boosts(monkeypatch)
+        response = self._search(service, monkeypatch, {
+            "written_out": "Parent Teacher Meeting Doc", "acronym": "PTM Doc"},
+            search_mode="semantic")
+        assert set(self._multipliers(response).values()) == {(1.0, 1.0)}
+
+    def test_missing_written_out_matches_are_added_back(self, service, monkeypatch):
+        """A document only the title/summary scroll finds is added back like an ordinary
+        match: 0.15 x its boost, raised to the threshold. One that matches the query too
+        gets both boosts. Title wins when both fields match."""
+        _set_expansion_boosts(monkeypatch)
+        response = self._search(service, monkeypatch, {"candidate": "Annual report"}, scroll_only={
+            "title_written_out": ("Parent Teacher Meeting Doc", ""),
+            "title_both": ("PTM Doc - Parent Teacher Meeting Doc", ""),
+            "summary_written_out": ("Annual report", "Parent Teacher Meeting Doc"),
+            "title_and_summary": ("Parent Teacher Meeting Doc", "Parent Teacher Meeting Doc"),
+        })
+        floor = TestFieldMatchInjection.FLOOR
+        ids = [r.source_id for r in response.results]
+        assert len(ids) == len(set(ids))
+        by_source = {r.source_id: r for r in response.results}
+        assert set(by_source) == {"candidate", "title_written_out", "title_both",
+                                  "summary_written_out", "title_and_summary"}
+        assert response.total_results == 5
+
+        added = by_source["title_written_out"]
+        assert added.match_source == "title_keyword_match"
+        assert (added.title_match, added.title_expansion_match) == (None, "exact")
+        assert (added.title_multiplier, added.title_expansion_multiplier) == (
+            1.0, settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST)
+        assert added.score == pytest.approx(floor * settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST)
+
+        both = by_source["title_both"]
+        assert (both.title_match, both.title_expansion_match) == ("partial", "partial")
+        assert both.score == pytest.approx(
+            floor * settings.PARTIAL_TITLE_BOOST * settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST)
+
+        summary = by_source["summary_written_out"]
+        assert summary.match_source == "summary_keyword_match"
+        assert (summary.summary_match, summary.summary_expansion_match) == (None, "exact")
+        assert summary.summary_expansion_multiplier == settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST
+        assert summary.score == pytest.approx(
+            floor * settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST)
+
+        assert by_source["title_and_summary"].match_source == "title_keyword_match"
+
+    @pytest.mark.parametrize("name", list(EXPANSION_BOOSTS))
     def test_values_below_one_fail_at_startup(self, monkeypatch, name):
         from app.config import Settings
 
         monkeypatch.setenv(name, "0.9")
         with pytest.raises(ValueError, match=name):
             Settings()
-
-
-class TestAcronymTextBoost:
-    """Acronym queries: ACRONYM_TEXT_BOOST when the body contains the query as typed
-    ("PTM Doc"), ACRONYM_EXPANSION_TEXT_BOOST when it contains the query written out
-    ("Parent Teacher Meeting Doc"), any case; the higher of the two, never both. Only
-    top_k documents without a title boost are checked."""
-
-    PTM = {"PTM": ["Parent Teacher Meeting"]}
-
-    def test_case_variants(self, service):
-        assert service._case_variants(" PTM Doc ") == [
-            "PTM DOC", "PTM Doc", "Ptm Doc", "Ptm doc", "ptm doc"]
-        assert service._case_variants("  ") == []
-
-    def test_one_qdrant_call_returns_the_sources_per_phrase_set(self, service, monkeypatch):
-        calls = []
-
-        def fake_batch(collection_name, requests):
-            calls.append(requests)
-            return [types.SimpleNamespace(points=[
-                types.SimpleNamespace(payload={"source_id": "1"}),
-                types.SimpleNamespace(payload={"source_id": "1"}),   # second chunk, same doc
-            ]), types.SimpleNamespace(points=[])]
-
-        monkeypatch.setattr("app.services.acronym_ranking.qdrant_client.query_batch_points",
-                            fake_batch)
-        found = service._sources_with_text_containing(
-            ["1", "2"], [["PTM Doc"], ["Parent Teacher Meeting Doc"]])
-        assert found == [{"1"}, set()]
-        assert len(calls) == 1 and len(calls[0]) == 2
-        request = calls[0][0]
-        assert request.filter.must[0].key == "source_id"
-        assert request.filter.must[0].match.any == ["1", "2"]
-        # Any case: every spelling goes in as a "should" substring match on the body.
-        assert {c.key for c in request.filter.should} == {"text"}
-        assert {c.match.text for c in request.filter.should} == set(
-            service._case_variants("PTM Doc"))
-
-    def test_failed_check_returns_none(self, service, monkeypatch):
-        def broken(**kwargs):
-            raise RuntimeError("qdrant down")
-
-        monkeypatch.setattr("app.services.acronym_ranking.qdrant_client.query_batch_points",
-                            broken)
-        assert service._sources_with_text_containing(["1"], [["PTM Doc"]]) is None
-
-    def _search(self, service, monkeypatch, docs, query="PTM Doc", acronyms=None):
-        """docs: {source_id: (title, body)}. Returns ({source_id: (match, multiplier)},
-        the source_ids the text check was asked about)."""
-        from app.models.api_models import PrioritizedSearchRequest
-
-        monkeypatch.setattr("app.services.prioritized_search_service.detect_acronyms",
-                            lambda q: dict(self.PTM if acronyms is None else acronyms))
-        monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", True)
-        monkeypatch.setattr(settings, "HYBRID_SEARCH_ENABLED", True)
-        monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", False)
-        monkeypatch.setattr("app.services.prioritized_search_service.embedding.embed_query",
-                            lambda texts: [[0.0] * 8 for _ in texts])
-        all_results = {f"pt-{s}": _point(f"pt-{s}", s, text=body, title=title, summary="")
-                       for s, (title, body) in docs.items()}
-        field_scores = {f"pt-{s}": {"title": 0.5} for s in docs}
-        monkeypatch.setattr(PrioritizedSearchService, "_parallel_batch_search",
-                            lambda self, **kw: (all_results, field_scores))
-        monkeypatch.setattr(PrioritizedSearchService, "_get_field_match_sources",
-                            lambda self, *a, **kw: {})
-        asked = []
-
-        def fake_text_check(self, source_ids, phrase_sets):
-            asked.extend(source_ids)
-            return [{s for s in source_ids
-                     if any(p.lower() in docs[s][1].lower() for p in phrases)}
-                    for phrases in phrase_sets]
-
-        monkeypatch.setattr(PrioritizedSearchService, "_sources_with_text_containing",
-                            fake_text_check)
-        response = service.search(PrioritizedSearchRequest(
-            query=query, top_k=10, search_mode="hybrid", include_scoring_debug=True))
-        return ({r.source_id: (r.acronym_in_body_match, r.acronym_in_body_multiplier)
-                 for r in response.results}, asked)
-
-    DOCS = {
-        "query": ("Annual report", "Notes from the ptm doc review."),
-        "written_out": ("Annual report", "The PARENT TEACHER MEETING DOC is attached."),
-        "both": ("Annual report", "PTM Doc - Parent Teacher Meeting Doc"),
-        "acronym_only": ("Annual report", "The PTM was held in July."),
-        "expansion_only": ("Annual report", "Parent Teacher Meeting guidelines."),
-        "titled": ("PTM Doc for schools", "Notes from the PTM Doc review."),
-        "none": ("Annual report", "Water and roads."),
-    }
-
-    def test_body_contains_the_query_or_the_query_written_out(self, service, monkeypatch):
-        monkeypatch.setattr(settings, "ACRONYM_TEXT_BOOST", 1.2)
-        monkeypatch.setattr(settings, "ACRONYM_EXPANSION_TEXT_BOOST", 1.2)
-        boosts, asked = self._search(service, monkeypatch, self.DOCS)
-        assert boosts == {
-            "query": ("query", 1.2),
-            "written_out": ("expansion", 1.2),
-            "both": ("query", 1.2),                # equal boosts: applied once
-            "acronym_only": (None, 1.0),           # the bare acronym is not the query
-            "expansion_only": (None, 1.0),         # the full name alone is not the query
-            "titled": (None, 1.0),                 # has a title boost: not checked
-            "none": (None, 1.0),
-        }
-        assert "titled" not in asked
-
-    def test_higher_boost_applies_never_both(self, service, monkeypatch):
-        monkeypatch.setattr(settings, "ACRONYM_TEXT_BOOST", 1.2)
-        monkeypatch.setattr(settings, "ACRONYM_EXPANSION_TEXT_BOOST", 1.5)
-        boosts, _ = self._search(service, monkeypatch, self.DOCS)
-        assert boosts["both"] == ("expansion", 1.5)
-        assert boosts["query"] == ("query", 1.2)
-
-    def test_one_side_off(self, service, monkeypatch):
-        monkeypatch.setattr(settings, "ACRONYM_TEXT_BOOST", 1.0)
-        monkeypatch.setattr(settings, "ACRONYM_EXPANSION_TEXT_BOOST", 1.3)
-        boosts, _ = self._search(service, monkeypatch, self.DOCS)
-        assert boosts["query"] == (None, 1.0)
-        assert boosts["both"] == ("expansion", 1.3)
-
-    def test_off_by_default_makes_no_check(self, service, monkeypatch):
-        monkeypatch.setattr(settings, "ACRONYM_TEXT_BOOST", 1.0)
-        monkeypatch.setattr(settings, "ACRONYM_EXPANSION_TEXT_BOOST", 1.0)
-        boosts, asked = self._search(service, monkeypatch, self.DOCS)
-        assert asked == []
-        assert set(boosts.values()) == {(None, None)}
-
-    def test_ordinary_queries_get_no_text_boost(self, service, monkeypatch):
-        monkeypatch.setattr(settings, "ACRONYM_TEXT_BOOST", 1.2)
-        monkeypatch.setattr(settings, "ACRONYM_EXPANSION_TEXT_BOOST", 1.2)
-        boosts, asked = self._search(service, monkeypatch, self.DOCS, acronyms={})
-        assert asked == []
-        assert set(boosts.values()) == {(None, None)}
 
 
 class TestFusionFormulaHasNoAcronymBranch:
@@ -600,8 +614,6 @@ class TestFieldMatchInjection:
         assert entry["field_scores"]["title_match"] == "partial"
         assert entry["raw_dense"] == 0.2228
         assert entry["keyword_score"] == 0.0
-        # the real relevance the pipeline measured is kept, not just dropped
-        assert entry["pre_floor_score"] == pytest.approx(0.31)
 
     def test_reused_and_never_scored_sources_land_on_the_same_floor(self, service, monkeypatch):
         """A reused source and a never-scored source get the identical weighted_score
@@ -625,9 +637,6 @@ class TestFieldMatchInjection:
         assert with_real["weighted_score"] == pytest.approx(floor_only["weighted_score"])
         assert floor_only["field_scores"]["tags"] is None
         assert with_real["field_scores"]["tags"] == 0.61
-        # never-scored path has nothing measured to preserve; reused path does
-        assert "pre_floor_score" not in floor_only
-        assert with_real["pre_floor_score"] == pytest.approx(0.31)
 
     def test_boost_cap_still_applies(self, service, monkeypatch):
         """The floor/boost/score_floor formula never produces a score above 1.0,
@@ -704,20 +713,27 @@ class TestFieldMatchInjection:
         assert entry["weighted_score"] == pytest.approx(self.FLOOR * settings.PARTIAL_TITLE_BOOST)
         assert "acronym_bonus" not in entry
 
-    def test_reused_doc_reports_its_pre_floor_score(self, service, monkeypatch):
-        """A document scored before the threshold takes the floor, its real score is
-        kept as pre_floor_score, and it shows no pre-boost score."""
-        self._patch_scroll(monkeypatch, [])
-        real = {"id": "pt-f", "payload": {"source_id": "F"}, "weighted_score": 0.31,
-                "acronym_pre_boost_score": 0.31, "field_scores": {}}
-        entry = service._fetch_field_match_docs(
-            ["F"], {"F": "partial"}, "title",
-            settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-            prethreshold_by_source={"F": real},
-        )[0]
-        assert entry["weighted_score"] == pytest.approx(self.FLOOR * settings.PARTIAL_TITLE_BOOST)
-        assert entry["pre_floor_score"] == 0.31
-        assert "acronym_pre_boost_score" not in entry
+    def test_expansion_add_back_records_its_own_keys(self, service, monkeypatch):
+        """mult_key keeps the expansion match apart from the ordinary one, on both the
+        reused and the never-scored path."""
+        self._patch_scroll(monkeypatch, ["77"])
+        real = {"id": "pt-219", "payload": {"source_id": "219"}, "weighted_score": 0.31,
+                "field_scores": {"tags": 0.61}}
+        entries = service._fetch_field_match_docs(
+            ["77", "219"], {"77": "exact", "219": "partial"}, "title", 1.7, 1.4,
+            prethreshold_by_source={"219": real}, mult_key="title_expansion_multiplier",
+        )
+        by_source = {e["payload"]["source_id"]: e for e in entries}
+        for source_id, match_type, boost in (("77", "exact", 1.7), ("219", "partial", 1.4)):
+            entry = by_source[source_id]
+            assert entry["field_scores"]["title_expansion_match"] == match_type
+            assert entry["title_expansion_multiplier"] == boost
+            assert "title_match" not in entry["field_scores"]
+            assert "title_multiplier" not in entry
+            assert entry["weighted_score"] == pytest.approx(self.FLOOR * boost)
+            assert entry["match_source"] == "title_keyword_match"
+        # The shared pre-threshold entry is copied, not changed.
+        assert real["field_scores"] == {"tags": 0.61}
 
 
 # ── 5. Multipliers themselves are untouched ───────────────────────────────────
@@ -821,8 +837,8 @@ class TestAcronymExpansionStillDrivesRetrieval:
 # ── 7. Acronym ranking is lexical and rides the lexical switch ────────────
 
 class TestAcronymRankingFollowsLexicalRanking:
-    """Acronym ranking (relevance blend, title/summary boosts) rides the same
-    switch as the title/summary boost: on in hybrid mode, off in semantic mode and
+    """Acronym ranking (the title/summary boosts, expansion boosts included) rides the
+    same switch as the title/summary boost: on in hybrid mode, off in semantic mode and
     when HYBRID_SEARCH_ENABLED is false.
 
     Doc A carries the acronym in its title; doc B carries none. In hybrid mode A's
@@ -833,7 +849,8 @@ class TestAcronymRankingFollowsLexicalRanking:
 
     def _run(self, service, monkeypatch, search_mode, hybrid_enabled=True,
              field_scores=None, acronyms=None, top_k=10, titles=None,
-             acronym_search_enabled=True, **request_fields):
+             acronym_search_enabled=True, method="inline", keyword_or=False,
+             scroll=False, **request_fields):
         from app.models.api_models import PrioritizedSearchRequest
 
         detected = dict(ACR) if acronyms is None else acronyms
@@ -841,6 +858,9 @@ class TestAcronymRankingFollowsLexicalRanking:
             "app.services.prioritized_search_service.detect_acronyms",
             lambda q: dict(detected))
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", acronym_search_enabled)
+        # Pinned, so the result does not depend on the local .env.
+        monkeypatch.setattr(settings, "ACRONYM_SEARCH_METHOD", method)
+        monkeypatch.setattr(settings, "ACRONYM_KEYWORD_OR", keyword_or)
         monkeypatch.setattr(settings, "HYBRID_SEARCH_ENABLED", hybrid_enabled)
         monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", False)
         monkeypatch.setattr(
@@ -859,14 +879,25 @@ class TestAcronymRankingFollowsLexicalRanking:
         monkeypatch.setattr(
             PrioritizedSearchService, "_parallel_batch_search",
             lambda self, **kw: (all_results, field_scores))
-        # No scroll: title matches come only from the candidate pool (the supplement).
-        monkeypatch.setattr(
-            PrioritizedSearchService, "_get_field_match_sources",
-            lambda self, *a, **kw: {})
+        if scroll:
+            # The title/summary scroll sees both documents and classifies them itself,
+            # for the query as typed and the written-out query.
+            _fake_scroll(monkeypatch, list(all_results.values()))
+        else:
+            # No scroll: title matches come only from the candidate pool (the supplement).
+            monkeypatch.setattr(
+                PrioritizedSearchService, "_get_field_match_sources",
+                lambda self, *a, **kw: {})
 
         return service.search(
             PrioritizedSearchRequest(query="DIET", top_k=top_k, search_mode=search_mode,
                                      **request_fields))
+
+    @staticmethod
+    def _method_info(method):
+        """The acronym_info keys reported whenever acronym search is on."""
+        return {"method": method,
+                "method_description": PrioritizedSearchService._acronym_method_description()}
 
     def test_semantic_mode_ranks_by_similarity_alone(self, service, monkeypatch):
         response = self._run(service, monkeypatch, "semantic")
@@ -923,7 +954,9 @@ class TestAcronymRankingFollowsLexicalRanking:
             self, service, monkeypatch):
         """Retrieval widening is NOT gated — only ranking is."""
         response = self._run(service, monkeypatch, "semantic")
-        assert response.acronym_info == {"enabled": True, "detected": True, "mapping": dict(ACR)}
+        assert response.acronym_info == {
+            "enabled": True, "detected": True, "mapping": dict(ACR),
+            **self._method_info("inline")}
 
     @pytest.mark.parametrize("enabled, acronyms, expected", [
         (False, None, {"enabled": False, "detected": False}),
@@ -937,7 +970,23 @@ class TestAcronymRankingFollowsLexicalRanking:
             self, service, monkeypatch, enabled, acronyms, expected):
         response = self._run(service, monkeypatch, "hybrid", acronyms=acronyms,
                              acronym_search_enabled=enabled)
+        if enabled:
+            # The method is reported whenever acronym search is on, acronym or not.
+            expected = {**expected, **self._method_info("inline")}
         assert response.acronym_info == expected
+
+    @pytest.mark.parametrize("method, keyword_or, phrase", [
+        ("max", False, "searched separately"),
+        ("max", True, "searched separately"),
+        ("inline", True, "once per full form"),
+        ("inline", False, "one keyword search"),
+    ])
+    def test_acronym_info_describes_the_method(
+            self, service, monkeypatch, method, keyword_or, phrase):
+        info = self._run(service, monkeypatch, "hybrid", method=method,
+                         keyword_or=keyword_or).acronym_info
+        assert info["method"] == method
+        assert phrase in info["method_description"]
 
 
 # ── scoring_context reports how an acronym query was actually scored ──────
@@ -946,51 +995,67 @@ class TestAcronymScoringContext:
     """search_config.scoring_context (debug only) must describe the scoring that
     ran: the field boosts and the acronym ranking block."""
 
-    def _context(self, service, monkeypatch, search_mode="hybrid", acronyms=None):
+    def _context(self, service, monkeypatch, search_mode="hybrid", acronyms=None, **run):
         response = TestAcronymRankingFollowsLexicalRanking()._run(
-            service, monkeypatch, search_mode, acronyms=acronyms, include_scoring_debug=True)
+            service, monkeypatch, search_mode, acronyms=acronyms, include_scoring_debug=True,
+            **run)
         return response.search_config["scoring_context"]
 
-    def test_acronym_query_reports_field_boosts_and_ranking(self, service, monkeypatch):
-        ctx = self._context(service, monkeypatch)
-        # The same boosts as any other query, plus the expansion and text boosts.
+    @pytest.mark.parametrize("method, dense_variants", [("inline", 1), ("max", 2)])
+    def test_acronym_query_reports_field_boosts_and_ranking(
+            self, service, monkeypatch, method, dense_variants):
+        ctx = self._context(service, monkeypatch, method=method)
+        # The same boosts as any other query, plus the expansion boosts.
         assert ctx["boost_config"] == {
             "mode": "title_summary_boost",
             "exact_title_boost": settings.EXACT_TITLE_BOOST,
             "partial_title_boost": settings.PARTIAL_TITLE_BOOST,
             "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,
             "partial_summary_boost": settings.PARTIAL_SUMMARY_BOOST,
-            "expanded_query_title_boost": settings.ACRONYM_EXPANDED_QUERY_TITLE_BOOST,
-            "expansion_title_boost": settings.ACRONYM_EXPANSION_TITLE_BOOST,
-            "expanded_query_summary_boost": settings.ACRONYM_EXPANDED_QUERY_SUMMARY_BOOST,
-            "expansion_summary_boost": settings.ACRONYM_EXPANSION_SUMMARY_BOOST,
-            "text_boost": settings.ACRONYM_TEXT_BOOST,
-            "expansion_text_boost": settings.ACRONYM_EXPANSION_TEXT_BOOST,
+            "expansion_exact_title_boost": settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST,
+            "expansion_partial_title_boost": settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST,
+            "expansion_exact_summary_boost": settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST,
+            "expansion_partial_summary_boost": settings.ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST,
         }
-        ranking = ctx["acronym_ranking"]
-        assert ranking["applied"] is True
-        assert ranking["expansion_score_weight"] == settings.ACRONYM_EXPANSION_SCORE_WEIGHT
-        assert ranking["dense_variants"] == 2
-        assert ranking["rescore"] == {
-            "applied": True, "candidate_pool": 2, "rescored": 2,
-            "limit": settings.ACRONYM_RESCORE_POOL_LIMIT, "capped": False,
-            "normalization": "self",
-        }
-        assert "body_check" not in ranking
-
-    def test_capped_rescore_is_reported(self, service, monkeypatch):
-        monkeypatch.setattr(settings, "ACRONYM_RESCORE_POOL_LIMIT", 1)
-        monkeypatch.setattr(settings, "HYBRID_FUSION_METHOD", "weighted")
-        rescore = self._context(service, monkeypatch)["acronym_ranking"]["rescore"]
-        assert rescore["capped"] is True
-        assert rescore["rescored"] == 1
-        assert rescore["normalization"] == "full_pool"
-
-    def test_semantic_mode_reports_ranking_off(self, service, monkeypatch):
-        ctx = self._context(service, monkeypatch, search_mode="semantic")
-        assert ctx["boost_config"]["mode"] == "off"
         assert ctx["acronym_ranking"] == {
-            "applied": False, "reason": "search_mode is semantic", "dense_variants": 2,
+            "applied": True,
+            "method": method,
+            "final_score": "score before boosts x title and summary multipliers "
+                           "(see boost_config), capped at 1.0",
+            "dense_variants": dense_variants,
+        }
+
+    def test_keyword_or_texts_are_reported(self, service, monkeypatch):
+        """One keyword search per text: the query as typed, then the full name."""
+        texts = self._context(service, monkeypatch, keyword_or=True)["keyword_or_texts"]
+        assert len(texts) == 2
+        assert texts[1] == ACR["DIET"][0]
+        assert "keyword_or_texts" not in self._context(service, monkeypatch)
+
+    @pytest.mark.parametrize("method, dense_variants", [("inline", 1), ("max", 3)])
+    def test_keyword_or_searches_every_meaning(
+            self, service, monkeypatch, method, dense_variants):
+        """The dense searches stop at ACRONYM_MAX_DENSE_VARIANTS; the keyword searches do not."""
+        monkeypatch.setattr(settings, "ACRONYM_MAX_DENSE_VARIANTS", 3)
+        meanings = ["District Institute of Education and Training",
+                    "Daily Intake Energy Table", "Dietary Information Exchange Tool"]
+        ctx = self._context(service, monkeypatch, acronyms={"DIET": meanings},
+                            method=method, keyword_or=True)
+        assert ctx["keyword_or_texts"][1:] == meanings
+        assert ctx["acronym_ranking"]["dense_variants"] == dense_variants
+
+    @pytest.mark.parametrize("search_mode, hybrid_enabled, reason", [
+        ("semantic", True, "search_mode is semantic"),
+        ("hybrid", False, "HYBRID_SEARCH_ENABLED is false"),
+    ])
+    def test_ranking_off_is_reported_with_its_reason(
+            self, service, monkeypatch, search_mode, hybrid_enabled, reason):
+        ctx = self._context(service, monkeypatch, search_mode=search_mode,
+                            hybrid_enabled=hybrid_enabled)
+        assert ctx["boost_config"]["mode"] == "off"
+        assert "expansion_exact_title_boost" not in ctx["boost_config"]
+        assert ctx["acronym_ranking"] == {
+            "applied": False, "reason": reason, "dense_variants": 1,
         }
 
     def test_ordinary_query_keeps_configured_boosts(self, service, monkeypatch):
@@ -1005,184 +1070,70 @@ class TestAcronymScoringContext:
         assert "acronym_ranking" not in ctx
 
 
-# ── Acronym debug field: pre-boost score ──────────────────────────────────
+# ── Acronym debug fields: the expansion match and multiplier ──────────────
 
 class TestAcronymDebugFields:
-    """acronym_pre_boost_score is set only on rows the relevance blend rescored, and
-    is debug-only."""
+    """title/summary_expansion_match and _multiplier sit next to title/summary_match and
+    _multiplier: top-level, debug-only, and kept out of field_scores."""
 
     @staticmethod
     def _row(**extra):
         return {"id": "p1", "payload": {"source_id": "S", "title": "T", "text": "x"},
-                "field_scores": {}, "weighted_score": 0.8,
-                "match_source": "title_keyword_match", **extra}
+                "field_scores": {"title": 0.4, "title_match": "partial",
+                                 "title_expansion_match": "exact",
+                                 "summary_expansion_match": None},
+                "weighted_score": 0.8, "title_multiplier": 1.5,
+                "title_expansion_multiplier": 1.7, **extra}
 
-    def test_ordinary_injected_row_has_no_acronym_fields(self, service):
+    def test_expansion_fields_surface_with_debug(self, service):
         item = service._build_result_items([self._row()], True)[0]
-        assert item.acronym_pre_boost_score is None
-        assert item.match_source == "title_keyword_match"
-
-    def test_rescored_row_shows_its_acronym_pre_boost_score(self, service):
-        item = service._build_result_items([self._row(acronym_pre_boost_score=0.5)], True)[0]
-        assert item.acronym_pre_boost_score == 0.5
+        assert (item.title_match, item.title_expansion_match) == ("partial", "exact")
+        assert (item.title_multiplier, item.title_expansion_multiplier) == (1.5, 1.7)
+        # Not set on the row: no boost.
+        assert (item.summary_expansion_match, item.summary_expansion_multiplier) == (None, 1.0)
+        assert item.field_scores == {"title": 0.4}
 
     def test_fields_hidden_without_debug(self, service):
-        item = service._build_result_items([self._row(acronym_pre_boost_score=0.5)], False)[0]
-        assert item.acronym_pre_boost_score is None
+        item = service._build_result_items([self._row()], False)[0]
+        assert item.title_expansion_match is None
+        assert item.title_expansion_multiplier is None
+        assert item.summary_expansion_multiplier is None
+        assert item.field_scores == {"title": 0.4}
 
+    def test_injected_row_keeps_its_match_source(self, service):
+        item = service._build_result_items(
+            [self._row(match_source="title_keyword_match")], True)[0]
+        assert item.match_source == "title_keyword_match"
 
-# ── Acronym queries: the title/summary boosts of any query, no body boost ──
-
-class TestAcronymFieldBoosts:
-    """Acronym queries get only the title/summary boosts every query gets, so the
-    score rebuilds from acronym_pre_boost_score and those two multipliers."""
-
-    def _run(self, service, monkeypatch, include_scoring_debug=True):
-        response = TestAcronymRankingFollowsLexicalRanking()._run(
-            service, monkeypatch, "hybrid", include_scoring_debug=include_scoring_debug,
-            field_scores={"pt-A": {"title": 0.30, "text": 0.10, SPARSE: 5.0},
-                          "pt-B": {"title": 0.90, SPARSE: 2.0}})
-        return {r.source_id: r for r in response.results}
-
-    def test_score_rebuilds_from_the_acronym_pre_boost_score(self, service, monkeypatch):
-        by_source = self._run(service, monkeypatch)
-        # A's title "DIET Handbook" contains the query; B's does not.
-        assert by_source["A"].title_multiplier == settings.PARTIAL_TITLE_BOOST
-        assert by_source["B"].title_multiplier == 1.0
-        for r in by_source.values():
-            assert r.score == pytest.approx(min(
-                r.acronym_pre_boost_score * r.title_multiplier * r.summary_multiplier, 1.0))
-
-    def test_acronym_pre_boost_score_hidden_without_debug(self, service, monkeypatch):
-        by_source = self._run(service, monkeypatch, include_scoring_debug=False)
-        assert all(r.acronym_pre_boost_score is None for r in by_source.values())
-
-
-# ── The acronym rescore cap is skipped in RRF mode ────────────────────────
-
-class TestRescoreCapFollowsFusionMethod:
-    """RRF scores a point by its rank within the list it is given and ignores
-    normalization_reference, so a capped subset would be ranked against itself
-    while the remainder kept full-pool scores. RRF mode therefore rescores the
-    whole pool; weighted mode keeps the cap."""
-
-    def _rescored_pool(self, service, monkeypatch, fusion_method):
-        seen = {}
-
-        def spy(self, pool_ids, *args, **kwargs):
-            seen["pool_ids"] = list(pool_ids)
-            seen["normalization_reference"] = kwargs.get("normalization_reference")
-            return {}
-
-        monkeypatch.setattr(settings, "HYBRID_FUSION_METHOD", fusion_method)
-        monkeypatch.setattr(settings, "ACRONYM_RESCORE_POOL_LIMIT", 1)
-        monkeypatch.setattr(PrioritizedSearchService, "_blended_acronym_relevance", spy)
-        TestAcronymRankingFollowsLexicalRanking()._run(service, monkeypatch, "hybrid")
-        return seen
-
-    def test_weighted_mode_caps_the_pool(self, service, monkeypatch):
-        seen = self._rescored_pool(service, monkeypatch, "weighted")
-        assert len(seen["pool_ids"]) == 1
-        assert seen["normalization_reference"] is not None
-
-    def test_rrf_mode_rescores_the_full_pool(self, service, monkeypatch):
-        seen = self._rescored_pool(service, monkeypatch, "rrf")
-        assert sorted(seen["pool_ids"]) == ["pt-A", "pt-B"]
-        assert seen["normalization_reference"] is None
-
-    def test_sent_but_empty_bm25_still_records_the_full_pool_range(
-            self, service, monkeypatch):
-        """BM25 was issued but matched nothing: the preliminary ranking must
-        take the same hybrid path as the rescore, or it records no min/max and
-        the capped subset self-normalizes."""
-        from app.models.api_models import PrioritizedSearchRequest
-
-        seen = {}
-
-        def spy(self, pool_ids, *args, **kwargs):
-            seen["normalization_reference"] = kwargs.get("normalization_reference")
-            return {}
-
-        all_results = {
-            "pt-A": _point("pt-A", "A", title="DIET Handbook", summary="", text="a"),
-            "pt-B": _point("pt-B", "B", title="Nutrition guide", summary="", text="b"),
-        }
-        field_scores = {"pt-A": {"title": 0.30, "text": 0.10}, "pt-B": {"title": 0.90}}
-
-        monkeypatch.setattr(
-            "app.services.prioritized_search_service.detect_acronyms", lambda q: dict(ACR))
-        monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", True)
-        monkeypatch.setattr(settings, "HYBRID_SEARCH_ENABLED", True)
-        monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", True)
-        monkeypatch.setattr(settings, "HYBRID_FUSION_METHOD", "weighted")
-        monkeypatch.setattr(settings, "ACRONYM_RESCORE_POOL_LIMIT", 1)
-        monkeypatch.setattr(
-            "app.services.prioritized_search_service.embedding.embed_query",
-            lambda texts: [[0.0] * 8 for _ in texts])
-        monkeypatch.setattr(
-            "app.core.clients.sparse_encoder.generate_sparse_vector",
-            lambda text: ([1], [1.0]))
-        # Sent (third value True), but no field_scores entry carries a sparse score.
-        monkeypatch.setattr(
-            PrioritizedSearchService, "_hybrid_batch_search",
-            lambda self, **kw: (all_results, field_scores, True))
-        monkeypatch.setattr(
-            PrioritizedSearchService, "_get_field_match_sources", lambda self, *a, **kw: {})
-        monkeypatch.setattr(PrioritizedSearchService, "_blended_acronym_relevance", spy)
-
-        service.search(PrioritizedSearchRequest(query="DIET", top_k=10, search_mode="hybrid"))
-
-        ref = seen["normalization_reference"]
-        assert ref and "dense_min" in ref and "dense_max" in ref
-
-
-# ── keyword_score_acronym / keyword_score_expansion are report-only ───────
-
-class TestKeywordBreakdown:
-    def test_scores_exactly_the_given_points(self, service, monkeypatch):
-        import app.services.prioritized_search_service as pss
-
-        def point(pid, score):
-            return types.SimpleNamespace(id=pid, score=score)
-
-        seen = []
-
-        def batch(collection_name, requests):
-            seen.extend(requests)
-            return [types.SimpleNamespace(points=[point("a", 3.0)]),                   # acronym form
-                    types.SimpleNamespace(points=[point("a", 7.0), point("b", 2.0)]),  # meaning 1
-                    types.SimpleNamespace(points=[point("a", 8.0)])]                   # meaning 2
-
-        monkeypatch.setattr(pss.qdrant_client, "query_batch_points", batch)
-        monkeypatch.setattr("app.core.clients.sparse_encoder.generate_sparse_vector",
-                            lambda text: ([1], [1.0]))
-        scores = service._keyword_scores_for_points(
-            ["a", "b", "c"], {"acronym": ["ptm doc"],
-                              "expansion": ["meaning one doc", "meaning two doc"]})
-        # Raw scores; the higher one over several meanings; no shared word -> 0.0.
-        assert scores == {"acronym": {"a": 3.0, "b": 0.0, "c": 0.0},
-                          "expansion": {"a": 8.0, "b": 2.0, "c": 0.0}}
-        # Every request is limited to exactly these points.
-        assert all(r.filter.must[0].has_id == ["a", "b", "c"] and r.limit == 3 for r in seen)
-
-    def test_failure_leaves_the_fields_empty(self, service, monkeypatch):
-        import app.services.prioritized_search_service as pss
-
-        def boom(**kwargs):
-            raise RuntimeError("qdrant down")
-
-        monkeypatch.setattr(pss.qdrant_client, "query_batch_points", boom)
-        monkeypatch.setattr("app.core.clients.sparse_encoder.generate_sparse_vector",
-                            lambda text: ([1], [1.0]))
-        assert service._keyword_scores_for_points(["a"], {"acronym": ["ptm"]}) == {}
-
-    def test_fields_are_left_out_of_the_response_unless_set(self):
+    @pytest.mark.parametrize("name", [
+        "pre_floor_score", "acronym_pre_boost_score", "keyword_score_acronym",
+        "keyword_score_expansion", "acronym_in_body_match", "acronym_in_body_multiplier",
+    ])
+    def test_removed_fields_are_gone_from_the_response(self, name):
         from app.models.api_models import SearchResultItem
 
-        base = dict(id="1", text="t", metadata={}, source_id="S", score=0.5, field_scores={})
-        assert "keyword_score_acronym" not in SearchResultItem(**base).model_dump()
-        shown = SearchResultItem(**base, keyword_score_acronym=3.0,
-                                 keyword_score_expansion=0.0).model_dump()
-        assert (shown["keyword_score_acronym"], shown["keyword_score_expansion"]) == (3.0, 0.0)
-        # Other None fields are unchanged.
-        assert "rrf_score" in SearchResultItem(**base).model_dump()
+        assert name not in SearchResultItem.model_fields
+
+
+# ── Acronym queries: the final score from the four multipliers ────────────
+
+class TestAcronymFieldBoosts:
+    """The score of an acronym query rebuilds from the score before boosts and the four
+    title/summary multipliers, capped at 1.0 (acronym_ranking.final_score)."""
+
+    def test_score_rebuilds_from_the_multipliers(self, service, monkeypatch):
+        _set_expansion_boosts(monkeypatch)
+        scores = {"pt-A": {"title": 0.30, "text": 0.10}, "pt-B": {"title": 0.60}}
+        response = TestAcronymRankingFollowsLexicalRanking()._run(
+            service, monkeypatch, "hybrid", scroll=True, include_scoring_debug=True,
+            titles={"A": "DIET Handbook", "B": "District Institute of Education and Training"},
+            field_scores={pid: dict(s) for pid, s in scores.items()})
+        by_source = {r.source_id: r for r in response.results}
+        assert by_source["A"].title_multiplier == settings.PARTIAL_TITLE_BOOST
+        assert by_source["B"].title_expansion_multiplier == (
+            settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST)
+        for source_id, r in by_source.items():
+            assert r.score == pytest.approx(min(
+                _weighted_dense(scores[f"pt-{source_id}"])
+                * r.title_multiplier * r.summary_multiplier
+                * r.title_expansion_multiplier * r.summary_expansion_multiplier, 1.0))

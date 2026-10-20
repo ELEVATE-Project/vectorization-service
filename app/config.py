@@ -107,15 +107,15 @@ class Settings(BaseSettings):
     PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.2"))
     # Acronym queries only: the title boost rule above, applied to the query with the
     # acronym written out ("PTM document" -> "Parent Teacher Meeting document"). It
-    # stacks with the title boost above (a document matching both gets both). Default 1.0
-    # (off); set a value above 1.0 to turn it on. Title equals the written-out query:
-    ACRONYM_EXPANSION_EXACT_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_TITLE_BOOST", "1.0"))
+    # stacks with the title boost above (a document matching both gets both). Set 1.0 to
+    # turn a boost off. Title equals the written-out query:
+    ACRONYM_EXPANSION_EXACT_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_TITLE_BOOST", "1.7"))
     # Title contains the written-out query ("Parent Teacher Meeting document in school"):
-    ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST", "1.0"))
+    ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST", "1.4"))
     # The same two matches in the summary (equals / contains), against the summary boost
-    # above (stacks with it, like the title). Default 1.0 (off).
-    ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST", "1.0"))
-    ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST", "1.0"))
+    # above (stacks with it, like the title).
+    ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST", "1.4"))
+    ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST", "1.2"))
     # The written-out query is matched by the title/summary scroll (OR with the query as
     # typed, no extra call), over the whole collection, so documents outside the candidate
     # pool can be boosted and injected too.
@@ -136,7 +136,8 @@ class Settings(BaseSettings):
     ACRONYM_PREFIX_SUFFIX_CAP: int = int(os.getenv("ACRONYM_PREFIX_SUFFIX_CAP", "3"))
 
     # Dense variants per query, including the original: one per expansion meaning
-    # (SSC, DM, MIP have two). Used by max (and keyword OR). See design notes, Settings.
+    # (SSC, DM, MIP have two). Used by max; keyword OR searches every meaning, not
+    # capped. See design notes, Settings.
     ACRONYM_MAX_DENSE_VARIANTS: int = int(os.getenv("ACRONYM_MAX_DENSE_VARIANTS", "3"))
 
     # How an acronym query searches the query and its expansions (see design notes, Settings):

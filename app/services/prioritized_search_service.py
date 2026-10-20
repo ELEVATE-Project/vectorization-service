@@ -400,16 +400,18 @@ class PrioritizedSearchService(AcronymRankingMixin):
 
                 variants = [query_for_embedding]
 
-                # AC-11: one variant per expansion meaning, capped. max searches each
-                # one; inline writes the meanings into one text instead (below).
+                # AC-11: one variant per expansion meaning. max searches each one
+                # (capped below); inline writes the meanings into one text instead (below).
                 for expansion_index in range(max_expansions):
-                    if len(variants) >= settings.ACRONYM_MAX_DENSE_VARIANTS:
-                        break
                     substituted = combined_pattern.sub(_make_resolver(expansion_index), query_for_embedding)
 
                     if substituted.lower() not in seen_variants:
                         seen_variants.add(substituted.lower())
                         variants.append(substituted)
+                # Keyword OR (below) searches every meaning; the dense searches stop at
+                # ACRONYM_MAX_DENSE_VARIANTS, the original query always included.
+                keyword_variants = variants
+                variants = variants[:max(1, settings.ACRONYM_MAX_DENSE_VARIANTS)]
                 dense_query_texts = variants
 
                 written_out_queries = [
@@ -422,9 +424,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 logger.info(f"Written-out queries (for title/summary boost): {written_out_queries}")
 
                 # Keyword OR: one BM25 search per variant ("diet" OR "District Institute
-                # of Education and Training"); each chunk keeps its higher raw score.
-                if (settings.ACRONYM_KEYWORD_OR or settings.ACRONYM_SEARCH_METHOD == "max") and len(variants) > 1:
-                    sparse_query_texts = list(variants)
+                # of Education and Training"), every meaning, not capped like the dense
+                # searches; each chunk keeps its higher raw score.
+                if (settings.ACRONYM_KEYWORD_OR or settings.ACRONYM_SEARCH_METHOD == "max") and len(keyword_variants) > 1:
+                    sparse_query_texts = list(keyword_variants)
                     logger.info(f"Keyword OR texts: {sparse_query_texts}")
 
                 if settings.ACRONYM_SEARCH_METHOD == "inline":
