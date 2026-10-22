@@ -16,8 +16,14 @@ from app.models.api_models import (
     PrioritizedSearchResponse,
     SearchResultItem
 )
+from app.utils.generic import normalize_theme
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_themes(values: Optional[List[str]]) -> List[str]:
+    """Theme filter values normalized the way upload stores them; blanks dropped."""
+    return [theme for theme in (normalize_theme(value) for value in (values or [])) if theme]
 
 
 def _match_any_condition(key: str, values: Optional[List[str]]) -> Optional[models.FieldCondition]:
@@ -31,6 +37,20 @@ def _match_any_condition(key: str, values: Optional[List[str]]) -> Optional[mode
     if not valid:
         return None
     return models.FieldCondition(key=key, match=models.MatchAny(any=valid))
+
+
+def _repeats_a_must(exclusion: models.FieldCondition, must_conditions: List[Any]) -> bool:
+    """True when a must condition is a MatchAny on the same key with the same set of values.
+
+    Qdrant 1.18 skips such a must_not on vector search and count (any value order),
+    so the caller nests it in a Filter, which Qdrant does apply.
+    """
+    return any(
+        isinstance(cond, models.FieldCondition) and cond.key == exclusion.key
+        and isinstance(cond.match, models.MatchAny)
+        and set(cond.match.any) == set(exclusion.match.any)
+        for cond in must_conditions
+    )
 
 
 class PrioritizedSearchService:
@@ -88,10 +108,14 @@ class PrioritizedSearchService:
                 logger.info(f"  - Resource Types: {request.resource_type}")
             if request.file_type:
                 logger.info(f"  - File Types: {request.file_type}")
+            if request.themes:
+                logger.info(f"  - Themes: {request.themes}")
             if request.exclude_organizations:
                 logger.info(f"  - Excluded Organizations: {request.exclude_organizations}")
             if request.exclude_file_type:
                 logger.info(f"  - Excluded File Types: {request.exclude_file_type}")
+            if request.exclude_themes:
+                logger.info(f"  - Excluded Themes: {request.exclude_themes}")
         else:
             logger.info("No filters applied")
 
@@ -186,6 +210,7 @@ class PrioritizedSearchService:
                     title=result_data['payload'].get('title'),
                     summary=result_data['payload'].get('summary'),
                     tags=result_data['payload'].get('tags'),
+                    theme=result_data['payload'].get('theme'),
                     metadata=result_data['payload'].get('metadata', {}),
                     source_id=result_data['payload'].get('source_id', ''),
                     score=result_data['weighted_score'],
@@ -319,11 +344,13 @@ class PrioritizedSearchService:
                 organizations=request.organizations,
                 resource_types=request.resource_type,
                 file_types=request.file_type,
+                themes=request.themes,
                 exclude_organizations=request.exclude_organizations,
                 exclude_file_types=request.exclude_file_type,
+                exclude_themes=request.exclude_themes,
                 any_of=request.any_of
             )
-            
+
             self._log_search_request(request, top_k, filter_conditions)
             
             logger.info("========== EXECUTING SEARCH ==========" )
@@ -664,7 +691,7 @@ class PrioritizedSearchService:
 
             # Project payload to retrieve only small metadata keys needed for filters and boosts.
             # Excludes the heavy 'text' payload field during candidate scoring.
-            metadata_payload_fields = ["source_id", "title", "summary", "tags", "metadata"]
+            metadata_payload_fields = ["source_id", "title", "summary", "tags", "theme", "metadata"]
 
             # 1. Build Query Requests for Dense Fields
             for field in search_fields:
@@ -813,8 +840,10 @@ class PrioritizedSearchService:
         organizations: Optional[List[str]] = None,
         resource_types: Optional[List[str]] = None,
         file_types: Optional[List[str]] = None,
+        themes: Optional[List[str]] = None,
         exclude_organizations: Optional[List[str]] = None,
         exclude_file_types: Optional[List[str]] = None,
+        exclude_themes: Optional[List[str]] = None,
         any_of: Optional[List[Any]] = None
     ) -> Optional[models.Filter]:
         """
@@ -835,7 +864,9 @@ class PrioritizedSearchService:
         - organizations → metadata.company (string)
         - resource_types → metadata.DOCUMENT_TYPE (comma-separated string)
         - file_types → metadata.type (string)
-        
+        - themes → theme (top-level string, same on every chunk of a document,
+          so the filter keeps or drops whole documents)
+
         Example:
         Input: categories=["Life Skills", "Peer Learning"], organizations=["involve"]
         Output: (tags IN ["Life Skills", "Peer Learning"]) AND (metadata.company = "involve")
@@ -845,8 +876,10 @@ class PrioritizedSearchService:
             organizations: Company names to filter by
             resource_types: Key entities to filter by (uses text matching)
             file_types: Document types to filter by
+            themes: Document themes to filter by
             exclude_organizations: Company names to exclude (must_not)
             exclude_file_types: Document types to exclude (must_not)
+            exclude_themes: Document themes to exclude (must_not)
             any_of: FilterBlocks to OR together and AND with the filters above
 
         Returns:
@@ -898,17 +931,31 @@ class PrioritizedSearchService:
             filter_summary.append(f"file_types: ({' OR '.join(valid_file_types)})")
             logger.info(f"Filter - file_types: {valid_file_types}")
 
+        # Themes filter (top-level theme field). Outer whitespace is trimmed like
+        # upload does; inner spacing and case are kept, since a theme is a code.
+        theme_condition = _match_any_condition("theme", _normalize_themes(themes))
+        if theme_condition is not None:
+            must_conditions.append(theme_condition)
+            filter_summary.append(f"themes: ({' OR '.join(theme_condition.match.any)})")
+            logger.info(f"Filter - themes: {theme_condition.match.any}")
+
         # Exclusions (must_not). Matching any listed value drops the document.
+        # A document with no theme never matches, so exclude_themes keeps it.
         for label, key, values in (
             ("organizations", "metadata.company", exclude_organizations),
             ("file_types", "metadata.type", exclude_file_types),
+            ("themes", "theme", _normalize_themes(exclude_themes)),
         ):
             condition = _match_any_condition(key, values)
             if condition is None:
                 continue
-            must_not_conditions.append(condition)
             filter_summary.append(f"NOT {label}: ({' OR '.join(condition.match.any)})")
             logger.info(f"Filter - exclude_{label}: {condition.match.any}")
+            # Same values included and excluded: nest the exclusion so Qdrant applies
+            # it and the result is empty, as the request implies.
+            if _repeats_a_must(condition, must_conditions):
+                condition = models.Filter(must=[condition])
+            must_not_conditions.append(condition)
 
         # Alternatives (should). Each block is itself a filter block, so it is
         # built by this same function — the branch is compiled by the identical
@@ -924,8 +971,10 @@ class PrioritizedSearchService:
                     organizations=block.organizations,
                     resource_types=block.resource_type,
                     file_types=block.file_type,
+                    themes=block.themes,
                     exclude_organizations=block.exclude_organizations,
                     exclude_file_types=block.exclude_file_type,
+                    exclude_themes=block.exclude_themes,
                 )
                 if branch is not None:
                     branch_filters.append(branch)
@@ -1342,6 +1391,7 @@ class PrioritizedSearchService:
                     title=doc['payload'].get('title'),
                     summary=doc['payload'].get('summary'),
                     tags=doc['payload'].get('tags'),
+                    theme=doc['payload'].get('theme'),
                     metadata=doc['payload'].get('metadata', {}),
                     source_id=doc['payload'].get('source_id', ''),
                     score=1.0,
@@ -1759,11 +1809,13 @@ class PrioritizedSearchService:
                 organizations=request.organizations,
                 resource_types=request.resource_type,
                 file_types=request.file_type,
+                themes=request.themes,
                 exclude_organizations=request.exclude_organizations,
                 exclude_file_types=request.exclude_file_type,
+                exclude_themes=request.exclude_themes,
                 any_of=request.any_of
             )
-            
+
             if filter_conditions:
                 logger.info("Getting unique sources with filters")
             else:
