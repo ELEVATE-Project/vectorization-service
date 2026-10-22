@@ -281,10 +281,10 @@ def load_acronym_cache() -> int:
             json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL
         )
 
-    # SET NX: warm-up fills only empty keys, so it never replaces an upload's value.
-    # A failure is not fatal: lookups fall back to Postgres.
+    # Overwrites on purpose: a restart repairs keys changed outside the upload API
+    # (migrations, SQL fixes). A failure is not fatal: lookups fall back to Postgres.
     try:
-        cache_client.set_many_if_absent(writes)
+        cache_client.set_many(writes)
     except Exception as e:
         logger.warning(
             f"Acronym cache warm-up failed for {len(writes)} acronym(s), "

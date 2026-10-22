@@ -306,14 +306,18 @@ connection timeouts into one during a Redis outage.
   the upload reports `cache_refreshed=false` instead of silently leaving
   deactivated acronyms live for 24 h.
 - **Warm-up** (`load_acronym_cache`) writes every active acronym in one
-  pipelined call at startup, with `SET NX`: it only fills empty keys, so an
-  upload committing while a pod starts is never replaced by the older snapshot.
+  pipelined call at startup and overwrites existing keys on purpose: a restart
+  repairs entries that changed outside the upload API (a seeding migration, a
+  SQL fix), including a cached `null` for an acronym added since. With `SET NX`
+  those stayed stale for up to `REDIS_NEGATIVE_CACHE_TTL` (null) or
+  `REDIS_CACHE_TTL` (an old expansion), and no API clears `acronym:*` keys.
   It is all or nothing; a failure is logged and the service boots with a cold
   cache, which costs latency, not correctness.
-- **Known limit: two uploads of the same acronym at once.** `refresh_cache`
-  overwrites unconditionally, so if two uploads race, the one whose Postgres
-  read was older can write last. Uploads are admin-only and a re-upload fixes
-  it, so this is accepted rather than adding per-key versions.
+- **Known limit: unconditional writes can race an upload.** `refresh_cache`
+  and warm-up overwrite, so a write from an older Postgres read can land last:
+  two uploads of the same acronym at once, or an upload committing while a pod
+  warms up. The window is milliseconds, uploads are admin-only and a re-upload
+  fixes it, so this is accepted rather than adding per-key versions.
 
 ## Bulk upload (`bulk_upsert`, `POST /api/acronyms/bulk`)
 
