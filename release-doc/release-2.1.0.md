@@ -2,6 +2,8 @@
 
 **Service:** vectorization-service
 
+> ⚠️ **Acronym search was not released in 2.1.0.** The acronym sections below describe an earlier design (ranking bonus, score blend) that was replaced before release; [release 2.2.0](release-2.2.0.md) is the first release with acronym search and applies instead. The search filtering changes (exclusion filters, `any_of`) shipped in 2.1.0 as described.
+
 > ⚠️ **Run the migration before starting the service on a fresh deploy.** The acronym cache warms at startup by querying `acronym_mapping` — if that table doesn't exist yet, warm-up fails (non-fatal, logged, service still boots) and acronym detection silently returns nothing until the migration runs and the cache is repopulated.
 
 ---

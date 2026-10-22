@@ -292,7 +292,9 @@ connection timeouts into one during a Redis outage.
   read, and an upload can commit in between. An unconditional write buried a
   new acronym under `null`, or restored an old or deactivated expansion for
   24 h. With `SET NX`, whatever the upload wrote wins. Keys holding a broken
-  value are overwritten instead, or NX would keep them forever.
+  value are deleted instead (NX would keep them forever, and an overwrite could
+  bury an upload that committed after the read); the next lookup refills them
+  with `SET NX`.
 - **Deactivation writes a `null` marker, not a delete.** A deleted key is empty,
   so a late lookup could write the old value back. The marker is written only
   for acronyms Postgres still shows as inactive (a second upload may have
@@ -304,8 +306,14 @@ connection timeouts into one during a Redis outage.
   the upload reports `cache_refreshed=false` instead of silently leaving
   deactivated acronyms live for 24 h.
 - **Warm-up** (`load_acronym_cache`) writes every active acronym in one
-  pipelined call at startup. It is all or nothing; a failure is logged and the
-  service boots with a cold cache, which costs latency, not correctness.
+  pipelined call at startup, with `SET NX`: it only fills empty keys, so an
+  upload committing while a pod starts is never replaced by the older snapshot.
+  It is all or nothing; a failure is logged and the service boots with a cold
+  cache, which costs latency, not correctness.
+- **Known limit: two uploads of the same acronym at once.** `refresh_cache`
+  overwrites unconditionally, so if two uploads race, the one whose Postgres
+  read was older can write last. Uploads are admin-only and a re-upload fixes
+  it, so this is accepted rather than adding per-key versions.
 
 ## Bulk upload (`bulk_upsert`, `POST /api/acronyms/bulk`)
 
@@ -315,7 +323,11 @@ connection timeouts into one during a Redis outage.
   detection can find. A single-letter whole key ("A") is rejected; a
   single-letter word inside a phrase ("RBI GRADE B") is fine.
 - Over-length values are rejected per row, because one reaching Postgres fails
-  the single multi-row INSERT for the whole batch.
+  the multi-row INSERT for the whole batch.
+- The upsert runs in chunks of 1,000 rows, in one transaction with one commit.
+  Postgres takes at most 65,535 bound values per statement, and psycopg 3 (the
+  deployed driver) binds server-side: one statement for every row failed the
+  whole upload above ~10,900 rows (6 values per row).
 - `is_active` is optional (missing means active, for older CSVs); anything other
   than true/false is a per-row error.
 - Create vs update comes from `RETURNING (xmax = 0)` in the same upsert (an

@@ -149,6 +149,7 @@ Response: `received`, `created`, `updated`, `deactivated`, `cache_refreshed`, `e
 | `ACRONYM_SEARCH_METHOD` | `inline` | `inline` (one text with the meanings written in) or `max` (one text per meaning, higher score per field); empty means `inline` |
 | `ACRONYM_MAX_DENSE_VARIANTS` | `3` | Dense query variants per acronym query, including the original (max only; keyword OR searches every meaning) |
 | `ACRONYM_MAX_PHRASE_WORDS` | `4` | Longest multi-word acronym detected and accepted on upload |
+| `ACRONYM_MAX_QUERY_WORDS` | `30` | Words of the query checked for acronyms; the rest is still searched, only not looked up, which bounds Redis/Postgres work for very long queries |
 | `ACRONYM_MIN_PREFIX_MATCH_LEN` | `4` | Shortest word stem allowed to prefix-match an expansion word |
 | `ACRONYM_PREFIX_SUFFIX_CAP` | `3` | Most extra characters in such a prefix match ("tests" ~ "test") |
 | `CACHE_ENABLED` | `true` | Use Redis for acronym lookups |

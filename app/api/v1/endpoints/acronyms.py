@@ -9,7 +9,8 @@ from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import verify_admin_token, verify_internal_token
 from app.config import settings
-from app.constants import ACRONYM_CSV_COLUMN_ACRONYM, ACRONYM_CSV_COLUMN_EXPANSIONS
+from app.constants import constants as const
+from app.constants import messages as msg
 from app.models.api_models import AcronymBulkUploadResponse, AcronymItem, AcronymListResponse
 from app.services.acronym_service import (
     bulk_upsert,
@@ -76,7 +77,7 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
     if len(raw) > max_bytes:
         raise HTTPException(
             status_code=413,
-            detail=f"File exceeds max size of {settings.ACRONYM_BULK_UPLOAD_MAX_SIZE_MB}MB",
+            detail=msg.ACRONYM_CSV_TOO_LARGE.format(max_size_mb=settings.ACRONYM_BULK_UPLOAD_MAX_SIZE_MB),
         )
 
     try:
@@ -84,19 +85,21 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
         # first header name and fail every row.
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
-        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded")
+        raise HTTPException(status_code=400, detail=msg.ACRONYM_CSV_NOT_UTF8)
 
     reader = csv.DictReader(io.StringIO(text))
-    required_columns = {ACRONYM_CSV_COLUMN_ACRONYM, ACRONYM_CSV_COLUMN_EXPANSIONS}
+    required_columns = {const.ACRONYM_CSV_COLUMN_ACRONYM, const.ACRONYM_CSV_COLUMN_EXPANSIONS}
     if not reader.fieldnames or not required_columns.issubset(reader.fieldnames):
         raise HTTPException(
             status_code=400,
-            detail=f"CSV must have columns {sorted(required_columns)}, found {reader.fieldnames}",
+            detail=msg.ACRONYM_CSV_MISSING_COLUMNS.format(
+                required_columns=sorted(required_columns), found_columns=reader.fieldnames
+            ),
         )
 
     rows = list(reader)
     if not rows:
-        raise HTTPException(status_code=400, detail="CSV file has no data rows")
+        raise HTTPException(status_code=400, detail=msg.ACRONYM_CSV_NO_DATA_ROWS)
 
     # bulk_upsert/refresh_cache/invalidate_cache are all synchronous, blocking
     # Postgres/Redis I/O — run_in_threadpool keeps them off the event loop.
@@ -109,10 +112,7 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
         logger.error(f"Acronym bulk upload failed in the database, outcome unconfirmed: {e}")
         raise HTTPException(
             status_code=503 if isinstance(e, OperationalError) else 500,
-            detail=(
-                "Database error: the upload could not be confirmed. Retrying the whole "
-                "file is safe; check the saved acronyms if unsure."
-            ),
+            detail=msg.ACRONYM_UPLOAD_DB_ERROR,
         ) from e
 
     # Committed already; now refresh active rows and mark deactivated ones.

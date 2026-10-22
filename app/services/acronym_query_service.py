@@ -4,11 +4,11 @@ from typing import Dict, List
 from spacy.lang.en.stop_words import STOP_WORDS
 
 from app.config import settings
-from app.constants import ACRONYM_NON_LETTER_PATTERN
+from app.constants import constants as const
 from app.services.acronym_service import get_expansions_batch
 
 # Letters only: "D.I.E.T." -> "DIET", "PTM2024" -> "PTM" (see acronym-design-notes.md).
-_NON_LETTER_RE = re.compile(ACRONYM_NON_LETTER_PATTERN)
+_NON_LETTER_RE = re.compile(const.ACRONYM_NON_LETTER_PATTERN)
 
 
 def _normalize_token(raw_token: str) -> str:
@@ -24,7 +24,10 @@ def detect_acronyms(query: str) -> Dict[str, List[str]]:
     if not query or not query.strip():
         return {}
 
-    raw_tokens = query.strip().split()
+    # Only the first ACRONYM_MAX_QUERY_WORDS words: each word adds up to
+    # ACRONYM_MAX_PHRASE_WORDS lookups and cached "not found" keys, so an unbounded
+    # query would be unbounded Redis/Postgres work.
+    raw_tokens = query.strip().split()[:settings.ACRONYM_MAX_QUERY_WORDS]
     is_single_word_query = len(raw_tokens) == 1
 
     # Deduped before lookup, so a repeated word is looked up once.

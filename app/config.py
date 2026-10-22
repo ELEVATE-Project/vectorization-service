@@ -105,10 +105,9 @@ class Settings(BaseSettings):
     # Summary boosts are lower than title (summary carries less weight than title).
     EXACT_SUMMARY_BOOST: float = float(os.getenv("EXACT_SUMMARY_BOOST", "1.4"))
     PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.2"))
-    # Acronym queries only: the title boost rule above, applied to the query with the
-    # acronym written out ("PTM document" -> "Parent Teacher Meeting document"). It
-    # stacks with the title boost above (a document matching both gets both). Set 1.0 to
-    # turn a boost off. Title equals the written-out query:
+    # Acronym queries only: the title boost for the query with the acronym written out
+    # ("PTM document" -> "Parent Teacher Meeting document"); both can apply. 1.0 = off.
+    # Title equals the written-out query:
     ACRONYM_EXPANSION_EXACT_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_TITLE_BOOST", "1.7"))
     # Title contains the written-out query ("Parent Teacher Meeting document in school"):
     ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST", "1.4"))
@@ -152,6 +151,9 @@ class Settings(BaseSettings):
     ACRONYM_KEYWORD_OR: bool = os.getenv("ACRONYM_KEYWORD_OR", "false").lower() == "true"
     # Longest multi-word acronym (in words) that detection finds and upload accepts.
     ACRONYM_MAX_PHRASE_WORDS: int = int(os.getenv("ACRONYM_MAX_PHRASE_WORDS", "4"))
+    # Words of the query checked for acronyms; the rest is still searched, only not
+    # looked up, so a very long query cannot flood Redis and Postgres.
+    ACRONYM_MAX_QUERY_WORDS: int = int(os.getenv("ACRONYM_MAX_QUERY_WORDS", "30"))
 
     # Master switch for acronym search; off gives exactly the pre-feature ranking.
     ACRONYM_SEARCH_ENABLED: bool = os.getenv("ACRONYM_SEARCH_ENABLED", "true").lower() == "true"

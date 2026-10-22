@@ -9,14 +9,8 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.config import settings
-from app.constants import (
-    ACRONYM_CACHE_KEY_PREFIX,
-    ACRONYM_CSV_COLUMN_ACRONYM,
-    ACRONYM_CSV_COLUMN_DESCRIPTION,
-    ACRONYM_CSV_COLUMN_EXPANSIONS,
-    ACRONYM_CSV_COLUMN_IS_ACTIVE,
-    ACRONYM_KEY_WORD_PATTERN,
-)
+from app.constants import constants as const
+from app.constants import messages as msg
 from app.core.clients import cache_client
 from app.core.database import SessionLocal
 from app.models.db_models import AcronymMapping
@@ -25,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 def _cache_key(acronym: str) -> str:
-    return f"{ACRONYM_CACHE_KEY_PREFIX}:{acronym}"
+    return f"{const.ACRONYM_CACHE_KEY_PREFIX}:{acronym}"
 
 
 def _valid_expansions(expansions) -> bool:
@@ -59,7 +53,7 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
 
     result: Dict[str, List[str]] = {}
     missing: List[str] = []
-    # Keys holding an unusable value: overwritten below, since SET NX would keep them.
+    # Keys holding an unusable value: deleted below, since SET NX would keep them.
     broken: set = set()
     for acronym, cached in zip(normalized, cached_values):
         if cached is None:
@@ -135,27 +129,26 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
                 f"Acronym {mapping.acronym!r} has malformed expansions in DB "
                 f"({mapping.expansions!r}), treating as not found"
             )
-    # SET NX so an upload that committed after our read wins; broken keys are
-    # overwritten. See release-doc/acronym-design-notes.md, Cache.
-    if_absent_writes: Dict[str, Tuple[str, int]] = {}
-    overwrite_writes: Dict[str, Tuple[str, int]] = {}
+    # SET NX: a value an upload wrote after our read is kept. Broken keys are
+    # deleted, and the next lookup fills them again. See design notes, Cache.
+    writes: Dict[str, Tuple[str, int]] = {}
     for acronym in missing:
         if acronym in found_by_acronym:
             result[acronym] = found_by_acronym[acronym]
             entry = (json.dumps(found_by_acronym[acronym]), settings.REDIS_CACHE_TTL)
         else:
             entry = (json.dumps(None), settings.REDIS_NEGATIVE_CACHE_TTL)
-        target = overwrite_writes if acronym in broken else if_absent_writes
-        target[_cache_key(acronym)] = entry
+        if acronym not in broken:
+            writes[_cache_key(acronym)] = entry
 
     if settings.CACHE_ENABLED:
         try:
-            cache_client.set_many_if_absent(if_absent_writes)
-            cache_client.set_many(overwrite_writes)
+            cache_client.set_many_if_absent(writes)
+            cache_client.delete_many([_cache_key(a) for a in broken])
         except Exception as e:
             logger.warning(
                 "Acronym batch cache write-through failed for "
-                f"{len(if_absent_writes) + len(overwrite_writes)} acronym(s): {e}"
+                f"{len(writes) + len(broken)} acronym(s): {e}"
             )
 
     return result
@@ -288,10 +281,10 @@ def load_acronym_cache() -> int:
             json.dumps(mapping.expansions), settings.REDIS_CACHE_TTL
         )
 
-    # One pipelined write, all or nothing. A failure must not stop the boot: a cold
-    # cache only costs latency, since lookups fall back to Postgres.
+    # SET NX: warm-up fills only empty keys, so it never replaces an upload's value.
+    # A failure is not fatal: lookups fall back to Postgres.
     try:
-        cache_client.set_many(writes)
+        cache_client.set_many_if_absent(writes)
     except Exception as e:
         logger.warning(
             f"Acronym cache warm-up failed for {len(writes)} acronym(s), "
@@ -322,10 +315,14 @@ def _split_expansions(raw: str) -> List[str]:
 # of sync if the column length is ever changed there.
 _ACRONYM_MAX_LENGTH = AcronymMapping.__table__.c.acronym.type.length
 
+# Rows per upsert statement in bulk_upsert: 6 bound values each, far below
+# Postgres' 65,535-parameter limit per statement.
+_UPSERT_CHUNK_ROWS = 1000
+
 # Letters only, up to ACRONYM_MAX_PHRASE_WORDS words: the only shape detection can
 # find, so anything else ("WI-FI", "4G") is rejected at upload.
 _ACRONYM_KEY_RE = re.compile(
-    rf"^{ACRONYM_KEY_WORD_PATTERN}(?: {ACRONYM_KEY_WORD_PATTERN}){{0,{settings.ACRONYM_MAX_PHRASE_WORDS - 1}}}$"
+    rf"^{const.ACRONYM_KEY_WORD_PATTERN}(?: {const.ACRONYM_KEY_WORD_PATTERN}){{0,{settings.ACRONYM_MAX_PHRASE_WORDS - 1}}}$"
 )
 
 
@@ -350,17 +347,17 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
     valid_by_acronym: dict = {}
 
     for index, row in enumerate(rows):
-        raw_acronym = (row.get(ACRONYM_CSV_COLUMN_ACRONYM) or "").strip()
+        raw_acronym = (row.get(const.ACRONYM_CSV_COLUMN_ACRONYM) or "").strip()
         acronym = raw_acronym.upper()
-        expansions = _split_expansions(row.get(ACRONYM_CSV_COLUMN_EXPANSIONS) or "")
-        description = (row.get(ACRONYM_CSV_COLUMN_DESCRIPTION) or "").strip() or None
-        status = (row.get(ACRONYM_CSV_COLUMN_IS_ACTIVE) or "").strip().lower()
+        expansions = _split_expansions(row.get(const.ACRONYM_CSV_COLUMN_EXPANSIONS) or "")
+        description = (row.get(const.ACRONYM_CSV_COLUMN_DESCRIPTION) or "").strip() or None
+        status = (row.get(const.ACRONYM_CSV_COLUMN_IS_ACTIVE) or "").strip().lower()
 
         if not acronym or not expansions:
             errors.append({
                 "index": index,
                 "acronym": raw_acronym or None,
-                "reason": "acronym and expansions must be non-empty after trimming whitespace",
+                "reason": msg.ACRONYM_ROW_EMPTY,
             })
             continue
 
@@ -368,10 +365,8 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
             errors.append({
                 "index": index,
                 "acronym": acronym,
-                "reason": (
-                    "acronym must be letters only (1-4 space-separated words; "
-                    "a lone word needs at least 2 letters) — this can never be "
-                    "detected in a search query otherwise"
+                "reason": msg.ACRONYM_ROW_INVALID_KEY.format(
+                    max_words=settings.ACRONYM_MAX_PHRASE_WORDS
                 ),
             })
             continue
@@ -387,7 +382,7 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
             errors.append({
                 "index": index,
                 "acronym": acronym,
-                "reason": f"is_active must be 'true' or 'false' if present, got {status!r}",
+                "reason": msg.ACRONYM_ROW_INVALID_IS_ACTIVE.format(status=status),
             })
             continue
 
@@ -396,7 +391,7 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
             errors.append({
                 "index": index,
                 "acronym": acronym,
-                "reason": f"acronym exceeds max length of {_ACRONYM_MAX_LENGTH} characters",
+                "reason": msg.ACRONYM_ROW_TOO_LONG.format(max_length=_ACRONYM_MAX_LENGTH),
             })
             continue
 
@@ -404,7 +399,7 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
             errors.append({
                 "index": valid_by_acronym[acronym]["index"],
                 "acronym": acronym,
-                "reason": f"duplicate acronym in batch, superseded by row {index}",
+                "reason": msg.ACRONYM_ROW_DUPLICATE.format(index=index),
             })
 
         valid_by_acronym[acronym] = {
@@ -444,24 +439,29 @@ def bulk_upsert(rows: List[dict]) -> Tuple[List[str], List[str], List[str], List
             }
             for acronym, v in valid_by_acronym.items()
         ]
-        stmt = pg_insert(acronym_table).values(values)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["acronym"],
-            set_={
-                "expansions": stmt.excluded.expansions,
-                "description": stmt.excluded.description,
-                "is_active": stmt.excluded.is_active,
-                "updated_at": stmt.excluded.updated_at,
-            },
-        )
-        # One call: RETURNING says which rows were new. An inserted row has xmax = 0;
-        # a row updated by ON CONFLICT carries this transaction's id. Timestamps
-        # can't tell: two uploads may share the same `now`.
-        stmt = stmt.returning(
-            acronym_table.c.acronym,
-            sa.literal_column("xmax = 0").label("inserted"),
-        )
-        inserted = {row.acronym: row.inserted for row in db.execute(stmt)}
+        inserted: Dict[str, bool] = {}
+        # Chunked, one transaction and one commit: psycopg 3 binds values server-side
+        # and Postgres takes at most 65,535 per statement (6 per row, ~10,900 rows).
+        # Keys are deduped above, so no row is touched by two chunks.
+        for start in range(0, len(values), _UPSERT_CHUNK_ROWS):
+            stmt = pg_insert(acronym_table).values(values[start:start + _UPSERT_CHUNK_ROWS])
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["acronym"],
+                set_={
+                    "expansions": stmt.excluded.expansions,
+                    "description": stmt.excluded.description,
+                    "is_active": stmt.excluded.is_active,
+                    "updated_at": stmt.excluded.updated_at,
+                },
+            )
+            # RETURNING says which rows were new. An inserted row has xmax = 0; a row
+            # updated by ON CONFLICT carries this transaction's id. Timestamps can't
+            # tell: two uploads may share the same `now`.
+            stmt = stmt.returning(
+                acronym_table.c.acronym,
+                sa.literal_column("xmax = 0").label("inserted"),
+            )
+            inserted.update({row.acronym: row.inserted for row in db.execute(stmt)})
         db.commit()
     except Exception:
         db.rollback()

@@ -1,3 +1,15 @@
+"""Internal constant text for the vectorization service (never sent in API responses).
+
+API error/success messages live in messages.py; this file holds everything else, such as
+labels used only in log lines.
+
+Usage: from app.constants import constants as const
+"""
+
+# =============================================================================
+# Acronym search
+# =============================================================================
+
 ACRONYM_CACHE_KEY_PREFIX = "acronym"
 
 # Bulk-upload CSV column names (spec §7)

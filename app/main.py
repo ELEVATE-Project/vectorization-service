@@ -28,11 +28,8 @@ async def lifespan(app: FastAPI):
         # loop (and every other in-flight request) for its full duration.
         await run_in_threadpool(load_acronym_cache)
     except Exception as e:
-        # Not fatal: get_expansions_batch() already falls back to Postgres per lookup,
-        # so a failed warm-up only costs a few extra DB round-trips on first
-        # touch — it must not take down the whole service (e.g. a fresh
-        # deploy where the migration hasn't run yet, or a transient Redis
-        # blip, would otherwise prevent boot entirely).
+        # Not fatal: lookups fall back to Postgres, so a failed warm-up (migration
+        # not run yet, Redis down) must not stop the service from starting.
         logger.warning(f"Acronym cache warm-up failed, continuing without it: {str(e)}")
 
     logger.info("Application startup completed")

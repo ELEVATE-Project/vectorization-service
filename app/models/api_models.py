@@ -352,10 +352,8 @@ class AcronymBulkUploadResponse(BaseModel):
     # created + updated, not a separate category — without it a batch that
     # disables 30 acronyms is indistinguishable from one that edits them.
     deactivated: int
-    # False means the rows committed but the cache could not be updated, so
-    # stale expansions may still be served until their TTL expires (up to
-    # REDIS_CACHE_TTL for a deactivated acronym). The upload itself succeeded;
-    # the fix is to clear the cache, not to re-upload.
+    # False: the rows are saved, but the cache could not be updated, so old values
+    # may be served until REDIS_CACHE_TTL ends. Clear the cache; do not re-upload.
     cache_refreshed: bool = True
     errors: List[AcronymUploadError]
     # Which acronyms each count refers to, in CSV order.

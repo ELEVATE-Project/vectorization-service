@@ -4,27 +4,20 @@ from typing import Optional
 from fastapi import Header, HTTPException
 
 from app.config import settings
+from app.constants import messages as msg
 
 
 def verify_internal_token(
     internal_access_token: Optional[str] = Header(None, convert_underscores=False),
-    # Nginx drops underscored header names by default (underscores_in_headers
-    # off) unless an operator explicitly re-enables them, and no Nginx config
-    # ships in this repo to confirm that's been done. A hyphenated fallback
-    # survives that default, so a deployment sitting behind an unconfigured
-    # proxy doesn't silently lose this header in transit.
+    # Hyphenated name also accepted: Nginx drops headers with underscores by default.
     internal_access_token_alias: Optional[str] = Header(
         None, alias="internal-access-token", convert_underscores=False
     ),
 ) -> None:
-    """Gate internal-only endpoints behind a shared secret (internal_access_token
-    header — underscored, not hyphenated, to stay consistent with FastAPI's Header param naming;
-    internal-access-token also accepted, see above).
+    """401 unless the internal_access_token header matches INTERNAL_API_TOKEN.
 
-    Header is optional so a missing one fails with the same 401 as a wrong one,
-    not a 422 that leaks the auth mechanism. compare_digest on utf-8/
-    surrogateescape-encoded bytes gives constant-time comparison (no timing
-    side-channel) without crashing on non-ASCII header bytes.
+    A missing token gets the same 401 as a wrong one. The comparison is
+    constant-time and does not fail on non-ASCII header bytes.
     """
     token = internal_access_token or internal_access_token_alias
     if (
@@ -35,7 +28,7 @@ def verify_internal_token(
             settings.INTERNAL_API_TOKEN.encode("utf-8", "surrogateescape"),
         )
     ):
-        raise HTTPException(status_code=401, detail="Invalid or missing internal token")
+        raise HTTPException(status_code=401, detail=msg.INTERNAL_TOKEN_INVALID)
 
 
 def verify_admin_token(
@@ -57,4 +50,4 @@ def verify_admin_token(
             settings.ADMIN_API_TOKEN.encode("utf-8", "surrogateescape"),
         )
     ):
-        raise HTTPException(status_code=401, detail="Invalid or missing admin token")
+        raise HTTPException(status_code=401, detail=msg.ADMIN_TOKEN_INVALID)

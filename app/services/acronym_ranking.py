@@ -11,12 +11,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from spacy.lang.en.stop_words import STOP_WORDS
 
 from app.config import settings
-from app.constants import WORD_TOKEN_PATTERN
+from app.constants import constants as const
+from app.constants import messages as msg
 
 logger = logging.getLogger(__name__)
 
 # Compiled once: runs against every expansion and query text.
-_WORD_RE = re.compile(WORD_TOKEN_PATTERN)
+_WORD_RE = re.compile(const.WORD_TOKEN_PATTERN)
 
 
 class AcronymRankingMixin:
@@ -93,15 +94,10 @@ class AcronymRankingMixin:
     def _acronym_method_description() -> str:
         """acronym_info.method_description: ACRONYM_SEARCH_METHOD (and keyword OR) in words."""
         if settings.ACRONYM_SEARCH_METHOD == "max":
-            return ("The query and the query with each acronym written out are searched "
-                    "separately, for meaning and for keywords; each field keeps the higher score.")
-        text = ("One search text with each acronym's full form written next to it, e.g. "
-                "\"PTM (Parent Teacher Meeting) documents\"")
+            return msg.ACRONYM_METHOD_MAX
         if settings.ACRONYM_KEYWORD_OR:
-            return (text + "; the keyword search runs once for the query and once more for each "
-                           "meaning, with every acronym replaced by that meaning (\"Parent Teacher "
-                           "Meeting documents\"), and each chunk keeps the higher keyword score.")
-        return text + "; one keyword search with the words of the query and of every full form."
+            return msg.ACRONYM_METHOD_INLINE + msg.ACRONYM_METHOD_INLINE_KEYWORD_OR
+        return msg.ACRONYM_METHOD_INLINE + msg.ACRONYM_METHOD_INLINE_KEYWORD
 
     @staticmethod
     def _acronym_ranking_context(

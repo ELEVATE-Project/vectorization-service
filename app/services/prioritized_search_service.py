@@ -551,11 +551,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
             # when include_scoring_debug is set (see below).
             scoring_context: Dict[str, Any] = {}
 
-            # Soft acronym ranking: an acronym query with lexical ranking on gets the
-            # expansion title/summary boosts on top of the usual ones. The retrieval score
-            # (inline: one text; max: each field's higher score) is the score before boosts.
-            # Everything else — ordinary queries, semantic mode, the hybrid kill switch —
-            # goes through the unchanged path below.
+            # Acronym query with lexical ranking on: also apply the expansion title/summary
+            # boosts. All other queries take the unchanged path below.
             soft_acronym_ranking = bool(acronyms_detected) and lexical_ranking_enabled
             # Only needed by the boost step below, so semantic search skips it.
             prethreshold_by_source: Optional[Dict[str, Dict[str, Any]]] = (
@@ -586,13 +583,10 @@ class PrioritizedSearchService(AcronymRankingMixin):
                 # in the dense candidate pool that the scroll missed. Acronym queries
                 # are matched like any other query: the query as typed.
 
-                # Acronym queries: the same rule with the query written out ("PTM document"
-                # -> "Parent Teacher Meeting document"): "exact" when the title (or summary,
-                # below) equals it, "partial" when it contains it. The title/summary scroll
-                # matches the written-out queries too (OR with the query as typed, no extra
-                # call), over the whole collection. This boost stacks with the ordinary boost
-                # for the same field: a document matching both gets both.
-                # written_out_queries is empty unless an acronym was detected.
+                # Acronym queries: the same scroll also matches the query with the acronym
+                # written out ("PTM document" -> "Parent Teacher Meeting document").
+                # Exact = field equals it, partial = field contains it. Stacks with the
+                # normal boost. Empty list when no acronym was found.
                 expansion_title_matches: Dict[str, str] = {}
                 title_matches = self._get_field_match_sources(
                     query_for_keyword_match, filter_conditions, "title",
@@ -1017,10 +1011,8 @@ class PrioritizedSearchService(AcronymRankingMixin):
                     all_results[pid] = point
                     if pid not in field_scores:
                         field_scores[pid] = {}
-                    # max(), not overwrite: with multiple dense embeddings for the same
-                    # field (acronym path), the same point can be scored twice for that
-                    # field — keep whichever embedding matched it best. Keyword OR / max
-                    # do the same for their BM25 lists (the higher raw score wins).
+                    # max(), not overwrite: with several query texts (acronym path) a chunk
+                    # can be scored twice for one field; keep the higher score.
                     score = getattr(point, "score", 0.0)
                     existing = field_scores[pid].get(field, float("-inf"))
                     field_scores[pid][field] = max(existing, score)
