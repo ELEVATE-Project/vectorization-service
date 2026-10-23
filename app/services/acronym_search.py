@@ -158,6 +158,11 @@ def build_acronym_query(original_query: str, cleaned_query: str) -> Optional[Acr
         return None
     logger.info(f"[ACRONYM] detected: {detected}")
 
+    # Clean the query again keeping the detected acronyms, so a stopword acronym
+    # (BE, ME, SO) is not removed before it is written out.
+    acronym_words = {word for acronym in detected for word in acronym.split()}
+    cleaned_query = preprocess_query(original_query, keep_words=acronym_words) or cleaned_query
+
     # Replace all acronyms in one pass, so a meaning that contains another acronym
     # is not replaced a second time.
     pattern = _acronym_substitution_pattern(detected)

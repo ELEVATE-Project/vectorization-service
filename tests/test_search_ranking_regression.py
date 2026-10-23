@@ -1030,6 +1030,22 @@ class TestAcronymScoringContext:
         assert query.sparse_texts == ["diet", *meanings]
         assert len(query.dense_texts) == dense_variants
 
+    @pytest.mark.parametrize("method", ["inline", "dual_query"])
+    def test_stopword_acronym_is_kept_in_a_long_query(self, monkeypatch, method):
+        """The clean-up drops "be" from a long query; a detected BE must still be written out."""
+        from app.utils.query_preprocessor import preprocess_query
+
+        query = "BE admissions for engineering courses"
+        monkeypatch.setattr("app.services.acronym_search.detect_acronyms",
+                            lambda q: {"BE": ["Bachelor of Engineering"]})
+        monkeypatch.setattr(settings, "ACRONYM_SEARCH_METHOD", method)
+        built = acronym_search.build_acronym_query(query, preprocess_query(query))
+        assert "be" not in preprocess_query(query).split()
+        assert built.sparse_texts == ["be admissions engineering courses",
+                                      "Bachelor of Engineering admissions engineering courses"]
+        assert any("engineering admissions" in t.lower() and "bachelor" in t.lower()
+                   for t in built.dense_texts)
+
     @pytest.mark.parametrize("search_mode, hybrid_enabled", [
         ("semantic", True),
         ("hybrid", False),

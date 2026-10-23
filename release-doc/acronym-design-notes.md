@@ -45,6 +45,8 @@ acronym, so a normal word only matches if it is also a registered acronym.
 - **Any case.** The commons media API lowercases queries, so "diet" must find DIET.
 - **Stopwords are still looked up.** BE, ME and SO are acronyms and stopwords at
   the same time; other stopwords are not in the dictionary and resolve to nothing.
+  The query clean-up keeps a detected acronym even when it is a stopword
+  (`preprocess_query(..., keep_words=...)`), so it can still be written out.
 - **Multi-word keys** ("RTE ACT", "PM SHRI") are found through the word runs. A run
   that contains a word with no letters ("&", "2024") is skipped, so two words that
   are not next to each other are never joined.
@@ -234,9 +236,8 @@ cannot be created.
 
 ## Known limits
 
-- **`dual_query` and stopword acronyms.** In a long query, the clean-up removes BE,
-  ME and SO before they are written out, so no semantic text with their meaning is
-  made; the keyword text still has the meaning's words. `inline` is not affected.
+- **Common words that are also acronyms.** "me", "be" and "so" are matched in any
+  case, so "show me library books" is searched as ME (Master of Engineering) too.
 - **Acronyms after word 30** are not detected; the words are still searched.
 - **Two uploads of the same acronym at the same moment**, or an upload while a pod
   loads the cache, can leave the older value in the cache until a re-upload or restart.
