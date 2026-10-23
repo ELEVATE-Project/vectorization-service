@@ -73,8 +73,10 @@ class FilterBlock(BaseModel):
     organizations: Optional[List[str]] = Field(default=None, description="Company names (searches 'metadata.company')")
     resource_type: Optional[List[str]] = Field(default=None, description="Key entities (searches 'metadata.DOCUMENT_TYPE')")
     file_type: Optional[List[str]] = Field(default=None, description="Document types (searches 'metadata.type')")
+    themes: Optional[List[str]] = Field(default=None, description="Document themes (searches top-level 'theme')")
     exclude_organizations: Optional[List[str]] = Field(default=None, description="Company names to exclude (must_not)")
     exclude_file_type: Optional[List[str]] = Field(default=None, description="Document types to exclude (must_not)")
+    exclude_themes: Optional[List[str]] = Field(default=None, description="Document themes to exclude (must_not)")
 
     @model_validator(mode="after")
     def _reject_empty_block(self):
@@ -84,7 +86,8 @@ class FilterBlock(BaseModel):
             value and any(str(item).strip() for item in value)
             for value in (
                 self.categories, self.organizations, self.resource_type,
-                self.file_type, self.exclude_organizations, self.exclude_file_type,
+                self.file_type, self.themes, self.exclude_organizations,
+                self.exclude_file_type, self.exclude_themes,
             )
         )
         if not has_value:
@@ -125,6 +128,11 @@ class PrioritizedSearchRequest(BaseModel):
         default=None,
         description="Optional list of document types to filter (searches in 'metadata.type' field, OR condition)"
     )
+    themes: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of document themes to filter (searches the top-level 'theme' field, "
+                    "OR condition, case-sensitive). Documents without a theme are dropped."
+    )
     exclude_organizations: Optional[List[str]] = Field(
         default=None,
         description="Optional list of company names to exclude (must_not on 'metadata.company'). "
@@ -135,6 +143,11 @@ class PrioritizedSearchRequest(BaseModel):
         description="Optional list of document types to exclude (must_not on 'metadata.type'). "
                     "A document matching any listed value is dropped."
     )
+    exclude_themes: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of document themes to exclude (must_not on the top-level 'theme'). "
+                    "A document matching any listed value is dropped; documents without a theme are kept."
+    )
     any_of: Optional[List[FilterBlock]] = Field(
         default=None,
         description="Optional list of alternatives, at least one of which must match "
@@ -144,7 +157,7 @@ class PrioritizedSearchRequest(BaseModel):
                     "Use it only for an OR that joins two different fields, e.g. "
                     "'PDFs from shikshalokam, or DOCX from csf'. An OR between values "
                     "of one field is just a longer list on that field, and an exclusion "
-                    "is exclude_organizations/exclude_file_type — neither needs any_of."
+                    "is exclude_organizations/exclude_file_type/exclude_themes — neither needs any_of."
     )
     search_mode: Literal["hybrid", "semantic"] = Field(
         default="hybrid",
@@ -183,6 +196,11 @@ class SearchResultItem(BaseModel):
     title: Optional[str] = None
     summary: Optional[str] = None
     tags: Optional[List[str]] = None
+    theme: Optional[str] = Field(
+        default=None,
+        description="Document theme (top-level payload key, KEYWORD-indexed, never embedded). "
+                    "None when the document has no theme."
+    )
     metadata: Dict[str, Any]
     source_id: str
     score: float

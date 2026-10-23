@@ -1,13 +1,16 @@
 import uuid
+import asyncio
 import logging
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 from fastapi import HTTPException, UploadFile
 from qdrant_client import models
 from app.services.document_operations.base_operation import BaseDocumentOperation
-from app.core.clients.qdrant import upload_to_qdrant
+from app.core.clients.qdrant import upload_to_qdrant, qdrant_client
 from app.core.clients.embedding import generate_embeddings, validate_vector
 from app.config import settings
+from app.constants import messages as msg
+from app.constants import constants as const
 from app.services.file_processors.csv_processor import CSVProcessor
 from app.services.file_processors.pdf_processor import PDFProcessor
 from app.services.file_processors.docx_processor import DOCXProcessor
@@ -16,6 +19,9 @@ from app.services.file_processors.text_processor import TextProcessor
 from app.services.url_text_extractor import URLTextExtractor
 
 logger = logging.getLogger(__name__)
+
+# Holds running background rollback tasks so asyncio doesn't garbage-collect them early
+_background_rollback_tasks: set = set()
 
 
 class UploadService(BaseDocumentOperation):
@@ -39,40 +45,184 @@ class UploadService(BaseDocumentOperation):
         """Get list of all supported file types"""
         return list(self.processor_map.keys())
 
+    def validate_upload_file(self, file: UploadFile, check_type: bool = True) -> str:
+        """Validate the uploaded file's name/type/declared size; returns the lowercase extension"""
+        if file is None or not file.filename or not file.filename.strip():
+            raise HTTPException(status_code=400, detail=msg.FILE_WITH_FILENAME_REQUIRED)
+
+        # Reject unsupported types up front — a clear 400, not a late processor failure
+        file_extension = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+        if check_type and f".{file_extension}" not in self.processor_map:
+            raise HTTPException(
+                status_code=400,
+                detail=msg.UNSUPPORTED_FILE_TYPE.format(
+                    extension=file_extension or "none", supported_types=self.get_supported_file_types()
+                )
+            )
+
+        # Quick check using the declared size; validate_file_content() re-checks the real bytes
+        if file.size is not None and file.size > self._max_file_size_bytes():
+            raise self._file_too_large()
+        return file_extension or "txt"
+
+    def validate_file_content(self, file_content: bytes) -> None:
+        """Reject empty or oversized file bodies"""
+        if not file_content:
+            raise HTTPException(status_code=400, detail=msg.UPLOADED_FILE_EMPTY)
+        if len(file_content) > self._max_file_size_bytes():
+            raise self._file_too_large()
+
+    @staticmethod
+    def _max_file_size_bytes() -> int:
+        return settings.MAX_FILE_SIZE_MB * 1024 * 1024
+
+    @staticmethod
+    def _file_too_large() -> HTTPException:
+        return HTTPException(
+            status_code=413,
+            detail=msg.FILE_TOO_LARGE.format(max_size_mb=settings.MAX_FILE_SIZE_MB)
+        )
+
+    @staticmethod
+    def _delete_points(point_ids: list) -> None:
+        """Delete exactly these point ids (never another request's points)"""
+        qdrant_client.delete(
+            collection_name=settings.COLLECTION_NAME,
+            points_selector=models.PointIdsList(points=point_ids),
+        )
+
+    async def _rollback_points(self, point_ids: list, source_id: str,
+                               reason: str = const.ROLLBACK_REASON_PARTIAL_UPLOAD) -> bool:
+        """Delete these point ids, retrying briefly; True once they are gone.
+
+        reason only labels the log lines (UpdateService reuses this to remove an old version).
+        """
+        max_attempts = max(1, settings.UPLOAD_ROLLBACK_MAX_ATTEMPTS)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._delete_points(point_ids)
+                logger.warning(f"Deleted {len(point_ids)} points for source_id {source_id} ({reason})")
+                return True
+            except Exception as exc:
+                logger.warning(
+                    f"Delete attempt {attempt}/{max_attempts} for source_id {source_id} ({reason}) failed: {exc}"
+                )
+                # Qdrant just failed the upload, so give it a moment before trying again (0.5s, 1s, ...)
+                if attempt < max_attempts:
+                    await asyncio.sleep(settings.UPLOAD_ROLLBACK_RETRY_WAIT_SECONDS * 2 ** (attempt - 1))
+        return False
+
+    async def _background_rollback(self, point_ids: list, source_id: str,
+                                   reason: str = const.ROLLBACK_REASON_PARTIAL_UPLOAD) -> None:
+        """Keep retrying the delete after the request has returned"""
+        for attempt in range(1, settings.UPLOAD_ROLLBACK_BACKGROUND_MAX_ATTEMPTS + 1):
+            # Backoff doubles each attempt, capped at the max wait (2, 4, 8, ... 60s)
+            wait_seconds = min(
+                settings.UPLOAD_ROLLBACK_BACKGROUND_FIRST_WAIT_SECONDS * 2 ** (attempt - 1),
+                settings.UPLOAD_ROLLBACK_BACKGROUND_MAX_WAIT_SECONDS,
+            )
+            await asyncio.sleep(wait_seconds)
+            try:
+                # The Qdrant client is synchronous; run it off the event loop
+                await asyncio.to_thread(self._delete_points, point_ids)
+                logger.warning(
+                    f"Background delete removed {len(point_ids)} points for source_id {source_id} "
+                    f"({reason}, attempt {attempt})"
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    f"Background delete attempt {attempt} for source_id {source_id} ({reason}) failed: {exc}"
+                )
+
+        # Out of retries — log ids here for manual cleanup
+        logger.error(
+            f"Background delete gave up for source_id {source_id} ({reason}); {len(point_ids)} points may "
+            f"remain searchable. Point IDs: {point_ids}"
+        )
+
+    def _schedule_background_rollback(self, point_ids: list, source_id: str,
+                                      reason: str = const.ROLLBACK_REASON_PARTIAL_UPLOAD) -> None:
+        """Start the background delete and keep a reference until it finishes"""
+        task = asyncio.create_task(self._background_rollback(list(point_ids), source_id, reason))
+        _background_rollback_tasks.add(task)
+        task.add_done_callback(_background_rollback_tasks.discard)
+
+    async def _ensure_upload_complete(self, upload_results: dict, source_id: str,
+                                      company_id: Optional[str] = None) -> None:
+        """Fail the request (and roll back this request's points) on an empty or partial upload"""
+        if upload_results.get("success_count", 0) == 0 and upload_results.get("error_count", 0) == 0:
+            raise HTTPException(
+                status_code=500,
+                detail=msg.NO_VALID_CHUNKS_TO_UPLOAD
+            )
+        if upload_results.get("error_count", 0) == 0:
+            return
+
+        # Some batches failed — delete only this request's own points, so no half-indexed
+        # document is left behind.
+        point_ids = upload_results.get("point_ids") or []
+        error_count = upload_results["error_count"]
+        total_points = upload_results.get("total_points", len(point_ids))
+        rolled_back = await self._rollback_points(point_ids, source_id) if point_ids else True
+
+        if rolled_back:
+            raise HTTPException(
+                status_code=502,
+                detail=msg.PARTIAL_UPLOAD_ROLLED_BACK.format(
+                    source_id=source_id, error_count=error_count, total_points=total_points
+                ),
+            )
+
+        # Rollback still failing — log ids, retry in background, tell the caller the truth
+        logger.error(
+            f"Rollback of partial upload failed for source_id {source_id} (company_id {company_id}); "
+            f"{len(point_ids)} points may remain searchable. Point IDs: {point_ids}"
+        )
+        self._schedule_background_rollback(point_ids, source_id)
+        raise HTTPException(
+            status_code=502,
+            detail=msg.PARTIAL_UPLOAD_ROLLBACK_FAILED.format(
+                source_id=source_id, error_count=error_count, total_points=total_points,
+                stored_count=upload_results.get("success_count", 0),
+            ),
+        )
+
     async def process(self, file: UploadFile, priority: str, metadata: Dict[str, Any] = None,
                       source_id: str = None, company_id: str = None,
-                      title: str = None, summary: str = None, tags: List[str] = None):
-        """Process file upload with company_id support"""
-        try:
-            # Validate inputs
-            self.validate_source_id(source_id)
-            self.validate_priority(priority)
+                      title: str = None, summary: str = None, tags: List[str] = None,
+                      theme: str = None, add_updated_at: bool = True):
+        """Process file upload with company_id support.
 
-            # Use metadata dict directly (already parsed by endpoint)
-            additional_metadata = metadata if metadata else {}
+        add_updated_at=False (a replace of a stored document that has no updated_at) stores
+        the chunks without metadata.updated_at; POST and every other caller keep the default.
+        """
+        try:
+            # Validate everything up front — a bad request should never reach
+            # parsing, embedding or Qdrant.
+            source_id = self.validate_source_id(source_id, strict=True)
+            priority = self.validate_priority(priority)
+            company_id, title, summary, tags, additional_metadata = self.validate_document_fields(
+                source_id, company_id, title, summary, tags, metadata
+            )
+            # Moves any metadata theme to the top level, so it's never stored or embedded
+            theme = self.validate_theme(theme, additional_metadata)
             logger.info(f"Received metadata: {additional_metadata}")
 
             # Add company_id to metadata if provided
             if company_id:
                 additional_metadata['company'] = company_id
-            
-            # Add title, summary, and tags to metadata if provided
-            if title:
-                additional_metadata['title'] = title
-            if summary:
-                additional_metadata['summary'] = summary
-            if tags:
-                # Tags are already a list
-                additional_metadata['tags'] = tags
+
+            # markdown_url means content comes from the URL, so the file itself
+            # is not parsed or type-checked.
+            use_markdown_url = bool(additional_metadata.get('markdown_url'))
+            file_extension = self.validate_upload_file(file, check_type=not use_markdown_url)
 
             # Ensure collections exist
             await self.ensure_collections()
 
-            # Initialize file_extension
-            file_extension = file.filename.split(".")[-1].lower() if file.filename else "txt"
-
             # Check if markdown_url is present in metadata
-            if additional_metadata and 'markdown_url' in additional_metadata and additional_metadata['markdown_url']:
+            if use_markdown_url:
                 # Extract text from URL instead of processing file
                 url = additional_metadata['markdown_url']
                 logger.info(f"Extracting text from markdown_url: {url}")
@@ -81,8 +231,9 @@ class UploadService(BaseDocumentOperation):
                 )
                 file_extension = "url_extracted"  # Mark as URL-extracted content
             else:
-                # Process file based on type (normal flow)
+                # Re-check size/emptiness on the actual bytes — UploadFile.size isn't always set
                 file_content = await file.read()
+                self.validate_file_content(file_content)
 
                 processed_chunks = await self._process_file_by_type(
                     file_content, file.filename, priority, file_extension
@@ -91,17 +242,22 @@ class UploadService(BaseDocumentOperation):
             if not processed_chunks:
                 raise HTTPException(
                     status_code=400,
-                    detail="No content could be extracted from the file."
+                    detail=msg.NO_CONTENT_EXTRACTED
                 )
 
             # Generate embeddings and upload
             upload_results = await self._upload_chunks(
-                processed_chunks, additional_metadata, source_id, company_id, title, summary, tags
+                processed_chunks, additional_metadata, source_id, company_id, title, summary, tags,
+                theme=theme, add_updated_at=add_updated_at
             )
+
+            # Per-batch upload errors are only counted, not raised — fail here instead of
+            # returning 201 on a partial or empty upload.
+            await self._ensure_upload_complete(upload_results, source_id, company_id)
 
             return {
                 "status": "success",
-                "message": f"Successfully processed {len(processed_chunks)} chunks from {file.filename}",
+                "message": msg.UPLOAD_SUCCEEDED.format(chunk_count=len(processed_chunks), filename=file.filename),
                 "chunks_processed": len(processed_chunks),
                 "points_uploaded": upload_results['success_count'],
                 "upload_failures": upload_results['error_count'],
@@ -112,10 +268,12 @@ class UploadService(BaseDocumentOperation):
                 "title": title,
                 "summary": summary,
                 "tags": tags,
+                "theme": theme,
                 "supported_file_types": self.get_supported_file_types(),
+                # The merged, stored metadata (incl. source_id) — not the raw processor output
                 "sample_chunk": {
                     "text": processed_chunks[0]["text"] if processed_chunks else None,
-                    "metadata": processed_chunks[0]["metadata"] if processed_chunks else None,
+                    "metadata": upload_results.get("sample_metadata"),
                 },
             }
 
@@ -123,7 +281,7 @@ class UploadService(BaseDocumentOperation):
             raise
         except Exception as e:
             logger.error(f"Upload failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=msg.UPLOAD_FAILED.format(error=e))
 
     async def _process_file_by_type(self, file_content: bytes, filename: str,
                                     priority: str, file_extension: str):
@@ -133,8 +291,9 @@ class UploadService(BaseDocumentOperation):
         if not processor:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported file type: {file_extension}. "
-                       f"Supported types: {self.get_supported_file_types()}"
+                detail=msg.UNSUPPORTED_FILE_TYPE.format(
+                    extension=file_extension, supported_types=self.get_supported_file_types()
+                )
             )
 
         logger.info(f"Using {processor.__class__.__name__} for file {filename}")
@@ -146,7 +305,7 @@ class UploadService(BaseDocumentOperation):
             # Extract text from URL
             url_extractor = URLTextExtractor()
             extracted_text = await url_extractor.extract_text(url)
-            
+
             logger.info(f"Extracted {len(extracted_text)} characters from URL: {url}")
             
             # Import required modules for direct chunking
@@ -162,7 +321,7 @@ class UploadService(BaseDocumentOperation):
                     "source": filename,
                     "type": "url_extracted",
                     "priority": priority,
-                    "is_markdown": False  # Force plain text processing
+                    "is_markdown": False  # not markdown — use plain character splitting below
                 }
             )
             
@@ -204,7 +363,7 @@ class UploadService(BaseDocumentOperation):
             logger.error(f"Error processing URL text: {str(e)}")
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to process URL text: {str(e)}"
+                detail=msg.URL_TEXT_PROCESSING_FAILED.format(error=e)
             )
 
     def parse_tags(self, tags: str) -> list:
@@ -248,38 +407,68 @@ class UploadService(BaseDocumentOperation):
         
         return embeddings
 
+    @staticmethod
+    def _validate_chunks(processed_chunks: List[dict]) -> None:
+        """Reject processor output with a malformed chunk before anything is embedded or stored"""
+        invalid = [
+            idx for idx, chunk in enumerate(processed_chunks)
+            if not isinstance(chunk, dict) or not {"id", "text", "metadata"} <= chunk.keys()
+        ]
+        if invalid:
+            logger.error(f"Processor returned {len(invalid)} malformed chunks at positions {invalid}")
+            raise HTTPException(
+                status_code=500,
+                detail=msg.INVALID_CHUNKS.format(
+                    invalid_count=len(invalid), chunk_count=len(processed_chunks)
+                ),
+            )
+
     def _prepare_chunk_metadata(self, chunk: dict, additional_metadata: dict, 
-                                source_id: str, company_id: str, 
-                                title: str, summary: str, tags: List[str]):
+                                source_id: str, company_id: str,
+                                title: str, summary: str, tags: List[str],
+                                add_updated_at: bool = True):
         """Prepare and merge metadata for a chunk"""
         if not isinstance(chunk["metadata"], dict):
             logger.warning("Chunk metadata is not a dict, initializing empty dict")
-            chunk_metadata = {}
+            processor_metadata = {}
         else:
-            chunk_metadata = chunk["metadata"].copy()
+            processor_metadata = chunk["metadata"]
 
-        if additional_metadata:
-            chunk_metadata.update(additional_metadata)
+        # Processor metadata (source, type, is_hindi, total_chunks — backs the file_type
+        # filter) always wins over caller metadata with the same keys.
+        chunk_metadata = dict(additional_metadata) if additional_metadata else {}
+        chunk_metadata.update(processor_metadata)
 
-        if company_id and 'company' not in chunk_metadata:
+        # Keep a conflicting caller value instead of dropping it (e.g. commons-backend
+        # sends source="file" and type=<MIME type>) under non-colliding keys.
+        for key, preserved_key in (("source", "origin"), ("type", "mime_type")):
+            caller_value = (additional_metadata or {}).get(key)
+            if caller_value is not None and caller_value != processor_metadata.get(key):
+                chunk_metadata.setdefault(preserved_key, caller_value)
+
+        # company is the organization filter key; always the validated company_id.
+        if company_id:
             chunk_metadata['company'] = company_id
         
-        if title and 'title' not in chunk_metadata:
-            chunk_metadata['title'] = title
-        
-        if summary and 'summary' not in chunk_metadata:
-            chunk_metadata['summary'] = summary
-        
-        if tags and 'tags' not in chunk_metadata:
-            chunk_metadata['tags'] = tags
-        
+        # title/summary/tags live once at the payload top level — drop the metadata copy
+        # only when the top level has it or it's empty (commons sends tags: []).
+        top_level = {"title": title, "summary": summary, "tags": tags}
+        for field in settings.OMITTED_FIELDS_FROM_METADATA:
+            if field in chunk_metadata and (top_level.get(field) or not chunk_metadata[field]):
+                del chunk_metadata[field]
+
         if source_id:
             chunk_metadata['source_id'] = source_id
         
         current_time = datetime.now().isoformat()
         chunk_metadata['created_at'] = current_time
-        chunk_metadata['updated_at'] = current_time
-        
+        # A replace keeps updated_at only if the stored document had it; when it did not,
+        # the caller's copy is dropped too, so the new version does not gain the key.
+        if add_updated_at:
+            chunk_metadata['updated_at'] = current_time
+        else:
+            chunk_metadata.pop('updated_at', None)
+
         return chunk_metadata
 
     def _create_point_vectors(self, text_embedding, field_embeddings: dict, sparse_vector=None):
@@ -304,12 +493,21 @@ class UploadService(BaseDocumentOperation):
 
     async def _upload_chunks(self, processed_chunks: List[dict], additional_metadata: dict,
                              source_id: str, company_id: str = None,
-                             title: str = None, summary: str = None, tags: List[str] = None):
+                             title: str = None, summary: str = None, tags: List[str] = None,
+                             theme: str = None, add_updated_at: bool = True):
         """Generate embeddings and upload chunks to Qdrant with separate embeddings for title, summary, and text"""
+        # Fail the whole request on a bad chunk, before embedding/writing anything —
+        # skipping it would store a silent gap and still report success.
+        self._validate_chunks(processed_chunks)
+
         logger.info(f"Generating embeddings for {len(processed_chunks)} chunks")
         text_embeddings = generate_embeddings([chunk["text"] for chunk in processed_chunks])
 
-        field_embeddings = self._generate_field_embeddings(title, summary, tags, additional_metadata)
+        # metadata vector still embeds title/summary/tags, even though they're no
+        # longer stored under metadata — keeps ranking unchanged.
+        embedding_metadata = dict(additional_metadata or {})
+        embedding_metadata.update({k: v for k, v in (("title", title), ("summary", summary), ("tags", tags)) if v})
+        field_embeddings = self._generate_field_embeddings(title, summary, tags, embedding_metadata)
 
         # Phase 2: generate BM25 sparse vectors when enabled.
         sparse_vectors: List[object] = []
@@ -330,19 +528,14 @@ class UploadService(BaseDocumentOperation):
                 )
                 sparse_vectors = []
 
+        # strict zip raises on an embedding-count mismatch instead of silently
+        # dropping chunks, so total_points always equals chunks_processed.
         points = []
-        for idx, (chunk, text_embedding) in enumerate(zip(processed_chunks, text_embeddings)):
-            if not isinstance(chunk, dict):
-                logger.error(f"Invalid chunk type: {type(chunk)}")
-                continue
-
-            if "id" not in chunk or "text" not in chunk or "metadata" not in chunk:
-                logger.error(f"Chunk missing required fields: {chunk.keys()}")
-                continue
-
+        for idx, (chunk, text_embedding) in enumerate(zip(processed_chunks, text_embeddings, strict=True)):
             chunk_id = str(chunk["id"])
             chunk_metadata = self._prepare_chunk_metadata(
-                chunk, additional_metadata, source_id, company_id, title, summary, tags
+                chunk, additional_metadata, source_id, company_id, title, summary, tags,
+                add_updated_at=add_updated_at
             )
 
             payload = {
@@ -351,7 +544,9 @@ class UploadService(BaseDocumentOperation):
                 "source_id": source_id,
                 "title": title if title else None,
                 "summary": summary if summary else None,
-                "tags": tags if tags else None
+                "tags": tags if tags else None,
+                # theme is filter-only — never embedded, never in metadata, never affects score
+                "theme": theme,
             }
 
             sparse_vec = sparse_vectors[idx] if idx < len(sparse_vectors) else None
@@ -377,6 +572,11 @@ class UploadService(BaseDocumentOperation):
                 f"{upload_results['error_count']} failed"
             )
 
+            # point_ids back a partial-upload rollback; sample_metadata is the first
+            # point's merged metadata, returned as-is to the caller.
+            upload_results["point_ids"] = [point.id for point in points]
+            upload_results["sample_metadata"] = points[0].payload["metadata"]
             return upload_results
 
-        return {"total_points": 0, "success_count": 0, "error_count": 0}
+        return {"total_points": 0, "success_count": 0, "error_count": 0,
+                "point_ids": [], "sample_metadata": None}
