@@ -20,9 +20,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
-    # Intentional no-op: `translations` predates Alembic and is created by
-    # Base.metadata.create_all() in app/core/database.py, which stays in place.
-    # This revision only establishes a starting point for future migrations.
+    # No-op starting point: `translations` predates Alembic and is created by init_db() at startup.
     pass
 
 

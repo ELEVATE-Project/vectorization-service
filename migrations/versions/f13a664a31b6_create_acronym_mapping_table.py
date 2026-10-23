@@ -6,7 +6,7 @@ Create Date: 2026-08-11 16:21:22.416872
 
 Edited before production; it now creates an identity `id` primary key. Tables made
 by its earlier versions are converted by 5b7dea819fa4, so `alembic upgrade head`
-gives the same table everywhere. See design notes, Schema history.
+gives the same table everywhere. See design notes, Database.
 """
 import csv
 import logging
@@ -59,9 +59,7 @@ def _load_seed_rows() -> list:
                 f"{sorted(REQUIRED_CSV_COLUMNS)}, found {reader.fieldnames}"
             )
         now = datetime.now(timezone.utc)
-        # All rows go into one INSERT, so one bad row would fail the migration.
-        # Skip rows with no expansions or a too-long acronym (with a warning);
-        # for a repeated acronym the last row wins, like the bulk upload.
+        # One bad row would fail the single INSERT: skip empty or too-long rows; the last repeat wins.
         by_acronym = {}
         for line_no, row in enumerate(reader, start=2):
             acronym = (row.get('acronym') or '').strip().upper()

@@ -261,17 +261,23 @@ class SearchResultItem(BaseModel):
     )
     title_expansion_multiplier: Optional[float] = Field(
         default=None,
-        description="Acronym queries: boost factor applied because the title matched the "
-                    "query with the acronym written out (ACRONYM_EXPANSION_EXACT_TITLE_BOOST / "
-                    "ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST). Stacks with title_multiplier: a document "
-                    "matching both gets both. 1.0 means no boost. Debug-only (include_scoring_debug=true)."
+        description=(
+            "Additional boost applied when an acronym query matches its expanded form in the title. "
+            "Uses ACRONYM_EXPANSION_EXACT_TITLE_BOOST or ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST, "
+            "depending on the match type. Applied on top of title_multiplier: when both match, the "
+            "score is multiplied by both (capped at 1.0). A value of 1.0 means no additional boost. "
+            "Only available when include_scoring_debug=true."
+        ),
     )
     summary_expansion_multiplier: Optional[float] = Field(
         default=None,
-        description="Acronym queries: the same for the summary "
-                    "(ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST / ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST). "
-                    "Stacks with summary_multiplier. 1.0 means no "
-                    "boost. Debug-only (include_scoring_debug=true)."
+        description=(
+            "Additional boost applied when an acronym query matches its expanded form in the summary. "
+            "Uses ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST or ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST, "
+            "depending on the match type. Applied on top of summary_multiplier: when both match, the "
+            "score is multiplied by both (capped at 1.0). A value of 1.0 means no additional boost. "
+            "Only available when include_scoring_debug=true."
+        ),
     )
     title_match: Optional[str] = Field(
         default=None,
@@ -283,15 +289,22 @@ class SearchResultItem(BaseModel):
     )
     title_expansion_match: Optional[str] = Field(
         default=None,
-        description="Acronym queries: how the title matched the query with the acronym "
-                    "written out ('PTM document' -> 'Parent Teacher Meeting document'): "
-                    "'exact', 'partial', or None. Goes with title_expansion_multiplier; "
-                    "title_match covers the query as typed only. Debug-only (include_scoring_debug=true)."
+        description=(
+            "Indicates how the title matched the expanded form of an acronym in the query "
+            "(e.g., 'PTM document' matching 'Parent Teacher Meeting document'). "
+            "Possible values: 'exact', 'partial', or None if no match. "
+            "Complements title_match, which represents the match against the original query. "
+            "Only available when include_scoring_debug=true."
+        ),
     )
     summary_expansion_match: Optional[str] = Field(
         default=None,
-        description="Acronym queries: the same for the summary. Goes with "
-                    "summary_expansion_multiplier. Debug-only (include_scoring_debug=true)."
+        description=(
+            "Indicates how the summary matched the expanded form of an acronym in the query. "
+            "Possible values: 'exact', 'partial', or None if no match. "
+            "Complements summary_match, which represents the match against the original query. "
+            "Only available when include_scoring_debug=true."
+        ),
     )
 
 class PrioritizedSearchResponse(BaseModel):
@@ -305,12 +318,13 @@ class PrioritizedSearchResponse(BaseModel):
     )
     acronym_info: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Acronym detection for this query: enabled (ACRONYM_SEARCH_ENABLED), "
-                    "detected (an acronym was found), method (ACRONYM_SEARCH_METHOD: inline "
-                    "or max; only when enabled) with method_description (the method in words), "
-                    "and when detected the mapping "
-                    "{acronym: expansions} plus ambiguous (acronyms with several meanings). "
-                    "None only when the request had no query text."
+        description=(
+            "Provides acronym detection details for the query, including whether detection is enabled "
+            "and whether an acronym was found. When enabled, includes the detection method "
+            "('inline' or 'dual_query') and its description. When an acronym is detected, includes the "
+            "acronym-to-expansions mapping and any ambiguous acronyms with multiple meanings. "
+            "None only when the request contains no query text."
+        ),
     )
 
 class TextSearchRequest(BaseModel):
@@ -348,9 +362,7 @@ class AcronymBulkUploadResponse(BaseModel):
     received: int
     created: int
     updated: int
-    # Rows in this batch whose is_active was set to false. A SUBSET of
-    # created + updated, not a separate category — without it a batch that
-    # disables 30 acronyms is indistinguishable from one that edits them.
+    # Rows set to is_active=false; also counted in created or updated.
     deactivated: int
     # False: the rows are saved, but the cache could not be updated, so old values
     # may be served until REDIS_CACHE_TTL ends. Clear the cache; do not re-upload.
@@ -366,6 +378,8 @@ class AcronymItem(BaseModel):
     expansions: List[str]
     description: Optional[str] = None
     is_active: bool
+    created_by: str
+    updated_by: str
     created_at: datetime
     updated_at: datetime
 

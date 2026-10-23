@@ -9,16 +9,25 @@ Usage: from app.constants import messages as msg
 """
 
 # =============================================================================
-# Internal and admin tokens (app/api/deps.py)
+# Internal token (app/api/deps.py)
 # =============================================================================
 
 # A missing token and a wrong one get the same 401
 INTERNAL_TOKEN_INVALID = "Invalid or missing internal token"
-ADMIN_TOKEN_INVALID = "Invalid or missing admin token"
 
 
 # =============================================================================
-# Acronym bulk upload (POST /api/acronyms/bulk)
+# Startup (app/main.py)
+# =============================================================================
+
+ENV_VARIABLES_MISSING = (
+    "Server could not start. Not all environment variables are provided: {missing}. "
+    "Set them in .env (see release-doc/release-2.2.0.md)."
+)
+
+
+# =============================================================================
+# Acronym bulk upload (POST /api/acronyms/bulkUpload)
 # =============================================================================
 
 # File checks before any row is read
@@ -26,9 +35,22 @@ ACRONYM_CSV_TOO_LARGE = "File exceeds max size of {max_size_mb}MB"
 ACRONYM_CSV_NOT_UTF8 = "File must be UTF-8 encoded"
 ACRONYM_CSV_MISSING_COLUMNS = "CSV must have columns {required_columns}, found {found_columns}"
 ACRONYM_CSV_NO_DATA_ROWS = "CSV file has no data rows"
+ACRONYM_CSV_DUPLICATE_COLUMNS = "CSV has duplicate columns: {columns}"
+ACRONYM_CSV_UNSUPPORTED_COLUMNS = "CSV has unsupported columns: {columns}; allowed: {allowed}"
+ACRONYM_CSV_UNNAMED_COLUMN_HAS_VALUES = (
+    "CSV column {position} has no name but has values; name it or remove it"
+)
 
 # Per-row errors (errors[].reason); the other rows still commit
-ACRONYM_ROW_EMPTY = "acronym and expansions must be non-empty after trimming whitespace"
+ACRONYM_ROW_FIELD_COUNT = (
+    "row has {found} fields, expected {expected}; "
+    "a value that contains a comma must be in double quotes"
+)
+ACRONYM_ROW_EMPTY = (
+    "acronym and expansions must be non-empty after trimming whitespace "
+    "(expansions may be empty when is_active is false)"
+)
+ACRONYM_ROW_NOT_FOUND = "acronym does not exist, so it cannot be deactivated"
 ACRONYM_ROW_INVALID_KEY = (
     "acronym must be letters only (1-{max_words} space-separated words; "
     "a lone word needs at least 2 letters) — this can never be "
@@ -49,18 +71,21 @@ ACRONYM_UPLOAD_DB_ERROR = (
 # Acronym search (POST /documents/search, acronym_info.method_description)
 # =============================================================================
 
-ACRONYM_METHOD_MAX = (
-    "The query and the query with each acronym written out are searched "
-    "separately, for meaning and for keywords; each field keeps the higher score."
+# acronym_info.method_description has three keys: semantic, keyword, boosting.
+ACRONYM_SEMANTIC_INLINE = (
+    "One search text with each acronym's meaning written next to it, "
+    "e.g. \"PTM (Parent Teacher Meeting) documents\"."
 )
-ACRONYM_METHOD_INLINE = (
-    "One search text with each acronym's full form written next to it, e.g. "
-    "\"PTM (Parent Teacher Meeting) documents\""
+ACRONYM_SEMANTIC_DUAL_QUERY = (
+    "The query and the query with each acronym written out "
+    "(\"Parent Teacher Meeting documents\") are searched separately; each field keeps the higher score."
 )
-# Appended to ACRONYM_METHOD_INLINE, by ACRONYM_KEYWORD_OR
-ACRONYM_METHOD_INLINE_KEYWORD_OR = (
-    "; the keyword search runs once for the query and once more for each "
-    "meaning, with every acronym replaced by that meaning (\"Parent Teacher "
-    "Meeting documents\"), and each chunk keeps the higher keyword score."
+ACRONYM_KEYWORD_SINGLE = "One search with the words of the query and of every meaning."
+ACRONYM_KEYWORD_PER_MEANING = (
+    "One search for the query and one for each meaning; each chunk keeps the higher score."
 )
-ACRONYM_METHOD_INLINE_KEYWORD = "; one keyword search with the words of the query and of every full form."
+ACRONYM_BOOSTING = (
+    "A title that equals or contains the query with the acronym written out gets "
+    "x{exact_title} or x{partial_title}, a summary x{exact_summary} or x{partial_summary}, "
+    "on top of the normal title and summary boosts (hybrid mode only)."
+)

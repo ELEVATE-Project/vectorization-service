@@ -7,18 +7,17 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import verify_admin_token, verify_internal_token
+from app.api.deps import verify_internal_token
 from app.config import settings
-from app.constants import constants as const
 from app.constants import messages as msg
 from app.models.api_models import AcronymBulkUploadResponse, AcronymItem, AcronymListResponse
 from app.services.acronym_service import (
     bulk_upsert,
     invalidate_cache,
     list_acronyms,
-    mark_deactivated_in_cache,
-    refresh_cache,
+    load_acronym_cache,
 )
+from app.validations.acronym import AcronymCsvError, validate_csv_header, validate_csv_rows_present
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -52,6 +51,8 @@ async def get_acronyms(
                 expansions=row.expansions,
                 description=row.description,
                 is_active=row.is_active,
+                created_by=row.created_by,
+                updated_by=row.updated_by,
                 created_at=row.created_at,
                 updated_at=row.updated_at,
             )
@@ -61,14 +62,14 @@ async def get_acronyms(
 
 
 @router.post(
-    "/bulk",
+    "/bulkUpload",
     response_model=AcronymBulkUploadResponse,
-    dependencies=[Depends(verify_internal_token), Depends(verify_admin_token)],
+    dependencies=[Depends(verify_internal_token)],
 )
 async def bulk_upload_acronyms(file: UploadFile = File(...)):
     """Upsert acronyms from a CSV: acronym, expansions (pipe-separated), description, is_active.
 
-    Needs both tokens. Bad rows are reported in `errors`; the rest commit.
+    Needs internal_access_token. Bad rows are reported in `errors`; the rest commit.
     """
     max_bytes = settings.ACRONYM_BULK_UPLOAD_MAX_SIZE_MB * 1024 * 1024
     # One byte past the limit is enough to know it's too big, without pulling
@@ -88,50 +89,34 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=msg.ACRONYM_CSV_NOT_UTF8)
 
     reader = csv.DictReader(io.StringIO(text))
-    required_columns = {const.ACRONYM_CSV_COLUMN_ACRONYM, const.ACRONYM_CSV_COLUMN_EXPANSIONS}
-    if not reader.fieldnames or not required_columns.issubset(reader.fieldnames):
-        raise HTTPException(
-            status_code=400,
-            detail=msg.ACRONYM_CSV_MISSING_COLUMNS.format(
-                required_columns=sorted(required_columns), found_columns=reader.fieldnames
-            ),
-        )
+    try:
+        names, unnamed = validate_csv_header(reader.fieldnames or [])
+        reader.fieldnames = names
+        rows = list(reader)
+        validate_csv_rows_present(rows, names, unnamed)
+    except AcronymCsvError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    rows = list(reader)
-    if not rows:
-        raise HTTPException(status_code=400, detail=msg.ACRONYM_CSV_NO_DATA_ROWS)
-
-    # bulk_upsert/refresh_cache/invalidate_cache are all synchronous, blocking
+    # bulk_upsert/invalidate_cache/load_acronym_cache are all synchronous, blocking
     # Postgres/Redis I/O — run_in_threadpool keeps them off the event loop.
     try:
         created, updated, deactivated, errors = await run_in_threadpool(bulk_upsert, rows)
     except SQLAlchemyError as e:
-        # One transaction, so usually nothing was saved — but a connection lost during
-        # the commit can leave it saved without confirmation. Retrying is safe: the
-        # upload is an upsert, so repeating the file gives the same rows.
+        # A lost connection during commit can still have saved it; a retry is safe (upsert).
         logger.error(f"Acronym bulk upload failed in the database, outcome unconfirmed: {e}")
         raise HTTPException(
             status_code=503 if isinstance(e, OperationalError) else 500,
             detail=msg.ACRONYM_UPLOAD_DB_ERROR,
         ) from e
 
-    # Committed already; now refresh active rows and mark deactivated ones.
+    # Committed already; delete the uploaded keys, then reload every active acronym.
+    # Deactivated keys stay deleted, since the reload writes active ones only.
     # cache_refreshed=False means stale entries may be served. See design notes.
     cache_refreshed = True
     if created or updated:
-        active_batch = [a for a in (created + updated) if a not in deactivated]
-        try:
-            if active_batch:
-                await run_in_threadpool(refresh_cache, active_batch)
-            if deactivated:
-                cache_refreshed = await run_in_threadpool(mark_deactivated_in_cache, deactivated)
-        except Exception as e:
-            logger.warning(f"Cache refresh failed after bulk upload, invalidating instead: {e}")
-            # Delete active keys (reload on next lookup); deactivated keys still get
-            # their marker, since an empty key could be refilled with the old value.
-            invalidated = await run_in_threadpool(invalidate_cache, active_batch)
-            marked = await run_in_threadpool(mark_deactivated_in_cache, deactivated)
-            cache_refreshed = invalidated and marked
+        deleted = await run_in_threadpool(invalidate_cache, created + updated)
+        reloaded = await run_in_threadpool(load_acronym_cache)
+        cache_refreshed = deleted and reloaded
 
     if not cache_refreshed:
         logger.warning(
