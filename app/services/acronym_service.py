@@ -37,7 +37,8 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
     if not normalized:
         return {}
 
-    if not settings.CACHE_ENABLED:
+    cache_enabled = settings.CACHE_ENABLED
+    if not cache_enabled:
         cached_values = [None] * len(normalized)
     else:
         keys = [_cache_key(a) for a in normalized]
@@ -108,7 +109,7 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
             f"Acronym batch DB lookup failed for {len(missing)} acronym(s), "
             f"treating as not found: {e}"
         )
-        if settings.CACHE_ENABLED:
+        if cache_enabled:
             try:
                 # Remember "not an acronym" for only REDIS_DB_ERROR_CACHE_TTL (30 s): searches
                 # stop asking the broken database, but real acronyms come back soon after it
@@ -145,7 +146,7 @@ def get_expansions_batch(acronyms: List[str]) -> Dict[str, List[str]]:
         if acronym not in broken:
             writes[_cache_key(acronym)] = entry
 
-    if settings.CACHE_ENABLED:
+    if cache_enabled:
         try:
             cache_client.set_many_if_absent(writes)
             cache_client.delete_many([_cache_key(a) for a in broken])

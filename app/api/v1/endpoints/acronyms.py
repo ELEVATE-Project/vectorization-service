@@ -71,14 +71,15 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
 
     Needs internal_access_token. Bad rows are reported in `errors`; the rest commit.
     """
-    max_bytes = settings.ACRONYM_BULK_UPLOAD_MAX_SIZE_MB * 1024 * 1024
+    max_size_mb = settings.ACRONYM_BULK_UPLOAD_MAX_SIZE_MB
+    max_bytes = max_size_mb * 1024 * 1024
     # One byte past the limit is enough to know it's too big, without pulling
     # an oversized upload into worker memory first.
     raw = await file.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise HTTPException(
             status_code=413,
-            detail=msg.ACRONYM_CSV_TOO_LARGE.format(max_size_mb=settings.ACRONYM_BULK_UPLOAD_MAX_SIZE_MB),
+            detail=msg.ACRONYM_CSV_TOO_LARGE.format(max_size_mb=max_size_mb),
         )
 
     try:

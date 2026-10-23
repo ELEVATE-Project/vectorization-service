@@ -329,7 +329,6 @@ class TestExpansionTitleBoost:
                             lambda q: dict(PTM if acronyms is None else acronyms))
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", True)
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_METHOD", "inline")
-        monkeypatch.setattr(settings, "ACRONYM_KEYWORD_OR", False)
         monkeypatch.setattr(settings, "HYBRID_SEARCH_ENABLED", True)
         monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", False)
         monkeypatch.setattr("app.services.prioritized_search_service.embedding.embed_query",
@@ -850,7 +849,7 @@ class TestAcronymRankingFollowsLexicalRanking:
 
     def _run(self, service, monkeypatch, search_mode, hybrid_enabled=True,
              field_scores=None, acronyms=None, top_k=10, titles=None,
-             acronym_search_enabled=True, method="inline", keyword_or=False,
+             acronym_search_enabled=True, method="inline",
              scroll=False, **request_fields):
         from app.models.api_models import PrioritizedSearchRequest
 
@@ -861,7 +860,6 @@ class TestAcronymRankingFollowsLexicalRanking:
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", acronym_search_enabled)
         # Pinned, so the result does not depend on the local .env.
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_METHOD", method)
-        monkeypatch.setattr(settings, "ACRONYM_KEYWORD_OR", keyword_or)
         monkeypatch.setattr(settings, "HYBRID_SEARCH_ENABLED", hybrid_enabled)
         monkeypatch.setattr(settings, "SPARSE_SEARCH_ENABLED", False)
         monkeypatch.setattr(
@@ -976,18 +974,14 @@ class TestAcronymRankingFollowsLexicalRanking:
             expected = {**expected, **self._method_info("inline")}
         assert response.acronym_info == expected
 
-    @pytest.mark.parametrize("method, keyword_or, key, phrase", [
-        ("dual_query", False, "semantic", "searched separately"),
-        ("dual_query", True, "semantic", "searched separately"),
-        ("dual_query", False, "keyword", "one for each meaning"),
-        ("inline", False, "semantic", "written next to it"),
-        ("inline", True, "keyword", "one for each meaning"),
-        ("inline", False, "keyword", "words of the query and of every meaning"),
+    @pytest.mark.parametrize("method, key, phrase", [
+        ("dual_query", "semantic", "searched separately"),
+        ("dual_query", "keyword", "one for each meaning"),
+        ("inline", "semantic", "written next to it"),
+        ("inline", "keyword", "one for each meaning"),
     ])
-    def test_acronym_info_describes_the_method(
-            self, service, monkeypatch, method, keyword_or, key, phrase):
-        info = self._run(service, monkeypatch, "hybrid", method=method,
-                         keyword_or=keyword_or).acronym_info
+    def test_acronym_info_describes_the_method(self, service, monkeypatch, method, key, phrase):
+        info = self._run(service, monkeypatch, "hybrid", method=method).acronym_info
         assert info["method"] == method
         assert set(info["method_description"]) == {"semantic", "keyword", "boosting"}
         assert phrase in info["method_description"][key]
@@ -1007,7 +1001,7 @@ class TestAcronymScoringContext:
 
     @pytest.mark.parametrize("method", ["inline", "dual_query"])
     def test_acronym_query_reports_field_boosts(self, service, monkeypatch, method):
-        ctx = self._context(service, monkeypatch, method=method, keyword_or=True)
+        ctx = self._context(service, monkeypatch, method=method)
         # The same boosts as any other query, plus the expansion boosts.
         assert ctx["boost_config"] == {
             "exact_title_boost": settings.EXACT_TITLE_BOOST,
@@ -1024,7 +1018,7 @@ class TestAcronymScoringContext:
         assert "keyword_or_texts" not in ctx
 
     @pytest.mark.parametrize("method, dense_variants", [("inline", 1), ("dual_query", 3)])
-    def test_keyword_or_searches_every_meaning(self, monkeypatch, method, dense_variants):
+    def test_keyword_search_covers_every_meaning(self, monkeypatch, method, dense_variants):
         """The dense searches stop at ACRONYM_MAX_DENSE_VARIANTS; the keyword searches do not."""
         meanings = ["District Institute of Education and Training",
                     "Daily Intake Energy Table", "Dietary Information Exchange Tool"]
@@ -1032,7 +1026,6 @@ class TestAcronymScoringContext:
                             lambda q: {"DIET": meanings})
         monkeypatch.setattr(settings, "ACRONYM_MAX_DENSE_VARIANTS", 3)
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_METHOD", method)
-        monkeypatch.setattr(settings, "ACRONYM_KEYWORD_OR", True)
         query = acronym_search.build_acronym_query("DIET", "diet")
         assert query.sparse_texts == ["diet", *meanings]
         assert len(query.dense_texts) == dense_variants

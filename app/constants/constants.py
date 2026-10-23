@@ -38,6 +38,9 @@ ACRONYM_CSV_COLUMNS = (
     ACRONYM_CSV_COLUMN_DESCRIPTION,
     ACRONYM_CSV_COLUMN_IS_ACTIVE,
 )
+# Largest ACRONYM_BULK_UPLOAD_BATCH_SIZE: 6 values per row, and Postgres allows at most
+# 65,535 values per statement.
+ACRONYM_BULK_UPLOAD_MAX_BATCH_SIZE = 10000
 
 # Acronym matching patterns; changing one changes matching.
 # Non-letters stripped from a query word: "D.I.E.T." -> "DIET", "PTM2024" -> "PTM".

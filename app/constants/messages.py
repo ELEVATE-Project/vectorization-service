@@ -143,7 +143,7 @@ INTERNAL_TOKEN_INVALID = "Invalid or missing internal token"
 
 ENV_VARIABLES_MISSING = (
     "Server could not start. Not all environment variables are provided: {missing}. "
-    "Set them in .env (see release-doc/release-2.2.0.md)."
+    "Set them in .env."
 )
 
 
@@ -199,7 +199,6 @@ ACRONYM_SEMANTIC_DUAL_QUERY = (
     "The query and the query with each acronym written out "
     "(\"Parent Teacher Meeting documents\") are searched separately; each field keeps the higher score."
 )
-ACRONYM_KEYWORD_SINGLE = "One search with the words of the query and of every meaning."
 ACRONYM_KEYWORD_PER_MEANING = (
     "One search for the query and one for each meaning; each chunk keeps the higher score."
 )

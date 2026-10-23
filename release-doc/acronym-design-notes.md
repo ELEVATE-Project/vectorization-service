@@ -27,7 +27,8 @@ For `POST /api/documents/search`, in order:
 3. **Search** with the texts it built: the semantic (dense) texts and the keyword
    (BM25) text or texts, all in one Qdrant batch call. When several texts score the
    same chunk for the same field, the higher score is kept (`max()`). Every search
-   logs `Search method`, `Dense query` and `Sparse query` (the texts sent to Qdrant).
+   logs `Dense query` and `Sparse query` (the texts sent to Qdrant); an acronym query
+   also logs its method (`[ACRONYM] searching with the inline texts …`).
 4. **Rank** as for any query.
 5. **Boost** (hybrid mode only): the normal title/summary boosts for the query as
    typed, plus the expansion boosts for the query with the acronym written out.
@@ -65,7 +66,7 @@ It returns an `AcronymQuery`:
 |---|---|
 | `dense_texts` | Semantic search |
 | `sparse_text` | One keyword search: the query as typed plus the words of every meaning |
-| `sparse_texts` | Keyword OR: one keyword search per text (or `None`) |
+| `sparse_texts` | One keyword search per text (or `None` when nothing was written out) |
 | `written_out` | The query with each acronym written out, one per meaning, for the expansion boosts |
 
 **The method** (`ACRONYM_SEARCH_METHOD`):
@@ -76,13 +77,12 @@ It returns an `AcronymQuery`:
   two meanings gets both: "MIP (Micro Improvement Project, Micro Improvement Plan)".
 - **`dual_query`**: the cleaned query plus one text per meaning, each searched
   separately: "ptm documents", "Parent Teacher Meeting documents". At most
-  `ACRONYM_MAX_DENSE_VARIANTS` texts, the query included. Keyword OR is always on.
+  `ACRONYM_MAX_DENSE_VARIANTS` texts, the query included.
 
-**Keyword OR** (`ACRONYM_KEYWORD_OR`, or always with `dual_query`): one keyword
-search per text ("diet", then "District Institute of Education and Training"),
-not capped; each chunk keeps its higher raw BM25 score. Without it, one keyword
-search uses `sparse_text`. BM25 just counts words, so the extra words of the
-meanings cannot dilute it.
+**Keyword search** (both methods): one keyword search per text ("diet", then
+"District Institute of Education and Training"), not capped; each chunk keeps its
+higher raw BM25 score. When nothing is written out (the query already spells the
+meaning out), one keyword search uses `sparse_text`.
 
 **Writing an acronym out** (`_acronym_substitution_pattern`, `_expand_match`):
 
@@ -112,13 +112,13 @@ final score = score before boosts × every multiplier that applies, capped at 1.
 | Multiplier | When |
 |---|---|
 | `EXACT_TITLE_BOOST` / `PARTIAL_TITLE_BOOST` (any query) | The title equals / contains the query as typed |
-| `ACRONYM_EXPANSION_EXACT_TITLE_BOOST` (1.7) / `..._PARTIAL_TITLE_BOOST` (1.4) | The title equals / contains a written-out query |
+| `ACRONYM_EXPANSION_EXACT_TITLE_BOOST` (1.7) / `..._PARTIAL_TITLE_BOOST` (1.3) | The title equals / contains a written-out query |
 | `EXACT_SUMMARY_BOOST` / `PARTIAL_SUMMARY_BOOST` (any query) | The same for the summary |
 | `ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST` (1.4) / `..._PARTIAL_SUMMARY_BOOST` (1.2) | The same for the summary |
 
 - For "PTM": "Parent Teacher Meeting" as a title gets 1.7, "Parent Teacher
-  Meeting Guidelines" 1.4, "PTM Guidelines" the normal 1.5. A title with both forms
-  gets both (1.5 × 1.4). Word order and plurals are not matched.
+  Meeting Guidelines" 1.3, "PTM Guidelines" the normal 1.5. A title with both forms
+  gets both (1.5 × 1.3). Word order and plurals are not matched.
 - **One scroll per field, no extra Qdrant call.** The title (and summary) scroll
   matches the query as typed OR any written-out query; each document is then
   classified against both in Python.
@@ -194,14 +194,13 @@ the same file is safe, because it is an upsert.
 |---|---|---|
 | `ACRONYM_SEARCH_ENABLED` | `true` | Master switch; off gives the normal search |
 | `ACRONYM_SEARCH_METHOD` | `inline` | `inline` or `dual_query`; empty means `inline` |
-| `ACRONYM_KEYWORD_OR` | `false` | One keyword search per meaning (always on with `dual_query`) |
 | `ACRONYM_MAX_DENSE_VARIANTS` | `3` | `dual_query`: semantic texts per query, the query included |
 | `ACRONYM_MAX_PHRASE_WORDS` | `4` | Longest acronym in words (detection and upload) |
 | `ACRONYM_MAX_QUERY_WORDS` | `30` | Words of the query checked for acronyms |
 | `ACRONYM_MIN_PREFIX_MATCH_LEN` | `4` | Shortest word that may prefix-match a meaning word |
 | `ACRONYM_PREFIX_SUFFIX_CAP` | `3` | Most extra letters in a prefix match |
 | `ACRONYM_EXPANSION_EXACT_TITLE_BOOST` | `1.7` | Title equals a written-out query |
-| `ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST` | `1.4` | Title contains a written-out query |
+| `ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST` | `1.3` | Title contains a written-out query |
 | `ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST` | `1.4` | Summary equals a written-out query |
 | `ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST` | `1.2` | Summary contains a written-out query |
 | `ACRONYM_BULK_UPLOAD_MAX_SIZE_MB` | `5` | Largest CSV accepted |

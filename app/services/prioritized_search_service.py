@@ -144,9 +144,7 @@ class PrioritizedSearchService:
         # sorted, so the first one we see per source is the best one.
         if prethreshold_by_source_out is not None:
             for entry in self._filter_best_per_source(ranked_results):
-                source_id = entry['payload'].get('source_id')
-                if source_id:
-                    prethreshold_by_source_out[source_id] = entry
+                prethreshold_by_source_out[entry['payload']['source_id']] = entry
             logger.info(
                 f"Captured {len(prethreshold_by_source_out)} pre-threshold sources "
                 f"for keyword-injection score reuse"
@@ -336,9 +334,7 @@ class PrioritizedSearchService:
             # content words (e.g. "ministry of education" → "ministry education"). See CLAUDE.md §15.
             query_for_keyword_match = request.query
 
-            logger.info('****1**queryfor_embedding: %s', query_for_embedding)
             dense_query_texts = [query_for_embedding]
-            logger.info(f"****1**Generating dense embedding(s) for query: {dense_query_texts}")
             sparse_query_text = query_for_embedding
             sparse_query_texts: Optional[List[str]] = None
             written_out_queries: List[str] = []
@@ -349,20 +345,15 @@ class PrioritizedSearchService:
             if settings.ACRONYM_SEARCH_ENABLED:
                 acronym_query = build_acronym_query(request.query, query_for_embedding)
             acronym_info_field = acronym_info(acronym_query)
-            if acronym_query:
-                logger.info("[ACRONYM] searching with the acronym texts instead of the query")
+            search_with_acronym_texts = acronym_query is not None
+            if search_with_acronym_texts:
+                logger.info(f"[ACRONYM] searching with the {settings.ACRONYM_SEARCH_METHOD} texts instead of the query")
                 dense_query_texts = acronym_query.dense_texts
                 sparse_query_text = acronym_query.sparse_text
                 sparse_query_texts = acronym_query.sparse_texts
                 written_out_queries = acronym_query.written_out
 
-            # Logged for every search: the method and the texts actually sent to Qdrant.
-            search_method = "normal"
-            if acronym_query:
-                search_method = f"acronym {settings.ACRONYM_SEARCH_METHOD}"
-                if sparse_query_texts:
-                    search_method += " + keyword OR"
-            logger.info(f"Search method: {search_method}")
+            # Logged for every search: the texts actually sent to Qdrant.
             logger.info(f"Dense query: {dense_query_texts}")
             logger.info(f"Sparse query: {sparse_query_texts or [sparse_query_text]}")
             # One encode() for all dense texts; every vector is validated before Qdrant.
@@ -390,14 +381,12 @@ class PrioritizedSearchService:
 
             self._log_search_request(request, top_k, filter_conditions)
 
-            # Only two modes exist: "semantic" opts out of boosts; "hybrid" (the
-            # default) opts in. search_mode is validated to that set by Pydantic.
+            # "hybrid" (default) applies the title/summary boost below; "semantic" skips
+            # it. Checked here, before ranking, so semantic search can also skip the
+            # extra bookkeeping that only the boost step needs.
             search_mode = getattr(request, "search_mode", "hybrid")
-            # Acronym: the expansion boosts follow this switch too; semantic mode still
-            # searches with the acronym texts, only without the boosts.
-            lexical_ranking_enabled = (
-                settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic"
-            )
+            # Acronym: the expansion boosts follow this switch too.
+            boost_active = settings.HYBRID_SEARCH_ENABLED and search_mode != "semantic"
             
             logger.info("========== EXECUTING SEARCH ==========" )
             # Acronym: dual_query sends several query vectors; same-field hits merge with max().
@@ -415,7 +404,7 @@ class PrioritizedSearchService:
                     # Bounded candidate pool per field — keeps HNSW ef small (dominant
                     # query cost). See _candidate_limit / SEARCH_CANDIDATE_* config.
                     limit=self._candidate_limit(top_k),
-                    # Keyword OR and dual_query: each chunk keeps its higher raw BM25 score.
+                    # Acronym: one BM25 search per meaning; each chunk keeps its higher raw BM25 score.
                     sparse_query_texts=sparse_query_texts,
                 )
             else:
@@ -457,10 +446,14 @@ class PrioritizedSearchService:
             scoring_context: Dict[str, Any] = {}
 
             # Acronym: expansion title/summary boosts run only for an acronym query in hybrid mode.
-            soft_acronym_ranking = acronym_query is not None and lexical_ranking_enabled
+            apply_expansion_boosts = acronym_query is not None and boost_active
+            expansion_exact_title_boost = settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST
+            expansion_partial_title_boost = settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST
+            expansion_exact_summary_boost = settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST
+            expansion_partial_summary_boost = settings.ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST
             # Only needed by the boost step below, so semantic search skips it.
             prethreshold_by_source: Optional[Dict[str, Dict[str, Any]]] = (
-                {} if lexical_ranking_enabled else None
+                {} if boost_active else None
             )
 
             top_results, unique_source_results = self._process_and_filter_results(
@@ -476,7 +469,7 @@ class PrioritizedSearchService:
             # semantic pool). Tracked so total_results counts them — otherwise the
             # response could report fewer total than it returns.
             injected_source_ids: set = set()
-            if lexical_ranking_enabled:
+            if boost_active:
                 logger.info("Applying hybrid title + summary boost")
 
                 title_boosts = (settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST)
@@ -486,10 +479,8 @@ class PrioritizedSearchService:
                 # scrolls below (no extra Qdrant call); empty for other queries.
                 expansion_title_matches: Dict[str, str] = {}
                 expansion_summary_matches: Dict[str, str] = {}
-                expansion_title_boosts = (settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST,
-                                          settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST)
-                expansion_summary_boosts = (settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST,
-                                            settings.ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST)
+                expansion_title_boosts = (expansion_exact_title_boost, expansion_partial_title_boost)
+                expansion_summary_boosts = (expansion_exact_summary_boost, expansion_partial_summary_boost)
 
                 # Title boost (highest priority). Scroll retrieves prefix/partial
                 # matches; the supplement adds any mid/infix matches already present
@@ -505,7 +496,7 @@ class PrioritizedSearchService:
                 top_results = self._apply_field_boost(
                     top_results, title_matches, "title", *title_boosts,
                 )
-                if acronym_query:
+                if apply_expansion_boosts:
                     # Acronym: expansion title boost, stacked on the title boost above.
                     logger.info(f"[ACRONYM] expansion title matches: {expansion_title_matches}")
                     top_results = self._apply_field_boost(
@@ -525,7 +516,7 @@ class PrioritizedSearchService:
                 top_results = self._apply_field_boost(
                     top_results, summary_matches, "summary", *summary_boosts,
                 )
-                if acronym_query:
+                if apply_expansion_boosts:
                     # Acronym: expansion summary boost, stacked on the summary boost above.
                     logger.info(f"[ACRONYM] expansion summary matches: {expansion_summary_matches}")
                     top_results = self._apply_field_boost(
@@ -553,7 +544,7 @@ class PrioritizedSearchService:
                         query_embedding=query_embeddings[0],
                         score_floor=_floor_for("title"),
                     )
-                    if acronym_query:
+                    if apply_expansion_boosts:
                         # Acronym: an added document with the written-out query in its
                         # title also gets the expansion boost.
                         injected = self._apply_field_boost(
@@ -565,7 +556,7 @@ class PrioritizedSearchService:
                     injected_source_ids.update(d["payload"].get("source_id") for d in injected)
                     logger.info(f"Injected {len(injected)} title-match docs missing from semantic results")
 
-                if acronym_query:
+                if apply_expansion_boosts:
                     # Acronym: add documents whose title matches only the written-out query.
                     missing_expansion = [sid for sid in expansion_title_matches if sid not in present_ids]
                     if missing_expansion:
@@ -594,7 +585,7 @@ class PrioritizedSearchService:
                         query_embedding=query_embeddings[0],
                         score_floor=_floor_for("summary"),
                     )
-                    if acronym_query:
+                    if apply_expansion_boosts:
                         # Acronym: the expansion summary boost stacks, as for title.
                         injected = self._apply_field_boost(
                             injected, expansion_summary_matches, "summary", *expansion_summary_boosts,
@@ -605,7 +596,7 @@ class PrioritizedSearchService:
                     injected_source_ids.update(d["payload"].get("source_id") for d in injected)
                     logger.info(f"Injected {len(injected)} summary-match docs missing from semantic results")
 
-                if acronym_query:
+                if apply_expansion_boosts:
                     # Acronym: add documents whose summary matches only the written-out query,
                     # unless a title match already brought them in.
                     missing_expansion_summary = [
@@ -685,14 +676,14 @@ class PrioritizedSearchService:
                 # Never default dense_weight/sparse_weight from settings: _rank_results
                 # writes them only where weighted fusion ran, so their absence is the
                 # signal that it didn't (dense-only, empty-BM25, RRF).
-                scoring_context["boost_config"] = self._boost_config(lexical_ranking_enabled)
-                if soft_acronym_ranking:
+                scoring_context["boost_config"] = self._boost_config(boost_active)
+                if apply_expansion_boosts:
                     # Acronym: report the expansion boosts too.
                     scoring_context["boost_config"].update({
-                        "expansion_exact_title_boost": settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST,
-                        "expansion_partial_title_boost": settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST,
-                        "expansion_exact_summary_boost": settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST,
-                        "expansion_partial_summary_boost": settings.ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST,
+                        "expansion_exact_title_boost": expansion_exact_title_boost,
+                        "expansion_partial_title_boost": expansion_partial_title_boost,
+                        "expansion_exact_summary_boost": expansion_exact_summary_boost,
+                        "expansion_partial_summary_boost": expansion_partial_summary_boost,
                     })
                 search_config["scoring_context"] = scoring_context
 
@@ -822,7 +813,7 @@ class PrioritizedSearchService:
         Returns (all_results, field_scores, sparse_issued): sparse_issued means sent,
         not matched, which keeps zero-hit queries on the hybrid [0, 1] scale.
 
-        sparse_query_texts (ACRONYM_KEYWORD_OR / ACRONYM_SEARCH_METHOD=dual_query): one BM25 request per
+        sparse_query_texts (acronym queries): one BM25 request per
         text instead of query_text, merged per chunk with max() of the raw BM25 scores; the
         usual min-max normalization follows.
         """
@@ -1697,7 +1688,7 @@ class PrioritizedSearchService:
                 matches[source_id] = match_type
 
     @staticmethod
-    def _boost_config(lexical_ranking_enabled: bool) -> Dict[str, Any]:
+    def _boost_config(boost_active: bool) -> Dict[str, Any]:
         """The title/summary multipliers actually applied (all 1.0 when boosts are off)."""
         configured = {
             "exact_title_boost": settings.EXACT_TITLE_BOOST,
@@ -1705,7 +1696,7 @@ class PrioritizedSearchService:
             "exact_summary_boost": settings.EXACT_SUMMARY_BOOST,
             "partial_summary_boost": settings.PARTIAL_SUMMARY_BOOST,
         }
-        if not lexical_ranking_enabled:
+        if not boost_active:
             return dict.fromkeys(configured, 1.0)
         return configured
 

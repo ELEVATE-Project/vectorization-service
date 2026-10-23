@@ -146,7 +146,7 @@ class AcronymQuery:
     detected: Dict[str, List[str]]      # acronym -> its meanings
     dense_texts: List[str]              # semantic search texts
     sparse_text: str                    # one BM25 text: the query plus every meaning's words
-    sparse_texts: Optional[List[str]]   # keyword OR / dual_query: one BM25 text per meaning
+    sparse_texts: Optional[List[str]]   # one BM25 text per meaning (None if nothing was written out)
     written_out: List[str]              # the query with each acronym written out (expansion boosts)
 
 
@@ -176,17 +176,14 @@ def build_acronym_query(original_query: str, cleaned_query: str) -> Optional[Acr
         if substituted.lower() not in {v.lower() for v in variants}:
             variants.append(substituted)
     dense_texts = variants[:max(1, settings.ACRONYM_MAX_DENSE_VARIANTS)]
-    logger.info(f"***1***Dense embedding variants (for semantic search): {dense_texts}")
 
     written_out = [
         text for text in dict.fromkeys(write_out(original_query, i) for i in range(max_expansions))
         if text.strip().lower() != original_query.strip().lower()
     ]
 
-    # Keyword OR: one BM25 search per meaning (not capped); each chunk keeps the higher score.
-    sparse_texts = None
-    if (settings.ACRONYM_KEYWORD_OR or settings.ACRONYM_SEARCH_METHOD == const.ACRONYM_SEARCH_METHOD_DUAL_QUERY) and len(variants) > 1:
-        sparse_texts = list(variants)
+    # Both methods: one BM25 search per meaning (not capped); each chunk keeps the higher score.
+    sparse_texts = list(variants) if len(variants) > 1 else None
 
     if settings.ACRONYM_SEARCH_METHOD == const.ACRONYM_SEARCH_METHOD_INLINE:
         # Every meaning in one text ("MIP (Micro Improvement Project, Micro Improvement Plan)").
@@ -344,25 +341,23 @@ def acronym_method_description() -> Dict[str, str]:
     """acronym_info.method_description: how acronym queries are searched (semantic, keyword) and boosted."""
     dual_query = settings.ACRONYM_SEARCH_METHOD == const.ACRONYM_SEARCH_METHOD_DUAL_QUERY
     semantic = msg.ACRONYM_SEMANTIC_DUAL_QUERY if dual_query else msg.ACRONYM_SEMANTIC_INLINE
-    # dual_query always runs one keyword search per meaning; inline only with ACRONYM_KEYWORD_OR.
-    keyword = (msg.ACRONYM_KEYWORD_PER_MEANING if dual_query or settings.ACRONYM_KEYWORD_OR
-               else msg.ACRONYM_KEYWORD_SINGLE)
     boosting = msg.ACRONYM_BOOSTING.format(
         exact_title=settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST,
         partial_title=settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST,
         exact_summary=settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST,
         partial_summary=settings.ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST,
     )
-    return {"semantic": semantic, "keyword": keyword, "boosting": boosting}
+    return {"semantic": semantic, "keyword": msg.ACRONYM_KEYWORD_PER_MEANING, "boosting": boosting}
 
 
 def acronym_info(acronym_query: Optional[AcronymQuery]) -> Dict[str, Any]:
     """The acronym_info response field."""
+    enabled = settings.ACRONYM_SEARCH_ENABLED
     info: Dict[str, Any] = {
-        "enabled": settings.ACRONYM_SEARCH_ENABLED,
+        "enabled": enabled,
         "detected": acronym_query is not None,
     }
-    if settings.ACRONYM_SEARCH_ENABLED:
+    if enabled:
         info["method"] = settings.ACRONYM_SEARCH_METHOD
         info["method_description"] = acronym_method_description()
     if acronym_query:

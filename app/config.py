@@ -128,7 +128,7 @@ class Settings(BaseSettings):
     # Title equals the written-out query:
     ACRONYM_EXPANSION_EXACT_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_TITLE_BOOST", "1.7"))
     # Title contains the written-out query ("Parent Teacher Meeting document in school"):
-    ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST", "1.4"))
+    ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST", "1.3"))
     # The same two matches in the summary (equals / contains).
     ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST", "1.4"))
     ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST", "1.2"))
@@ -153,8 +153,6 @@ class Settings(BaseSettings):
     # inline (default): one text with each meaning next to its acronym ("PTM (Parent Teacher Meeting)").
     # dual_query: the query and each meaning searched separately; each field keeps the higher score.
     ACRONYM_SEARCH_METHOD: str = os.getenv("ACRONYM_SEARCH_METHOD", const.ACRONYM_SEARCH_METHOD_INLINE)
-    # One BM25 search per meaning ("diet" OR "District Institute ..."); each chunk keeps the higher score.
-    ACRONYM_KEYWORD_OR: bool = os.getenv("ACRONYM_KEYWORD_OR", "false").lower() == "true"
     # Longest multi-word acronym (in words) that detection finds and upload accepts.
     ACRONYM_MAX_PHRASE_WORDS: int = int(os.getenv("ACRONYM_MAX_PHRASE_WORDS", "4"))
     # Words of the query checked for acronyms; bounds lookups for very long queries.
@@ -225,10 +223,10 @@ class Settings(BaseSettings):
             value = getattr(self, name)
             if value <= 0:
                 raise ValueError(f"{name} must be a whole number of seconds above 0, got {value}")
-        # 6 values per row; Postgres allows at most 65,535 per statement.
-        if not 1 <= self.ACRONYM_BULK_UPLOAD_BATCH_SIZE <= 10000:
+        max_batch_size = const.ACRONYM_BULK_UPLOAD_MAX_BATCH_SIZE
+        if not 1 <= self.ACRONYM_BULK_UPLOAD_BATCH_SIZE <= max_batch_size:
             raise ValueError(
-                f"ACRONYM_BULK_UPLOAD_BATCH_SIZE must be between 1 and 10000, "
+                f"ACRONYM_BULK_UPLOAD_BATCH_SIZE must be between 1 and {max_batch_size}, "
                 f"got {self.ACRONYM_BULK_UPLOAD_BATCH_SIZE}"
             )
         for name in ("ACRONYM_EXPANSION_EXACT_TITLE_BOOST", "ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST",

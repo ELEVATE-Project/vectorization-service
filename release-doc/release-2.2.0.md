@@ -8,8 +8,6 @@
 
 > ⚠️ **Run `alembic upgrade head` before starting the service.** The acronym cache warms at startup by reading the `acronym_mapping` table. If the table does not exist yet, warm-up fails (logged, non-fatal) and acronym detection finds nothing until the migration has run.
 
-> ℹ️ **About [release 2.1.0](release-2.1.0.md).** That note describes an earlier, unreleased design of acronym search (a ranking bonus, a UUID `code` key). This release is the first to ship acronym search; where the two notes differ, this one applies.
-
 ---
 
 ## Table of Contents
@@ -52,7 +50,7 @@
 **Acronym search**
 
 - **Acronym detection in search queries.** A query containing a registered acronym (e.g. `DIET`, `PTM`, `SSC`) is detected and expanded before retrieval, so a search for the acronym also finds documents that only spell out its full meaning. Gated by `ACRONYM_SEARCH_ENABLED` (default `true`).
-- **Acronym-aware ranking.** Acronym queries are searched with the acronym written out (`ACRONYM_SEARCH_METHOD`: `inline`, the default, or `dual_query`), then get the same title and summary boosts as any other query (the query as typed). A title that has the query with the acronym written out ("PTM Doc" → "Parent Teacher Meeting Doc") gets an extra boost on top: x1.7 when the title equals it, x1.4 when the title contains it. The summary gets the same rule (x1.4 / x1.2).
+- **Acronym-aware ranking.** Acronym queries are searched with the acronym written out (`ACRONYM_SEARCH_METHOD`: `inline`, the default, or `dual_query`), then get the same title and summary boosts as any other query (the query as typed). A title that has the query with the acronym written out ("PTM Doc" → "Parent Teacher Meeting Doc") gets an extra boost on top: x1.7 when the title equals it, x1.3 when the title contains it. The summary gets the same rule (x1.4 / x1.2).
 - **Acronym dictionary.** New Postgres table `acronym_mapping`, seeded with 486 acronyms. One acronym can have several meanings (`SSC` → "Staff Selection Commission" / "Sainik School Society"). Lookups go through a Redis cache.
 - **Bulk upload endpoint.** `POST /api/acronyms/bulkUpload` creates, updates, enables or disables acronyms from a CSV, and reports which acronyms were created, updated and deactivated.
 - **`acronym_info` in the search response**, showing whether acronym search is enabled, the search method in use, whether an acronym was detected, and its expansions.
@@ -117,8 +115,8 @@ Always an object for a request with query text (`null` only without query text):
 | Key | `inline` | `dual_query` |
 |---|---|---|
 | `semantic` | One search text with each acronym's meaning written next to it, e.g. "PTM (Parent Teacher Meeting) documents". | The query and the query with each acronym written out ("Parent Teacher Meeting documents") are searched separately; each field keeps the higher score. |
-| `keyword` | One search with the words of the query and of every meaning; with `ACRONYM_KEYWORD_OR=true`, one search per meaning as for `dual_query`. | One search for the query and one for each meaning; each chunk keeps the higher score. |
-| `boosting` | A title that equals or contains the query with the acronym written out gets x1.7 or x1.4, a summary x1.4 or x1.2, on top of the normal title and summary boosts (hybrid mode only). | Same |
+| `keyword` | One search for the query and one for each meaning; each chunk keeps the higher score. | Same |
+| `boosting` | A title that equals or contains the query with the acronym written out gets x1.7 or x1.3, a summary x1.4 or x1.2, on top of the normal title and summary boosts (hybrid mode only). | Same |
 
 </details>
 
@@ -181,12 +179,11 @@ Add these to `.env` (defaults shown match `app/config.py`, so omitting them is s
 | `ACRONYM_BULK_UPLOAD_MAX_SIZE_MB` | `5` | Largest CSV accepted |
 | `ACRONYM_BULK_UPLOAD_BATCH_SIZE` | `200` | Rows saved per database statement during an upload (1 to 10000) |
 | `ACRONYM_EXPANSION_EXACT_TITLE_BOOST` | `1.7` | Title multiplier when the title equals the query with the acronym written out |
-| `ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST` | `1.4` | Title multiplier when the title contains the query with the acronym written out |
+| `ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST` | `1.3` | Title multiplier when the title contains the query with the acronym written out |
 | `ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST` | `1.4` | Summary multiplier when the summary equals the query with the acronym written out |
 | `ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST` | `1.2` | Summary multiplier when the summary contains the query with the acronym written out |
 | `ACRONYM_SEARCH_METHOD` | `inline` | `inline` (one text with the meanings written in) or `dual_query` (one text per meaning, higher score per field); empty means `inline` |
-| `ACRONYM_KEYWORD_OR` | `false` | One keyword (BM25) search per meaning, each chunk keeping its higher score; always on with `dual_query` |
-| `ACRONYM_MAX_DENSE_VARIANTS` | `3` | Dense query variants per acronym query, including the original (dual_query only; keyword OR searches every meaning) |
+| `ACRONYM_MAX_DENSE_VARIANTS` | `3` | Dense query variants per acronym query, including the original (dual_query only; the keyword search covers every meaning) |
 | `ACRONYM_MAX_PHRASE_WORDS` | `4` | Longest multi-word acronym detected and accepted on upload |
 | `ACRONYM_MAX_QUERY_WORDS` | `30` | Words of the query checked for acronyms; the rest is still searched, only not looked up, which bounds Redis/Postgres work for very long queries |
 | `ACRONYM_MIN_PREFIX_MATCH_LEN` | `4` | Shortest word stem allowed to prefix-match an expansion word |
@@ -256,16 +253,54 @@ Existing settings that acronym search now also depends on:
 
 5. Pull the new code and add the new env keys to `.env` (see [New Configuration](#new-configuration) and `.env.sample`):
    ```dotenv
+   # Required
+   INTERNAL_API_TOKEN=<generate-a-real-secret>
+   POSTGRES_DATABASE_URI=postgresql://<user>:<password>@<host>:5432/<database>
+
+   # Ingestion and upload
    MAX_SOURCE_ID_LENGTH=255
    SOURCE_ID_PATTERN='^[A-Za-z0-9_\-.:]+$'
    PRIORITY_PATTERN='^P\d+$'
+   UPLOAD_ROLLBACK_MAX_ATTEMPTS=3
+   UPLOAD_ROLLBACK_RETRY_WAIT_SECONDS=0.5
+   UPLOAD_ROLLBACK_BACKGROUND_MAX_ATTEMPTS=9
+   UPLOAD_ROLLBACK_BACKGROUND_FIRST_WAIT_SECONDS=2
+   UPLOAD_ROLLBACK_BACKGROUND_MAX_WAIT_SECONDS=60
+
+   # Acronym search
    ACRONYM_SEARCH_ENABLED=true
+   ACRONYM_SEARCH_METHOD=inline
+   ACRONYM_MAX_DENSE_VARIANTS=3
+   ACRONYM_MAX_PHRASE_WORDS=4
+   ACRONYM_MAX_QUERY_WORDS=30
+   ACRONYM_MIN_PREFIX_MATCH_LEN=4
+   ACRONYM_PREFIX_SUFFIX_CAP=3
    SPARSE_SEARCH_ENABLED=true
-   INTERNAL_API_TOKEN=<generate-a-real-secret>
+
+   # Acronym expansion boosts
+   ACRONYM_EXPANSION_EXACT_TITLE_BOOST=1.7
+   ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST=1.3
+   ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST=1.4
+   ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST=1.2
+
+   # Acronym bulk upload
+   ACRONYM_BULK_UPLOAD_MAX_SIZE_MB=5
+   ACRONYM_BULK_UPLOAD_BATCH_SIZE=200
+
+   # Acronym cache (Redis) and Postgres timeouts
+   CACHE_ENABLED=true
+   REDIS_DB=2
+   REDIS_CACHE_TTL=86400
+   REDIS_NEGATIVE_CACHE_TTL=3600
+   REDIS_DB_ERROR_CACHE_TTL=30
+   REDIS_SOCKET_CONNECT_TIMEOUT=1
+   REDIS_SOCKET_TIMEOUT=1
+   POSTGRES_CONNECT_TIMEOUT=3
+   POSTGRES_STATEMENT_TIMEOUT_MS=5000
    ```
-   `INTERNAL_API_TOKEN` is required. The `UPLOAD_ROLLBACK_*` retry/backoff variables and the
-   other acronym settings are optional tuning knobs — their defaults already match the code,
-   so omitting them is safe.
+   `INTERNAL_API_TOKEN` is required: the service does not start without it. The other values
+   shown are the defaults in `app/config.py`; see [New Configuration](#new-configuration) for
+   what each one does.
 
 6. Install dependencies:
    ```bash
