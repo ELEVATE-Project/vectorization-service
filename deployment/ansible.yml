@@ -29,8 +29,14 @@
         repo: https://github.com/ELEVATE-Project/vectorization-service.git
         dest: "{{ release_path }}"
         version: "{{ gitBranch }}"
+        force: yes
         clone: yes
         update: yes
+      register: git_result
+    
+    - name: Show what was deployed
+      debug:
+        msg: "Before: {{ git_result.before }} | After: {{ git_result.after }}"
 
     - name: Download application secrets
       shell: >
@@ -91,6 +97,7 @@
     - name: Run Django migrations
       shell: |
         export $(cat .env | xargs)
+        .venv/bin/alembic upgrade head
       args:
         executable: /bin/bash
         chdir: "{{ current_path }}"

@@ -1,3 +1,4 @@
+from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Optional, List, Dict, Any, Literal
 from app.config import settings
@@ -276,6 +277,26 @@ class SearchResultItem(BaseModel):
                     "Applied after title_multiplier, each capped at 1.0. "
                     "Debug-only (include_scoring_debug=true)."
     )
+    title_expansion_multiplier: Optional[float] = Field(
+        default=None,
+        description=(
+            "Additional boost applied when an acronym query matches its expanded form in the title. "
+            "Uses ACRONYM_EXPANSION_EXACT_TITLE_BOOST or ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST, "
+            "depending on the match type. Applied on top of title_multiplier: when both match, the "
+            "score is multiplied by both (capped at 1.0). A value of 1.0 means no additional boost. "
+            "Only available when include_scoring_debug=true."
+        ),
+    )
+    summary_expansion_multiplier: Optional[float] = Field(
+        default=None,
+        description=(
+            "Additional boost applied when an acronym query matches its expanded form in the summary. "
+            "Uses ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST or ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST, "
+            "depending on the match type. Applied on top of summary_multiplier: when both match, the "
+            "score is multiplied by both (capped at 1.0). A value of 1.0 means no additional boost. "
+            "Only available when include_scoring_debug=true."
+        ),
+    )
     title_match: Optional[str] = Field(
         default=None,
         description="Title match type: 'exact', 'partial', or None if no title match"
@@ -283,6 +304,25 @@ class SearchResultItem(BaseModel):
     summary_match: Optional[str] = Field(
         default=None,
         description="Summary match type: 'exact', 'partial', or None if no summary match"
+    )
+    title_expansion_match: Optional[str] = Field(
+        default=None,
+        description=(
+            "Indicates how the title matched the expanded form of an acronym in the query "
+            "(e.g., 'PTM document' matching 'Parent Teacher Meeting document'). "
+            "Possible values: 'exact', 'partial', or None if no match. "
+            "Complements title_match, which represents the match against the original query. "
+            "Only available when include_scoring_debug=true."
+        ),
+    )
+    summary_expansion_match: Optional[str] = Field(
+        default=None,
+        description=(
+            "Indicates how the summary matched the expanded form of an acronym in the query. "
+            "Possible values: 'exact', 'partial', or None if no match. "
+            "Complements summary_match, which represents the match against the original query. "
+            "Only available when include_scoring_debug=true."
+        ),
     )
 
 class PrioritizedSearchResponse(BaseModel):
@@ -293,6 +333,16 @@ class PrioritizedSearchResponse(BaseModel):
     search_config: Dict[str, Any] = Field(
         default_factory=dict,
         description="Configuration used for this search"
+    )
+    acronym_info: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Provides acronym detection details for the query, including whether detection is enabled "
+            "and whether an acronym was found. When enabled, includes the detection method "
+            "('inline' or 'dual_query') and its description. When an acronym is detected, includes the "
+            "acronym-to-expansions mapping and any ambiguous acronyms with multiple meanings. "
+            "None only when the request contains no query text."
+        ),
     )
 
 class TextSearchRequest(BaseModel):
@@ -320,3 +370,39 @@ class SourceVerificationResponse(BaseModel):
     not_found: List[str] = Field(..., description="List of source IDs that don't exist in Qdrant")
     found_count: int = Field(..., description="Count of found source IDs")
     not_found_count: int = Field(..., description="Count of not found source IDs")
+
+class AcronymUploadError(BaseModel):
+    index: int = Field(..., description="0-based index of the row in the CSV (0 = first data row, header excluded)")
+    acronym: Optional[str] = Field(None, description="Acronym value, if present on the row")
+    reason: str
+
+class AcronymBulkUploadResponse(BaseModel):
+    received: int
+    created: int
+    updated: int
+    # Rows set to is_active=false; also counted in created or updated.
+    deactivated: int
+    # False: the rows are saved, but the cache could not be updated, so old values
+    # may be served until REDIS_CACHE_TTL ends. Clear the cache; do not re-upload.
+    cache_refreshed: bool = True
+    errors: List[AcronymUploadError]
+    # Which acronyms each count refers to, in CSV order.
+    created_acronyms: List[str] = []
+    updated_acronyms: List[str] = []
+    deactivated_acronyms: List[str] = []
+
+class AcronymItem(BaseModel):
+    acronym: str
+    expansions: List[str]
+    description: Optional[str] = None
+    is_active: bool
+    created_by: str
+    updated_by: str
+    created_at: datetime
+    updated_at: datetime
+
+class AcronymListResponse(BaseModel):
+    total: int = Field(..., description="Total rows matching the filters, independent of limit/offset")
+    limit: int
+    offset: int
+    items: List[AcronymItem]

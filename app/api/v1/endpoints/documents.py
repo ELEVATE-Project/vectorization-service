@@ -211,7 +211,9 @@ async def check_similarity(request: SimilarityCheckRequest) -> SimilarityCheckRe
 # Primary search: weighted multi-field dense search (fused with BM25 when sparse is enabled),
 # then filtering, title/summary boosts and one best result per source_id; no query lists all sources.
 @router.post("/documents/search", response_model=PrioritizedSearchResponse)
-async def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSearchResponse:
+# Deliberately sync: search() blocks (Qdrant, Redis, Postgres), and as `async` one
+# stalled dependency froze every request. FastAPI runs `def` in its threadpool.
+def prioritized_search(request: PrioritizedSearchRequest) -> PrioritizedSearchResponse:
     """
     Perform prioritized multi-field search across documents with optional filters.
     

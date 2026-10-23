@@ -3,8 +3,10 @@ fastapi
 uvicorn
 # Database and Caching
 sqlalchemy
+# Postgres driver for postgresql:// URLs (POSTGRES_DATABASE_URI).
 psycopg2-binary
 redis
+alembic
 # Pinned to >=1.18.0: enables sparse vectors (BM25) and the Query API with RRF.
 # NOTE: Compatible with the project's Python 3.10.16 runtime.
 # Re-test before upgrading to qdrant-client 2.x, as major versions may introduce breaking API changes.
@@ -29,6 +31,12 @@ langchain
 langchain-text-splitters
 langchain-core
 spacy>=3.7.0
+# spaCy imports click, but new typer versions no longer install it; without
+# this line `import spacy` fails.
+click
+# The spaCy model is installed by `spacy download en_core_web_sm`
+# (deployment/ansible.yml). Uncomment to install it with pip instead.
+#en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
 
 # Data Types and Validation
 pydantic

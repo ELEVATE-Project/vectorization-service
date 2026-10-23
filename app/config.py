@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
+from app.constants import constants as const
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -42,11 +44,28 @@ class Settings(BaseSettings):
     MAX_CACHE_RESULTS: int = 1
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
+    # Commons uses db 0 on the shared Redis, so this service defaults to db 2.
+    REDIS_DB: int = int(os.getenv("REDIS_DB", 2))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
+    # Small on purpose: redis-py has no default timeout, so a stuck Redis would stall search.
+    REDIS_SOCKET_CONNECT_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_CONNECT_TIMEOUT", 1))
+    REDIS_SOCKET_TIMEOUT: float = float(os.getenv("REDIS_SOCKET_TIMEOUT", 1))
     REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", 86400))  # 24 hours in seconds
+    # Caches "not an acronym" so ordinary words skip Postgres; shorter than REDIS_CACHE_TTL.
+    # Uploads reload the cache, so this only bounds staleness in rare races.
+    REDIS_NEGATIVE_CACHE_TTL: int = int(os.getenv("REDIS_NEGATIVE_CACHE_TTL", 3600))  # 1 hour
+    # Short: a DB-error miss must not hide real acronyms once Postgres is back.
+    REDIS_DB_ERROR_CACHE_TTL: int = int(os.getenv("REDIS_DB_ERROR_CACHE_TTL", 30))
     REDIS_MAX_CACHE_SIZE: int = int(os.getenv("REDIS_MAX_CACHE_SIZE", 1000))
     DATABASE_URL: str = os.getenv("POSTGRES_DATABASE_URI", "postgresql://anuj:1234@localhost:5432/ai_vector_service")
+    # Seconds to open a connection; without it an unreachable host hangs for minutes.
+    POSTGRES_CONNECT_TIMEOUT: int = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", 3))
+    # Longest query; enforced by Postgres, so it stops slow or locked queries, not a frozen server.
+    POSTGRES_STATEMENT_TIMEOUT_MS: int = int(os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
     REDIS_CACHE_ENABLED: bool = False
+
+    # Secret for the internal_access_token header on the acronym endpoints; no default.
+    INTERNAL_API_TOKEN: str = os.getenv("INTERNAL_API_TOKEN", "")
 
     # URL extraction settings
     URL_EXTRACTION_CHUNK_SIZE: int = 1500
@@ -55,6 +74,11 @@ class Settings(BaseSettings):
 
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
+    # Acronym bulk-upload CSVs are small tabular text, not documents —
+    # a much lower cap than MAX_FILE_SIZE_MB.
+    ACRONYM_BULK_UPLOAD_MAX_SIZE_MB: int = int(os.getenv("ACRONYM_BULK_UPLOAD_MAX_SIZE_MB", 5))
+    # Rows saved per database statement during a bulk upload.
+    ACRONYM_BULK_UPLOAD_BATCH_SIZE: int = int(os.getenv("ACRONYM_BULK_UPLOAD_BATCH_SIZE", 200))
 
     # Partial-upload rollback: if some Qdrant batches fail, delete the chunks this request stored.
     # Tries while the request is open; the wait between tries doubles (0.5s, 1s).
@@ -99,6 +123,15 @@ class Settings(BaseSettings):
     # Summary boosts are lower than title (summary carries less weight than title).
     EXACT_SUMMARY_BOOST: float = float(os.getenv("EXACT_SUMMARY_BOOST", "1.4"))
     PARTIAL_SUMMARY_BOOST: float = float(os.getenv("PARTIAL_SUMMARY_BOOST", "1.2"))
+    # Acronym queries only: the title boost for the query with the acronym written out
+    # ("PTM document" -> "Parent Teacher Meeting document"); both can apply. 1.0 = off.
+    # Title equals the written-out query:
+    ACRONYM_EXPANSION_EXACT_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_TITLE_BOOST", "1.7"))
+    # Title contains the written-out query ("Parent Teacher Meeting document in school"):
+    ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST", "1.3"))
+    # The same two matches in the summary (equals / contains).
+    ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST", "1.4"))
+    ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST: float = float(os.getenv("ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST", "1.2"))
     METADATA_MATCH_BOOST: float = float(os.getenv("METADATA_MATCH_BOOST", "1.2"))
     # How many keyword-matched documents we are willing to score per search. Scoring
     # each one downloads 5 vectors, and a short query can match thousands of titles.
@@ -108,16 +141,34 @@ class Settings(BaseSettings):
     SHORT_QUERY_THRESHOLD: int = int(os.getenv("SHORT_QUERY_THRESHOLD", "3"))
     RRF_K: int = int(os.getenv("RRF_K", "60"))  # standard Reciprocal Rank Fusion constant
 
+    # Minimum stem length for prefix-matching expansion words ("institute" ~ "institutes").
+    ACRONYM_MIN_PREFIX_MATCH_LEN: int = int(os.getenv("ACRONYM_MIN_PREFIX_MATCH_LEN", "4"))
+
+    # Max extra characters in a prefix match: "tests" ~ "test", but not "testimony".
+    ACRONYM_PREFIX_SUFFIX_CAP: int = int(os.getenv("ACRONYM_PREFIX_SUFFIX_CAP", "3"))
+
+    # dual_query only: dense texts per query (the original plus one per meaning).
+    ACRONYM_MAX_DENSE_VARIANTS: int = int(os.getenv("ACRONYM_MAX_DENSE_VARIANTS", "3"))
+
+    # inline (default): one text with each meaning next to its acronym ("PTM (Parent Teacher Meeting)").
+    # dual_query: the query and each meaning searched separately; each field keeps the higher score.
+    ACRONYM_SEARCH_METHOD: str = os.getenv("ACRONYM_SEARCH_METHOD", const.ACRONYM_SEARCH_METHOD_INLINE)
+    # Longest multi-word acronym (in words) that detection finds and upload accepts.
+    ACRONYM_MAX_PHRASE_WORDS: int = int(os.getenv("ACRONYM_MAX_PHRASE_WORDS", "4"))
+    # Words of the query checked for acronyms; bounds lookups for very long queries.
+    ACRONYM_MAX_QUERY_WORDS: int = int(os.getenv("ACRONYM_MAX_QUERY_WORDS", "30"))
+
+    # Master switch for acronym search; off gives exactly the pre-feature ranking.
+    ACRONYM_SEARCH_ENABLED: bool = os.getenv("ACRONYM_SEARCH_ENABLED", "true").lower() == "true"
+    # explicitly enable/disable caching of redis results (default true)
+    CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").lower() == "true"
+
     # Sparse Vector Configuration (Phase 2 — requires qdrant-client>=1.9.0)
     SPARSE_VECTOR_NAME: str = os.getenv("SPARSE_VECTOR_NAME", "bm25")
     SPARSE_SEARCH_ENABLED: bool = os.getenv("SPARSE_SEARCH_ENABLED", "false").lower() == "true"
 
-    # Hybrid score fusion weights. In hybrid mode the dense (cosine) and sparse
-    # (BM25) scores are each min-max normalized to [0, 1] across the candidate
-    # pool, then combined as: HYBRID_DENSE_WEIGHT * dense + HYBRID_SPARSE_WEIGHT * sparse.
-    # This yields a calibrated 0-1 weighted_score comparable to filter_score
-    # (raw RRF fused scores are ~0-0.1 and would never clear a cosine-scale
-    # threshold like 0.35, silently dropping every hybrid result).
+    # Hybrid fusion: dense and sparse scores are min-max normalized, then weighted,
+    # so weighted_score stays 0-1 and comparable to filter_score.
     HYBRID_DENSE_WEIGHT: float = float(os.getenv("HYBRID_DENSE_WEIGHT", "0.7"))
     HYBRID_SPARSE_WEIGHT: float = float(os.getenv("HYBRID_SPARSE_WEIGHT", "0.3"))
 
@@ -140,18 +191,10 @@ class Settings(BaseSettings):
     # production (responses stay lean given the large default top_k).
     INCLUDE_SCORING_DEBUG: bool = os.getenv("INCLUDE_SCORING_DEBUG", "false").lower() == "true"
 
-    # Candidate pool sizing for multi-field search. Each dense named-vector search
-    # (title/text/tags/summary/metadata) and the sparse BM25 search retrieves up to
-    # `min(top_k * SEARCH_CANDIDATE_FANOUT, SEARCH_CANDIDATE_MAX)` candidates; the
-    # union is fused/ranked client-side. The CAP bounds HNSW `ef` — the dominant
-    # query cost — so a large top_k cannot trigger a 10k-deep traversal per field;
-    # the FANOUT gives small-top_k callers a re-ranking margin (retrieve more than
-    # you return). For top_k=1000 the CAP wins → 2000/field (was 10000).
-    #
-    # CAP also influences result `count`: the hybrid score is min-max normalized
-    # across the candidate pool, so a larger pool lets more docs clear filter_score.
-    # 2000 balances latency (~2x faster than the old 10000) against count fidelity.
-    # Raise toward 10000 for fuller counts, lower toward 500 for max speed.
+    # Candidates fetched per field search: min(top_k * FANOUT, MAX).
+    # FANOUT fetches more than top_k, so ranking has extra results to choose from.
+    # MAX limits the cost when top_k is large; a higher MAX is slower but lets more
+    # documents pass filter_score (scores are normalized across this pool).
     SEARCH_CANDIDATE_FANOUT: int = int(os.getenv("SEARCH_CANDIDATE_FANOUT", "8"))
     SEARCH_CANDIDATE_MAX: int = int(os.getenv("SEARCH_CANDIDATE_MAX", "2000"))
 
@@ -166,6 +209,31 @@ class Settings(BaseSettings):
                 f"HYBRID_FUSION_METHOD must be one of {sorted(valid_methods)}, "
                 f"got {self.HYBRID_FUSION_METHOD!r}"
             )
+        # BaseSettings reads the env var as typed, so normalize here: empty means inline.
+        self.ACRONYM_SEARCH_METHOD = (
+            (self.ACRONYM_SEARCH_METHOD or "").strip().lower() or const.ACRONYM_SEARCH_METHOD_INLINE
+        )
+        if self.ACRONYM_SEARCH_METHOD not in const.ACRONYM_SEARCH_METHODS:
+            raise ValueError(
+                f"ACRONYM_SEARCH_METHOD must be one of {list(const.ACRONYM_SEARCH_METHODS)} "
+                f"(empty means {const.ACRONYM_SEARCH_METHOD_INLINE}), got {self.ACRONYM_SEARCH_METHOD!r}"
+            )
+        # Redis rejects a TTL of 0 or less, which would quietly stop the acronym cache.
+        for name in ("REDIS_CACHE_TTL", "REDIS_NEGATIVE_CACHE_TTL", "REDIS_DB_ERROR_CACHE_TTL"):
+            value = getattr(self, name)
+            if value <= 0:
+                raise ValueError(f"{name} must be a whole number of seconds above 0, got {value}")
+        max_batch_size = const.ACRONYM_BULK_UPLOAD_MAX_BATCH_SIZE
+        if not 1 <= self.ACRONYM_BULK_UPLOAD_BATCH_SIZE <= max_batch_size:
+            raise ValueError(
+                f"ACRONYM_BULK_UPLOAD_BATCH_SIZE must be between 1 and {max_batch_size}, "
+                f"got {self.ACRONYM_BULK_UPLOAD_BATCH_SIZE}"
+            )
+        for name in ("ACRONYM_EXPANSION_EXACT_TITLE_BOOST", "ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST",
+                     "ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST", "ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST"):
+            value = getattr(self, name)
+            if not (math.isfinite(value) and value >= 1.0):
+                raise ValueError(f"{name} must be a finite number >= 1.0, got {value}")
         dw, sw = self.HYBRID_DENSE_WEIGHT, self.HYBRID_SPARSE_WEIGHT
         if not (math.isfinite(dw) and dw >= 0.0):
             raise ValueError(
