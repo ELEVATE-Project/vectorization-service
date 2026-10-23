@@ -976,9 +976,9 @@ class TestAcronymRankingFollowsLexicalRanking:
 
     @pytest.mark.parametrize("method, key, phrase", [
         ("dual_query", "semantic", "searched separately"),
-        ("dual_query", "keyword", "one for each meaning"),
+        ("dual_query", "keyword", "one for each expansion"),
         ("inline", "semantic", "written next to it"),
-        ("inline", "keyword", "one for each meaning"),
+        ("inline", "keyword", "one for each expansion"),
     ])
     def test_acronym_info_describes_the_method(self, service, monkeypatch, method, key, phrase):
         info = self._run(service, monkeypatch, "hybrid", method=method).acronym_info

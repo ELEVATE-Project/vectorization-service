@@ -192,18 +192,19 @@ ACRONYM_UPLOAD_DB_ERROR = (
 
 # acronym_info.method_description has three keys: semantic, keyword, boosting.
 ACRONYM_SEMANTIC_INLINE = (
-    "One search text with each acronym's meaning written next to it, "
+    "One search text with each acronym's expansion written next to it, "
     "e.g. \"PTM (Parent Teacher Meeting) documents\"."
 )
 ACRONYM_SEMANTIC_DUAL_QUERY = (
-    "The query and the query with each acronym written out "
+    "The query and the query with each acronym expanded "
     "(\"Parent Teacher Meeting documents\") are searched separately; each field keeps the higher score."
 )
-ACRONYM_KEYWORD_PER_MEANING = (
-    "One search for the query and one for each meaning; each chunk keeps the higher score."
+ACRONYM_KEYWORD_PER_EXPANSION = (
+    "One search for the query and one for each expansion; each chunk keeps the higher score."
 )
 ACRONYM_BOOSTING = (
-    "A title that equals or contains the query with the acronym written out gets "
-    "x{exact_title} or x{partial_title}, a summary x{exact_summary} or x{partial_summary}, "
-    "on top of the normal title and summary boosts (hybrid mode only)."
+    "Along with the existing boosts, a query with an acronym expansion gets: "
+    "title exact match x{exact_title}, title partial match x{partial_title}, "
+    "summary exact match x{exact_summary}, summary partial match x{partial_summary} "
+    "(hybrid mode only)."
 )

@@ -347,7 +347,7 @@ def acronym_method_description() -> Dict[str, str]:
         exact_summary=settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST,
         partial_summary=settings.ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST,
     )
-    return {"semantic": semantic, "keyword": msg.ACRONYM_KEYWORD_PER_MEANING, "boosting": boosting}
+    return {"semantic": semantic, "keyword": msg.ACRONYM_KEYWORD_PER_EXPANSION, "boosting": boosting}
 
 
 def acronym_info(acronym_query: Optional[AcronymQuery]) -> Dict[str, Any]:

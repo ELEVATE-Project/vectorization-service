@@ -114,9 +114,9 @@ Always an object for a request with query text (`null` only without query text):
 
 | Key | `inline` | `dual_query` |
 |---|---|---|
-| `semantic` | One search text with each acronym's meaning written next to it, e.g. "PTM (Parent Teacher Meeting) documents". | The query and the query with each acronym written out ("Parent Teacher Meeting documents") are searched separately; each field keeps the higher score. |
-| `keyword` | One search for the query and one for each meaning; each chunk keeps the higher score. | Same |
-| `boosting` | A title that equals or contains the query with the acronym written out gets x1.7 or x1.3, a summary x1.4 or x1.2, on top of the normal title and summary boosts (hybrid mode only). | Same |
+| `semantic` | One search text with each acronym's expansion written next to it, e.g. "PTM (Parent Teacher Meeting) documents". | The query and the query with each acronym expanded ("Parent Teacher Meeting documents") are searched separately; each field keeps the higher score. |
+| `keyword` | One search for the query and one for each expansion; each chunk keeps the higher score. | Same |
+| `boosting` | Along with the existing boosts, a query with an acronym expansion gets: title exact match x1.7, title partial match x1.3, summary exact match x1.4, summary partial match x1.2 (hybrid mode only). | Same |
 
 </details>
 
