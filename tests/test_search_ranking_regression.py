@@ -25,6 +25,7 @@ import types
 import pytest
 
 from app.config import settings
+from app.services import acronym_search
 from app.services.prioritized_search_service import PrioritizedSearchService
 
 SPARSE = settings.SPARSE_VECTOR_NAME
@@ -104,7 +105,7 @@ class TestPhraseInText:
         "Annexure 3: District Institute of Education and Training (DIET) norms",
     ])
     def test_matches_real_expansion_variants(self, service, title):
-        assert service._phrase_in_text(ACR["DIET"][0], title) is True
+        assert acronym_search._phrase_in_text(ACR["DIET"][0], title) is True
 
     @pytest.mark.parametrize("title", [
         # shares district+education but is a different programme
@@ -118,7 +119,7 @@ class TestPhraseInText:
     ])
     def test_rejects_near_misses(self, service, title):
         """ALL content words are required, so partial word overlap never promotes."""
-        assert service._phrase_in_text(ACR["DIET"][0], title) is False
+        assert acronym_search._phrase_in_text(ACR["DIET"][0], title) is False
 
     @pytest.mark.parametrize("expansion,title", [
         # An initialism must not match the phrase it abbreviates: with no length
@@ -141,7 +142,7 @@ class TestPhraseInText:
         — 97 of 110 title x expansion matches across the corpus were spurious
         this way.
         """
-        assert service._phrase_in_text(expansion, title) is False
+        assert acronym_search._phrase_in_text(expansion, title) is False
 
     @pytest.mark.parametrize("expansion,title", [
         ("School Management Committee", "School Management Committees: a handbook"),
@@ -150,14 +151,14 @@ class TestPhraseInText:
     ])
     def test_inflections_still_match(self, service, expansion, title):
         """The length floor must not cost the inflection tolerance it guards."""
-        assert service._phrase_in_text(expansion, title) is True
+        assert acronym_search._phrase_in_text(expansion, title) is True
 
 
 class TestWordsMatch:
     """_words_match is the per-word rule _phrase_in_text applies."""
 
     def test_exact_match(self, service):
-        assert service._words_match("district", "district") is True
+        assert acronym_search._words_match("district", "district") is True
 
     @pytest.mark.parametrize("word,term", [
         ("institutes", "institute"),   # plural document word, singular expansion
@@ -166,7 +167,7 @@ class TestWordsMatch:
         ("teachers", "teacher"),
     ])
     def test_prefix_counts_once_the_shorter_side_is_long_enough(self, service, word, term):
-        assert service._words_match(word, term) is True
+        assert acronym_search._words_match(word, term) is True
 
     @pytest.mark.parametrize("word,term", [
         ("s", "school"),          # initialism letter vs the word it abbreviates
@@ -175,24 +176,24 @@ class TestWordsMatch:
         ("committee", "com"),     # short side is the expansion word, same rule
     ])
     def test_prefix_below_the_floor_is_rejected(self, service, word, term):
-        assert service._words_match(word, term) is False
+        assert acronym_search._words_match(word, term) is False
 
     def test_floor_applies_to_the_shorter_side_regardless_of_order(self, service):
         """Length is measured on the shorter string, not on `word` or on `term`."""
-        assert service._words_match("edu", "education") is service._words_match(
+        assert acronym_search._words_match("edu", "education") is acronym_search._words_match(
             "education", "edu")
 
     def test_unrelated_words_never_match(self, service):
-        assert service._words_match("district", "training") is False
+        assert acronym_search._words_match("district", "training") is False
 
     def test_empty_inputs(self, service):
-        assert service._phrase_in_text("", "anything") is False
-        assert service._phrase_in_text(ACR["DIET"][0], None) is False
-        assert service._phrase_in_text(ACR["DIET"][0], "") is False
+        assert acronym_search._phrase_in_text("", "anything") is False
+        assert acronym_search._phrase_in_text(ACR["DIET"][0], None) is False
+        assert acronym_search._phrase_in_text(ACR["DIET"][0], "") is False
 
     def test_stopword_only_phrase_never_matches_everything(self, service):
         """A phrase with no content words must not match every document."""
-        assert service._phrase_in_text("of and the", "totally unrelated title") is False
+        assert acronym_search._phrase_in_text("of and the", "totally unrelated title") is False
 
     def test_content_words_drops_stopwords(self, service):
         # A tuple, not a list: _expansion_content_words is cached (the
@@ -201,7 +202,7 @@ class TestWordsMatch:
         # the SAME object. Handing out a mutable one would let any caller
         # corrupt every later hit, so the immutability is part of the
         # contract, not incidental.
-        assert service._expansion_content_words(ACR["DIET"][0]) == (
+        assert acronym_search._expansion_content_words(ACR["DIET"][0]) == (
             "district", "institute", "education", "training")
 
 
@@ -324,7 +325,7 @@ class TestExpansionTitleBoost:
         only by the title/summary scroll, not among the candidates."""
         from app.models.api_models import PrioritizedSearchRequest
 
-        monkeypatch.setattr("app.services.prioritized_search_service.detect_acronyms",
+        monkeypatch.setattr("app.services.acronym_search.detect_acronyms",
                             lambda q: dict(PTM if acronyms is None else acronyms))
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", True)
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_METHOD", "inline")
@@ -790,7 +791,7 @@ class TestAcronymExpansionStillDrivesRetrieval:
 
     def test_detected_acronym_yields_expansions(self, monkeypatch):
         """DIET must expand so 'District Institute...' documents are reachable."""
-        import app.services.acronym_query_service as aqs
+        import app.services.acronym_search as aqs
 
         monkeypatch.setattr(
             aqs, "get_expansions_batch",
@@ -804,7 +805,7 @@ class TestAcronymExpansionStillDrivesRetrieval:
         """The tokens sent to the dictionary are uppercased and stripped of
         punctuation. Pinning this is what the old stub couldn't do: it took no
         argument, so detect_acronyms could have sent anything at all."""
-        import app.services.acronym_query_service as aqs
+        import app.services.acronym_search as aqs
 
         seen = {}
 
@@ -823,7 +824,7 @@ class TestAcronymExpansionStillDrivesRetrieval:
     def test_empty_expansions_are_dropped(self, monkeypatch):
         """A row with an empty expansions list must not reach the caller —
         downstream code indexes expansions[0] unguarded."""
-        import app.services.acronym_query_service as aqs
+        import app.services.acronym_search as aqs
 
         monkeypatch.setattr(
             aqs, "get_expansions_batch",
@@ -855,7 +856,7 @@ class TestAcronymRankingFollowsLexicalRanking:
 
         detected = dict(ACR) if acronyms is None else acronyms
         monkeypatch.setattr(
-            "app.services.prioritized_search_service.detect_acronyms",
+            "app.services.acronym_search.detect_acronyms",
             lambda q: dict(detected))
         monkeypatch.setattr(settings, "ACRONYM_SEARCH_ENABLED", acronym_search_enabled)
         # Pinned, so the result does not depend on the local .env.
@@ -897,7 +898,7 @@ class TestAcronymRankingFollowsLexicalRanking:
     def _method_info(method):
         """The acronym_info keys reported whenever acronym search is on."""
         return {"method": method,
-                "method_description": PrioritizedSearchService._acronym_method_description()}
+                "method_description": acronym_search.acronym_method_description()}
 
     def test_semantic_mode_ranks_by_similarity_alone(self, service, monkeypatch):
         response = self._run(service, monkeypatch, "semantic")
@@ -975,25 +976,28 @@ class TestAcronymRankingFollowsLexicalRanking:
             expected = {**expected, **self._method_info("inline")}
         assert response.acronym_info == expected
 
-    @pytest.mark.parametrize("method, keyword_or, phrase", [
-        ("max", False, "searched separately"),
-        ("max", True, "searched separately"),
-        ("inline", True, "once more for each meaning"),
-        ("inline", False, "one keyword search"),
+    @pytest.mark.parametrize("method, keyword_or, key, phrase", [
+        ("dual_query", False, "semantic", "searched separately"),
+        ("dual_query", True, "semantic", "searched separately"),
+        ("dual_query", False, "keyword", "one for each meaning"),
+        ("inline", False, "semantic", "written next to it"),
+        ("inline", True, "keyword", "one for each meaning"),
+        ("inline", False, "keyword", "words of the query and of every meaning"),
     ])
     def test_acronym_info_describes_the_method(
-            self, service, monkeypatch, method, keyword_or, phrase):
+            self, service, monkeypatch, method, keyword_or, key, phrase):
         info = self._run(service, monkeypatch, "hybrid", method=method,
                          keyword_or=keyword_or).acronym_info
         assert info["method"] == method
-        assert phrase in info["method_description"]
+        assert set(info["method_description"]) == {"semantic", "keyword", "boosting"}
+        assert phrase in info["method_description"][key]
 
 
 # ── scoring_context reports how an acronym query was actually scored ──────
 
 class TestAcronymScoringContext:
     """search_config.scoring_context (debug only) must describe the scoring that
-    ran: the field boosts and the acronym ranking block."""
+    ran: the field boosts, including the expansion boosts for an acronym query."""
 
     def _context(self, service, monkeypatch, search_mode="hybrid", acronyms=None, **run):
         response = TestAcronymRankingFollowsLexicalRanking()._run(
@@ -1001,10 +1005,9 @@ class TestAcronymScoringContext:
             **run)
         return response.search_config["scoring_context"]
 
-    @pytest.mark.parametrize("method, dense_variants", [("inline", 1), ("max", 2)])
-    def test_acronym_query_reports_field_boosts_and_ranking(
-            self, service, monkeypatch, method, dense_variants):
-        ctx = self._context(service, monkeypatch, method=method)
+    @pytest.mark.parametrize("method", ["inline", "dual_query"])
+    def test_acronym_query_reports_field_boosts(self, service, monkeypatch, method):
+        ctx = self._context(service, monkeypatch, method=method, keyword_or=True)
         # The same boosts as any other query, plus the expansion boosts.
         assert ctx["boost_config"] == {
             "exact_title_boost": settings.EXACT_TITLE_BOOST,
@@ -1016,39 +1019,30 @@ class TestAcronymScoringContext:
             "expansion_exact_summary_boost": settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST,
             "expansion_partial_summary_boost": settings.ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST,
         }
-        assert ctx["acronym_ranking"] == {
-            "applied": True,
-            "method": method,
-            "final_score": "score before boosts x title and summary multipliers "
-                           "(see boost_config), capped at 1.0",
-            "dense_variants": dense_variants,
-        }
+        # Removed from the debug output: the "Sparse query" log line shows these texts.
+        assert "acronym_ranking" not in ctx
+        assert "keyword_or_texts" not in ctx
 
-    def test_keyword_or_texts_are_reported(self, service, monkeypatch):
-        """One keyword search per text: the query as typed, then the full name."""
-        texts = self._context(service, monkeypatch, keyword_or=True)["keyword_or_texts"]
-        assert len(texts) == 2
-        assert texts[1] == ACR["DIET"][0]
-        assert "keyword_or_texts" not in self._context(service, monkeypatch)
-
-    @pytest.mark.parametrize("method, dense_variants", [("inline", 1), ("max", 3)])
-    def test_keyword_or_searches_every_meaning(
-            self, service, monkeypatch, method, dense_variants):
+    @pytest.mark.parametrize("method, dense_variants", [("inline", 1), ("dual_query", 3)])
+    def test_keyword_or_searches_every_meaning(self, monkeypatch, method, dense_variants):
         """The dense searches stop at ACRONYM_MAX_DENSE_VARIANTS; the keyword searches do not."""
-        monkeypatch.setattr(settings, "ACRONYM_MAX_DENSE_VARIANTS", 3)
         meanings = ["District Institute of Education and Training",
                     "Daily Intake Energy Table", "Dietary Information Exchange Tool"]
-        ctx = self._context(service, monkeypatch, acronyms={"DIET": meanings},
-                            method=method, keyword_or=True)
-        assert ctx["keyword_or_texts"][1:] == meanings
-        assert ctx["acronym_ranking"]["dense_variants"] == dense_variants
+        monkeypatch.setattr("app.services.acronym_search.detect_acronyms",
+                            lambda q: {"DIET": meanings})
+        monkeypatch.setattr(settings, "ACRONYM_MAX_DENSE_VARIANTS", 3)
+        monkeypatch.setattr(settings, "ACRONYM_SEARCH_METHOD", method)
+        monkeypatch.setattr(settings, "ACRONYM_KEYWORD_OR", True)
+        query = acronym_search.build_acronym_query("DIET", "diet")
+        assert query.sparse_texts == ["diet", *meanings]
+        assert len(query.dense_texts) == dense_variants
 
-    @pytest.mark.parametrize("search_mode, hybrid_enabled, reason", [
-        ("semantic", True, "search_mode is semantic"),
-        ("hybrid", False, "HYBRID_SEARCH_ENABLED is false"),
+    @pytest.mark.parametrize("search_mode, hybrid_enabled", [
+        ("semantic", True),
+        ("hybrid", False),
     ])
-    def test_ranking_off_is_reported_with_its_reason(
-            self, service, monkeypatch, search_mode, hybrid_enabled, reason):
+    def test_boosts_off_report_neutral_multipliers(
+            self, service, monkeypatch, search_mode, hybrid_enabled):
         ctx = self._context(service, monkeypatch, search_mode=search_mode,
                             hybrid_enabled=hybrid_enabled)
         # Boosts off: every multiplier reads 1.0, and no expansion boosts.
@@ -1057,9 +1051,6 @@ class TestAcronymScoringContext:
             "partial_title_boost": 1.0,
             "exact_summary_boost": 1.0,
             "partial_summary_boost": 1.0,
-        }
-        assert ctx["acronym_ranking"] == {
-            "applied": False, "reason": reason, "dense_variants": 1,
         }
 
     def test_ordinary_query_keeps_configured_boosts(self, service, monkeypatch):
@@ -1122,7 +1113,7 @@ class TestAcronymDebugFields:
 
 class TestAcronymFieldBoosts:
     """The score of an acronym query rebuilds from the score before boosts and the four
-    title/summary multipliers, capped at 1.0 (acronym_ranking.final_score)."""
+    title/summary multipliers, capped at 1.0."""
 
     def test_score_rebuilds_from_the_multipliers(self, service, monkeypatch):
         _set_expansion_boosts(monkeypatch)
