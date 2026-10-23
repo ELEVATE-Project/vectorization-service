@@ -158,9 +158,7 @@ ACRONYM_CSV_MISSING_COLUMNS = "CSV must have columns {required_columns}, found {
 ACRONYM_CSV_NO_DATA_ROWS = "CSV file has no data rows"
 ACRONYM_CSV_DUPLICATE_COLUMNS = "CSV has duplicate columns: {columns}"
 ACRONYM_CSV_UNSUPPORTED_COLUMNS = "CSV has unsupported columns: {columns}; allowed: {allowed}"
-ACRONYM_CSV_UNNAMED_COLUMN_HAS_VALUES = (
-    "CSV column {position} has no name but has values; name it or remove it"
-)
+ACRONYM_CSV_EMPTY_COLUMN_NAME = "CSV has a column with no name (often a trailing comma in the header); remove it"
 
 # Per-row errors (errors[].reason); the other rows still commit
 ACRONYM_ROW_FIELD_COUNT = (

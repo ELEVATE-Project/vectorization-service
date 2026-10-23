@@ -90,10 +90,9 @@ async def bulk_upload_acronyms(file: UploadFile = File(...)):
 
     reader = csv.DictReader(io.StringIO(text))
     try:
-        names, unnamed = validate_csv_header(reader.fieldnames or [])
-        reader.fieldnames = names
+        reader.fieldnames = validate_csv_header(reader.fieldnames or [])
         rows = list(reader)
-        validate_csv_rows_present(rows, names, unnamed)
+        validate_csv_rows_present(rows)
     except AcronymCsvError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

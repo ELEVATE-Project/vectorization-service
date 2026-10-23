@@ -12,13 +12,13 @@ has a `# Acronym:` comment, and every acronym log line starts with `[ACRONYM]`.
 | `app/services/acronym_service.py` | The `acronym_mapping` table and its Redis cache: lookup, warm-up, upload |
 | `app/services/prioritized_search_service.py` | The search; acronym steps are `if acronym_query:` blocks |
 | `app/validations/acronym.py` | Checks for the bulk upload CSV (header and rows) |
-| `app/validations/generic.py` | Token comparison and the startup secret check |
+| `app/validations/generic.py` | Token comparison and the startup check of required environment variables |
 | `app/api/v1/endpoints/acronyms.py` | `GET /api/acronyms` and `POST /api/acronyms/bulkUpload` |
 | `app/constants/constants.py`, `messages.py` | Regex patterns, method names, CSV columns; API messages |
 
 ## Search flow
 
-For `POST /documents/search`, in order:
+For `POST /api/documents/search`, in order:
 
 1. **Clean the query**, as for any query (`preprocess_query`).
 2. **Build the acronym query** (`build_acronym_query`), only when
@@ -26,7 +26,8 @@ For `POST /documents/search`, in order:
    `None` and the rest of the search is the normal search, unchanged.
 3. **Search** with the texts it built: the semantic (dense) texts and the keyword
    (BM25) text or texts, all in one Qdrant batch call. When several texts score the
-   same chunk for the same field, the higher score is kept (`max()`).
+   same chunk for the same field, the higher score is kept (`max()`). Every search
+   logs `Search method`, `Dense query` and `Sparse query` (the texts sent to Qdrant).
 4. **Rank** as for any query.
 5. **Boost** (hybrid mode only): the normal title/summary boosts for the query as
    typed, plus the expansion boosts for the query with the acronym written out.
@@ -166,7 +167,7 @@ are saved in one transaction.
 2. **Header** (`validate_csv_header`): names are trimmed and lowercased. Duplicate or
    unknown columns reject the file (400), so a typo such as `is_actve` cannot
    silently save a row as active. `acronym` and `expansions` are required. A column
-   with no name (a trailing comma) is allowed only while it is empty.
+   with no name (a trailing comma) also rejects the file.
 3. **Each row** (`validate_acronym_row`): as many fields as the header (an unquoted
    comma would shift values); an acronym of letters only, 1 to
    `ACRONYM_MAX_PHRASE_WORDS` words, at most 32 characters, one word of at least 2
@@ -215,9 +216,11 @@ the same file is safe, because it is an upsert.
 | `POSTGRES_CONNECT_TIMEOUT` | `3` | Seconds to open a Postgres connection |
 | `POSTGRES_STATEMENT_TIMEOUT_MS` | `5000` | Longest query on Postgres |
 
-**At startup the service stops** if `INTERNAL_API_TOKEN` is not set (list:
-`REQUIRED_ENV_VARIABLES` in `app/constants/constants.py`), `ACRONYM_SEARCH_METHOD` is unknown, an expansion boost is
-below 1.0, a cache TTL is 0 or less, or the `translations` table cannot be created.
+**At startup the service stops** if `INTERNAL_API_TOKEN` is not set (the list is
+`REQUIRED_ENV_VARIABLES` in `app/constants/constants.py`), `ACRONYM_SEARCH_METHOD` is
+unknown, an expansion boost is below 1.0, a cache TTL is 0 or less,
+`ACRONYM_BULK_UPLOAD_BATCH_SIZE` is outside 1 to 10000, or the `translations` table
+cannot be created.
 
 ## Database
 

@@ -38,8 +38,6 @@ ACRONYM_CSV_COLUMNS = (
     ACRONYM_CSV_COLUMN_DESCRIPTION,
     ACRONYM_CSV_COLUMN_IS_ACTIVE,
 )
-# Placeholder name for a header column with no name (e.g. a trailing comma).
-ACRONYM_CSV_UNNAMED_COLUMN = "<unnamed column {position}>"
 
 # Acronym matching patterns; changing one changes matching.
 # Non-letters stripped from a query word: "D.I.E.T." -> "DIET", "PTM2024" -> "PTM".

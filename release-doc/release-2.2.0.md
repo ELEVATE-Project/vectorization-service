@@ -141,7 +141,7 @@ Requires the `internal_access_token` header.
 | `description` | No | Free text |
 | `is_active` | No | `true` / `false`; missing means active. Any other value is a row error. `false` only turns off an existing acronym; its stored expansions and description stay. An acronym that does not exist yet is a row error (it cannot be added as inactive). |
 
-Column names are trimmed and case-insensitive. A duplicate or unsupported column, or an unnamed column that holds values, rejects the file (400); an empty unnamed column (a trailing comma) is ignored. Each row must have as many fields as the header; a value that contains a comma must be in double quotes. A row that breaks a rule is reported in `errors`.
+Column names are trimmed and case-insensitive. A duplicate, unsupported or unnamed column (e.g. from a trailing comma in the header) rejects the file (400). Each row must have as many fields as the header; a value that contains a comma must be in double quotes. A row that breaks a rule is reported in `errors`.
 
 Response: `received`, `created`, `updated`, `deactivated`, `cache_refreshed`, `errors` (one entry per rejected row; the other rows still save), and `created_acronyms`, `updated_acronyms`, `deactivated_acronyms` in CSV order. Uploads are upserts on `acronym`, so re-uploading a file is safe. A database error returns 503 (unreachable) or 500 and says the outcome could not be confirmed.
 

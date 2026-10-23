@@ -1,6 +1,6 @@
 """Validation for the acronym bulk upload CSV: the header, then each row."""
 import re
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import settings
 from app.constants import constants as const
@@ -25,46 +25,35 @@ class AcronymCsvError(ValueError):
 # Header
 # =============================================================================
 
-def validate_csv_header(header: List[str]) -> Tuple[List[str], Set[str]]:
-    """Clean the header names and check them; returns (names, unnamed placeholders).
+def validate_csv_header(header: List[str]) -> List[str]:
+    """Clean the header names (trimmed, lowercased) and check them; returns the names.
 
-    Names are trimmed and lowercased; an unnamed column gets a placeholder name.
-    Raises AcronymCsvError for duplicate, unsupported or missing required columns.
+    Raises AcronymCsvError for an empty, duplicate, unsupported or missing required column.
     """
-    names: List[str] = []
-    unnamed: Set[str] = set()
-    for position, name in enumerate(header, start=1):
-        clean = (name or "").strip().lower()
-        if not clean:
-            clean = const.ACRONYM_CSV_UNNAMED_COLUMN.format(position=position)
-            unnamed.add(clean)
-        names.append(clean)
-    named = [n for n in names if n not in unnamed]
+    names = [(name or "").strip().lower() for name in header]
 
-    duplicates = sorted({n for n in named if named.count(n) > 1})
+    if "" in names:
+        raise AcronymCsvError(msg.ACRONYM_CSV_EMPTY_COLUMN_NAME)
+    duplicates = sorted({n for n in names if names.count(n) > 1})
     if duplicates:
         raise AcronymCsvError(msg.ACRONYM_CSV_DUPLICATE_COLUMNS.format(columns=duplicates))
-    unsupported = [n for n in named if n not in const.ACRONYM_CSV_COLUMNS]
+    unsupported = [n for n in names if n not in const.ACRONYM_CSV_COLUMNS]
     if unsupported:
         raise AcronymCsvError(msg.ACRONYM_CSV_UNSUPPORTED_COLUMNS.format(
             columns=unsupported, allowed=sorted(const.ACRONYM_CSV_COLUMNS)
         ))
     required_columns = {const.ACRONYM_CSV_COLUMN_ACRONYM, const.ACRONYM_CSV_COLUMN_EXPANSIONS}
-    if not required_columns.issubset(named):
+    if not required_columns.issubset(names):
         raise AcronymCsvError(msg.ACRONYM_CSV_MISSING_COLUMNS.format(
             required_columns=sorted(required_columns), found_columns=header
         ))
-    return names, unnamed
+    return names
 
 
-def validate_csv_rows_present(rows: List[dict], names: List[str], unnamed: Set[str]) -> None:
-    """Raise AcronymCsvError when there are no rows, or an unnamed column holds values."""
+def validate_csv_rows_present(rows: List[dict]) -> None:
+    """Raise AcronymCsvError when the file has no data rows."""
     if not rows:
         raise AcronymCsvError(msg.ACRONYM_CSV_NO_DATA_ROWS)
-    # An unnamed column is accepted only while it is empty (a trailing comma).
-    for position, name in enumerate(names, start=1):
-        if name in unnamed and any((row.get(name) or "").strip() for row in rows):
-            raise AcronymCsvError(msg.ACRONYM_CSV_UNNAMED_COLUMN_HAS_VALUES.format(position=position))
 
 
 # =============================================================================

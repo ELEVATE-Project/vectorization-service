@@ -680,22 +680,20 @@ class PrioritizedSearchService:
                 }
 
             # Gated by include_scoring_debug to keep prod responses lean. _rank_results
-            # has already filled scoring_context; add the boosts and acronym ranking.
+            # has already filled scoring_context; add just the boost multipliers.
             if request.include_scoring_debug:
                 # Never default dense_weight/sparse_weight from settings: _rank_results
                 # writes them only where weighted fusion ran, so their absence is the
                 # signal that it didn't (dense-only, empty-BM25, RRF).
                 scoring_context["boost_config"] = self._boost_config(lexical_ranking_enabled)
                 if soft_acronym_ranking:
-                    # Acronym: report the expansion boosts and how the query was searched.
+                    # Acronym: report the expansion boosts too.
                     scoring_context["boost_config"].update({
                         "expansion_exact_title_boost": settings.ACRONYM_EXPANSION_EXACT_TITLE_BOOST,
                         "expansion_partial_title_boost": settings.ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST,
                         "expansion_exact_summary_boost": settings.ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST,
                         "expansion_partial_summary_boost": settings.ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST,
                     })
-                if sparse_query_texts:
-                    scoring_context["keyword_or_texts"] = sparse_query_texts
                 search_config["scoring_context"] = scoring_context
 
             # total_results = all unique matched sources (semantic pool ∪ injected boost docs),
