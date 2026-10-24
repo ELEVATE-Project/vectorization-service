@@ -147,6 +147,20 @@ def parse_args() -> argparse.Namespace:
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
+def _target_sparse_names(client, collection_name: str) -> list:
+    """Return the sparse vector names declared on *collection_name* (empty on failure).
+
+    Used by the copy step to know which sparse vectors must be carried over, and by
+    Step 1 to validate a pre-existing target.
+    """
+    try:
+        cfg = client.get_collection(collection_name).config.params.sparse_vectors
+    except Exception as exc:
+        logger.warning(f"Could not read sparse config of '{collection_name}': {exc}")
+        return []
+    return sorted(cfg.keys()) if cfg else []
+
+
 def _flush_update_vectors(client, collection_name: str, pending: list, dry_run: bool) -> tuple[int, int]:
     """Flush a batch of PointVectors via update_vectors. Returns (migrated, errors)."""
     if not pending:
@@ -228,8 +242,18 @@ def run_inplace(client, collection_name: str, sparse_name: str, args,
         try:
             points, next_offset = client.scroll(**scroll_kwargs)
         except Exception as exc:
+            # Fatal: previously this broke out of the loop and the run still printed
+            # "migration complete ... errors=0" and exited 0, which reads as success
+            # while nothing was written. The usual cause is the collection not
+            # declaring `sparse_name`, which makes with_vectors=[sparse_name] 400.
             logger.error(f"Scroll failed: {exc}")
-            break
+            if sparse_name not in _target_sparse_names(client, collection_name):
+                logger.error(
+                    f"   Collection '{collection_name}' does not declare sparse vector "
+                    f"'{sparse_name}'. Qdrant cannot add a sparse field to an existing "
+                    f"collection — use blue-green mode (--new-collection) instead."
+                )
+            sys.exit(1)
 
         for point in points:
             scanned += 1
@@ -276,6 +300,12 @@ def run_inplace(client, collection_name: str, sparse_name: str, args,
         f"In-place migration complete in {elapsed:.1f}s — "
         f"scanned={scanned}, migrated={migrated}, skipped={skipped}, no_tokens={no_tokens}, errors={errors}"
     )
+    if scanned == 0 and total_points > 0:
+        logger.error(
+            f"Scanned 0 of {total_points} points — nothing was migrated. "
+            "This is a failure, not a no-op."
+        )
+        sys.exit(1)
     if errors:
         logger.warning(f"{errors} encoding errors. Re-run to retry (script is idempotent).")
         sys.exit(1)
@@ -430,6 +460,23 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
     existing_cols = [c.name for c in client.get_collections().collections]
     if new_col in existing_cols:
         logger.info(f"Target '{new_col}' already exists — skipping creation.")
+        # A sparse vector field CANNOT be added to an existing collection: Qdrant
+        # rejects update_collection(sparse_vectors_config=...) with
+        # "Not existing vector name error". If a pre-existing target lacks the field,
+        # every later read/write of it 400s, so the BM25 step would write nothing.
+        # Fail loudly here instead of copying data into a collection that can never
+        # hold sparse vectors.
+        if not args.dry_run and sparse_name not in _target_sparse_names(client, new_col):
+            logger.error(
+                f"Target '{new_col}' exists but does not declare sparse vector "
+                f"'{sparse_name}'. Qdrant cannot add a sparse field to an existing "
+                f"collection, so BM25 can never be stored there."
+            )
+            logger.error(
+                f"   Fix: migrate into a NEW collection name, or delete '{new_col}' "
+                f"and re-run so this script creates it with the sparse field."
+            )
+            sys.exit(1)
     elif not args.dry_run:
         logger.info(f"Creating target collection '{new_col}'...")
         client.create_collection(
@@ -448,8 +495,23 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
         logger.info("=" * 60)
         logger.info("STEP 2: Copying dense vectors + payload")
         copied = 0
+        preserved = 0
         offset = None
         start = time.monotonic()
+
+        # `upsert` REPLACES a point's entire vector map — any named vector absent from
+        # the upserted PointStruct is deleted. The source collection typically has no
+        # sparse vectors (that is the whole reason for migrating), so copying straight
+        # from it STRIPS any sparse vector the target already holds. Re-running the copy
+        # over an already-migrated target therefore silently wipes every BM25 vector it
+        # touches. Guard: read back the sparse vectors the target already has for each
+        # batch of ids and merge them into the upsert so they survive.
+        target_sparse = [] if args.dry_run else _target_sparse_names(client, new_col)
+        if target_sparse:
+            logger.info(
+                f"  Target declares sparse {target_sparse} — existing sparse vectors "
+                f"will be preserved across the copy."
+            )
 
         while True:
             scroll_kwargs = dict(
@@ -471,10 +533,42 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
                 break
 
             if not args.dry_run:
-                structs = [
-                    PointStruct(id=p.id, payload=p.payload, vector=p.vector)
-                    for p in points
-                ]
+                # Sparse vectors already on the target for these ids, keyed by point id.
+                keep: dict = {}
+                if target_sparse:
+                    try:
+                        for rec in client.retrieve(
+                            collection_name=new_col,
+                            ids=[p.id for p in points],
+                            with_vectors=target_sparse,
+                            with_payload=False,
+                        ):
+                            have = {
+                                name: vec
+                                for name, vec in (rec.vector or {}).items()
+                                if name in target_sparse
+                                and getattr(vec, "indices", None)
+                            }
+                            if have:
+                                keep[rec.id] = have
+                    except Exception as exc:
+                        # Never destroy data on a failed read — abort instead.
+                        logger.error(
+                            f"Could not read existing sparse vectors from '{new_col}': {exc}. "
+                            "Aborting rather than risk overwriting them."
+                        )
+                        sys.exit(1)
+
+                structs = []
+                for p in points:
+                    vector = dict(p.vector or {})
+                    existing_sparse = keep.get(p.id)
+                    if existing_sparse:
+                        vector.update(existing_sparse)
+                        preserved += 1
+                    structs.append(
+                        PointStruct(id=p.id, payload=p.payload, vector=vector)
+                    )
                 try:
                     client.upsert(collection_name=new_col, points=structs)
                     copied += len(structs)
@@ -492,6 +586,11 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
             offset = next_offset
 
         logger.info(f"Copy complete: {copied} points transferred.")
+        if preserved:
+            logger.info(
+                f"  Preserved existing sparse vectors on {preserved} point(s) "
+                "that the source did not carry."
+            )
     else:
         logger.info("Skipping copy step (--skip-copy).")
 
@@ -518,8 +617,20 @@ def run_bluegreen(client, old_col: str, new_col: str, sparse_name: str, args,
             try:
                 points, next_offset = client.scroll(**scroll_kwargs)
             except Exception as exc:
+                # Fatal for the same reason as the in-place scroll above: breaking here
+                # left the run reporting "BM25 encoding complete ... errors=0" having
+                # written nothing.
                 logger.error(f"Scroll on target failed: {exc}")
-                break
+                if sparse_name not in _target_sparse_names(client, new_col):
+                    logger.error(
+                        f"   Target '{new_col}' does not declare sparse vector "
+                        f"'{sparse_name}', so BM25 cannot be stored. Migrate into a new "
+                        f"collection name so this script creates it with the field."
+                    )
+                logger.error(
+                    f"   Retry the BM25 step alone once fixed: --new-collection {new_col} --skip-copy"
+                )
+                sys.exit(1)
 
             for point in points:
                 # Skip already-encoded points (idempotent)

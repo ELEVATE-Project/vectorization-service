@@ -5,9 +5,11 @@ from starlette.concurrency import run_in_threadpool
 from app.api.v1.api import api_router
 from app.core.clients.qdrant import ensure_collections_exist
 from app.core.clients.embedding import EmbeddingError
+from app.core.database import init_db
 from app.services.acronym_service import load_acronym_cache
 from app.utils.json_handler import CustomJSONResponse
 from app.config import settings
+from app.validations.generic import check_required_env_variables
 import logging
 
 logger = logging.getLogger(__name__)
@@ -16,6 +18,16 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
+    # Stops the startup if a required variable is empty; deps.py still checks each request.
+    check_required_env_variables()
+
+    try:
+        # Blocking database I/O: run in a thread so it does not block the event loop.
+        await run_in_threadpool(init_db)
+    except Exception as e:
+        logger.error(f"Startup failed: could not create the translations table: {str(e)}")
+        raise
+
     try:
         await ensure_collections_exist()
     except Exception as e:
@@ -23,16 +35,11 @@ async def lifespan(app: FastAPI):
         raise
 
     try:
-        # load_acronym_cache() is synchronous (blocking Postgres + Redis I/O) —
-        # must run in a thread, not be awaited directly, or it stalls the event
-        # loop (and every other in-flight request) for its full duration.
+        # Blocking I/O: run in a thread so it does not block the event loop.
         await run_in_threadpool(load_acronym_cache)
     except Exception as e:
-        # Not fatal: get_expansions_batch() already falls back to Postgres per lookup,
-        # so a failed warm-up only costs a few extra DB round-trips on first
-        # touch — it must not take down the whole service (e.g. a fresh
-        # deploy where the migration hasn't run yet, or a transient Redis
-        # blip, would otherwise prevent boot entirely).
+        # Not fatal: lookups fall back to Postgres, so a failed warm-up (migration
+        # not run yet, Redis down) must not stop the service from starting.
         logger.warning(f"Acronym cache warm-up failed, continuing without it: {str(e)}")
 
     logger.info("Application startup completed")

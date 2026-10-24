@@ -14,8 +14,10 @@ class DeleteService(BaseDocumentOperation):
     async def delete(self, source_id: str, company_id: Optional[str] = None):
         """Delete all documents with the given source_id and optional company_id"""
         try:
-            # Validate inputs
-            self.validate_source_id(source_id)
+            # Use the normalized ids: upload stores them stripped, so a padded
+            # " 975 " must still filter on "975" or the delete returns a false 404.
+            source_id = self.validate_source_id(source_id)
+            company_id = self.normalize_company_id(company_id)
 
             # Ensure collections exist
             await self.ensure_collections()

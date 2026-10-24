@@ -12,6 +12,7 @@ from langchain_core.documents import Document as LangchainDocument
 
 from .base_processor import BaseFileProcessor
 from app.services.translation_service import process_chunk
+from app.constants import messages as msg
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -394,4 +395,4 @@ class XLSXProcessor(BaseFileProcessor):
         except Exception as e:
             logger.error(f"XLSX processing error for '{filename}': {str(e)}")
             logger.error(f"Traceback: {traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=f"Error processing XLSX: {str(e)}")
+            raise HTTPException(status_code=500, detail=msg.XLSX_PROCESSING_FAILED.format(error=e))

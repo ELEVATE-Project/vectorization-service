@@ -1,354 +1,252 @@
 # Acronym search — design notes
 
-Why the acronym code works the way it does. Code comments stay short and point
-here; each section keeps the reasoning (and the bug or measurement behind it)
-that used to live inline.
+How acronym search works today, where the code is, and why it works that way.
+Code comments stay short and point here. In the code, every acronym-specific spot
+has a `# Acronym:` comment, and every acronym log line starts with `[ACRONYM]`.
 
-## Detection (`acronym_query_service.detect_acronyms`)
+## Where the code is
 
-**Case-insensitive on purpose.** Every token of 2+ letters is a candidate,
-whatever its case, and the dictionary decides. An uppercase-only rule was
-stricter ("diet" in "the diet chart" should not match DIET), but the commons
-media API lowercases queries before forwarding them, which silently disabled
-acronym search for every multi-word query. The dictionary is the filter: a
-lowercase word that is not a registered acronym resolves to nothing, so only
-words that are both everyday English and on file can match by accident.
+| File | What it does |
+|---|---|
+| `app/services/acronym_search.py` | Detects acronyms in a query and builds the texts the query is searched with |
+| `app/services/acronym_service.py` | The `acronym_mapping` table and its Redis cache: lookup, warm-up, upload |
+| `app/services/prioritized_search_service.py` | The search; acronym steps are `if acronym_query:` blocks |
+| `app/validations/acronym.py` | Checks for the bulk upload CSV (header and rows) |
+| `app/validations/generic.py` | Token comparison and the startup check of required environment variables |
+| `app/api/v1/endpoints/acronyms.py` | `GET /api/acronyms` and `POST /api/acronyms/bulkUpload` |
+| `app/constants/constants.py`, `messages.py` | Regex patterns, method names, CSV columns; API messages |
 
-**Stopwords are checked, not discarded.** In a multi-word query, stopwords
-(THE, AND, ON) are kept out of the ordinary candidate list but still looked up
-in the same batch. A stopword that is also a registered acronym (BE, ME, SO) is
-kept; one that is not stays out. Before this, "BE admission" found nothing,
-because "be" was thrown away before anyone checked. Single-word queries are
-never stripped.
+## Search flow
 
-**Multi-word entries.** The dictionary stores "RTE ACT" and "PM SHRI" as one key
-with a space. Detection also tries every contiguous window of 2 to
-`ACRONYM_MAX_PHRASE_WORDS` words, each word normalized like a single token.
-Phrases get no stopword filter: a whole phrase is specific enough that the
-lookup itself is the filter. A window containing a word that normalizes to
-nothing (a pure number, or "&") is skipped rather than bridged, so two
-non-adjacent words are never glued into a phrase.
+For `POST /api/documents/search`, in order:
 
-**Recovery for text commons already mangled.** Commons replaces every
-punctuation character with a space, so "D.I.E.T." and "DIET's" never arrive
-intact.
-- *Plural retry:* a single-token candidate ending in "S" that misses as typed
-  ("DIETS") is retried once without the S ("DIET"), and reported under the
-  singular key. The dictionary still decides: "ADMISSIONS" retries
-  "ADMISSION" and finds nothing.
-- *Single-letter gluing:* a run of 2+ one-letter tokens ("d i e t") is what a
-  dotted initialism becomes, and normal English almost never produces it, so
-  the run is also tried glued ("DIET"). Accepted trade-off: "a i" would glue
-  into the registered "AI"; the dot-vs-space difference is already gone by the
-  time the query reaches us.
+1. **Clean the query**, as for any query (`preprocess_query`).
+2. **Build the acronym query** (`build_acronym_query`), only when
+   `ACRONYM_SEARCH_ENABLED` is true. It detects acronyms; with none it returns
+   `None` and the rest of the search is the normal search, unchanged.
+3. **Search** with the texts it built: the semantic (dense) texts and the keyword
+   (BM25) text or texts, all in one Qdrant batch call. When several texts score the
+   same chunk for the same field, the higher score is kept (`max()`). Every search
+   logs `Dense query` and `Sparse query` (the texts sent to Qdrant); an acronym query
+   also logs its method (`[ACRONYM] searching with the inline texts …`).
+4. **Rank** as for any query.
+5. **Boost** (hybrid mode only): the normal title/summary boosts for the query as
+   typed, plus the expansion boosts for the query with the acronym written out.
+6. **Add back** title/summary matches that the score threshold dropped.
+7. **Respond** with `acronym_info`, and the debug fields when
+   `include_scoring_debug` is true.
 
-**Digits.** Digits are stripped per word ("PTM2024" -> "PTM"). So "RTE2024 ACT"
-is detected as "RTE ACT", but not substituted in the query, because trailing
-digits only attach to the last word of a match. "RTE ACT 2024" is unaffected.
+## Detection (`detect_acronyms`)
 
-**Empty expansions are dropped.** The `expansions` column defaults to `[]`, and
-only `bulk_upsert` checks for a non-empty list, so a row written another way
-could be empty. Filtering here protects both users in `search()` (the
-substitution regex and the sparse OR-join) at once.
+Every word of 2+ letters, and every run of 2 to `ACRONYM_MAX_PHRASE_WORDS` words,
+is looked up in the dictionary in one batch. The dictionary decides what is an
+acronym, so a normal word only matches if it is also a registered acronym.
 
-## Query substitution (`_acronym_substitution_pattern`)
+- **Any case.** The commons media API lowercases queries, so "diet" must find DIET.
+- **Stopwords are still looked up.** BE, ME and SO are acronyms and stopwords at
+  the same time; other stopwords are not in the dictionary and resolve to nothing.
+  The query clean-up keeps a detected acronym even when it is a stopword
+  (`preprocess_query(..., keep_words=...)`), so it can still be written out.
+- **Multi-word keys** ("RTE ACT", "PM SHRI") are found through the word runs. A run
+  that contains a word with no letters ("&", "2024") is skipped, so two words that
+  are not next to each other are never joined.
+- **Plurals.** A word ending in "S" that is not found ("DIETS") is tried once
+  without the S ("DIET") and reported under the singular key.
+- **Dotted initialisms.** Commons turns "D.I.E.T." into "d i e t", so a run of
+  single letters is also tried joined ("DIET"). Side effect: "a i" can join into "AI".
+- **Digits and punctuation are removed per word**: "PTM2024" and "PTM's" find PTM.
+- **Only the first `ACRONYM_MAX_QUERY_WORDS` (30) words** are checked. Each word adds
+  up to `ACRONYM_MAX_PHRASE_WORDS` lookups and cache entries, so a very long query
+  would otherwise mean unbounded Redis and Postgres work.
+- **Entries with no expansions are dropped**, so the search never sees one.
 
-The dense expansion variant is built by replacing the acronym in the query with
-its expansion. A plain `\bDIET\b` only found a bare "DIET", while detection also
-accepts "D.I.E.T.", "d i e t", "DIETS" and "PTM2024". Those were detected and
-reported, but the dense expansion was silently never built. So the pattern
-accepts the same shapes:
-- Letters separated by optional punctuation *or* whitespace ("D.I.E.T.",
-  "d i e t"). Only single characters can take the whitespace path, the same
-  shape detection needs before it glues a run, so ordinary prose is not
-  matched.
-- Multi-word keys ("RTE ACT"): each word gets its own letter pattern, joined by
-  required whitespace with optional punctuation around it ("R.T.E. Act").
-- `(?<![A-Za-z])` / `(?![A-Za-z])`: "dietary" is still rejected.
-- An optional trailing "S", matching detection's plural retry. "diets" matches;
-  "dietary" still does not, because "ary" is letters.
-- Trailing digits are captured, not consumed, so "ptm2024" expands to
-  "Parent Teacher Meeting 2024".
-- Longest key first ("RTE ACT" before "RTE", PMS before PM), because regex
-  alternation is leftmost-first, not longest-match.
+## Building the search texts (`build_acronym_query`)
 
-## Title and summary matching (`_build_field_match_queries`)
+It returns an `AcronymQuery`:
 
-Substring matching boosted "Dietary Guidelines" for DIET and "Basic Maths" for
-BA, so each check carries its own rule:
-- `substring`: the pre-acronym behaviour, used only when no acronym is
-  detected, so ordinary queries are unchanged.
-- `word`: whole-word, for the query and each acronym on acronym queries.
+| Field | Used for |
+|---|---|
+| `dense_texts` | Semantic search |
+| `sparse_text` | One keyword search: the query as typed plus the words of every meaning |
+| `sparse_texts` | One keyword search per text (or `None` when nothing was written out) |
+| `written_out` | The query with each acronym written out, one per meaning, for the expansion boosts |
 
-Expansions are not matched in titles or summaries. Retrieval (the expansion's
-dense variant and BM25 words) and the relevance blend already reward documents
-that spell the expansion out; also boosting them on top over-rewarded generic
-titles. Known limitation: the `word` rule ignores case, so a "Diet" title gets
-the DIET title multiplier. Measured locally, such a document only enters as a
-keyword-injected row at the floor and ranks near the bottom; matching
-single-word acronyms case-sensitively (as the body check does) is the fix if it
-matters.
+**The method** (`ACRONYM_SEARCH_METHOD`):
 
-`_term_in_text` uses letter/digit lookarounds instead of `\b`, because `\b`
-treats `_` as a word character and missed "DIET" in file-name titles like
-"..._DIET Empowerment..." (seen on real titles).
+- **`inline`** (default): one semantic text with every meaning written next to its
+  acronym, then cleaned like any query: "PTM documents" → "PTM (Parent Teacher
+  Meeting) documents" → "ptm parent teacher meeting documents". An acronym with
+  two meanings gets both: "MIP (Micro Improvement Project, Micro Improvement Plan)".
+- **`dual_query`**: the cleaned query plus one text per meaning, each searched
+  separately: "ptm documents", "Parent Teacher Meeting documents". At most
+  `ACRONYM_MAX_DENSE_VARIANTS` texts, the query included.
 
-`_phrase_in_text` is kept for query building: it decides whether the query
-already spells out an expansion (see Search pipeline). It requires **all**
-content words, allowing inflections by prefix ("institute" ~ "institutes");
-`_words_match` limits prefix matches by `ACRONYM_MIN_PREFIX_MATCH_LEN` and
-`ACRONYM_PREFIX_SUFFIX_CAP`, so "tests" matches "test" but "testimony" does not.
+**Keyword search** (both methods): one keyword search per text ("diet", then
+"District Institute of Education and Training"), not capped; each chunk keeps its
+higher raw BM25 score. When nothing is written out (the query already spells the
+meaning out), one keyword search uses `sparse_text`.
 
-## Body check (`_sources_with_acronym_in_body`)
+**Writing an acronym out** (`_acronym_substitution_pattern`, `_expand_match`):
 
-Feeds the text boost: a document whose body uses the acronym gets
-`EXACT_TEXT_BOOST`.
-- One BM25 query per acronym, restricted to the checked sources and grouped by
-  source.
-- BM25 folds case, so "diet" and "DIET" look the same. The top chunks
-  (`ACRONYM_BODY_CHECK_TOP_CHUNKS`) must use the acronym in capitals
-  (`_acronym_use_pattern`), so a food article about diet fails. Multi-word keys
-  ("RTE Act", "NIPUN Bharat") match in any case.
-- Top chunks rank by how often the word appears, not by case, so a BM25 hit
-  that fails in its top chunks has all its chunks read before it is rejected.
-- Only the acronym counts. A body that only spells out the expansion gets no
-  text boost: retrieval and the relevance blend cover it.
-- Only candidates that can still reach the page are checked (score x
-  `EXACT_TEXT_BOOST`, capped at 1.0, reaches the k-th score), best first, at
-  most `ACRONYM_BODY_CHECK_MAX_SOURCES`. The rule alone never changes a
-  ranking; the cap only can when more candidates than that could still reach
-  the page.
-- Chunks without a BM25 vector (indexed before BM25 was enabled) never answer
-  the BM25 query, so they are listed with a `has_vector` filter and their text is
-  checked directly with the same pattern. This also covers a fully pre-BM25
-  collection. On a Qdrant without `has_vector` filtering (before 1.13) the
-  lookup is rejected (HTTP 400) and those chunks stay unchecked. The rejection
-  is remembered, so later searches skip the lookup until restart; other
-  failures are retried on the next search.
-- Returns None when the check cannot run (sparse search off, encoder missing,
-  query failed); the text boost is then skipped.
-- `body_check` in the debug output: "bm25" (every checked document indexed),
-  "bm25+scan" (some read directly), "scan" (all read directly), "bm25 (scan
-  unsupported)" (Qdrant rejected has_vector; unindexed chunks unchecked), "unavailable"
-  (the check could not run), "none" (nothing to check).
+- One regex finds every detected acronym in one pass, so a meaning that contains
+  another acronym is never replaced again. Longest key first ("RTE ACT" before "RTE").
+- It accepts the same shapes as detection: letters split by punctuation or single
+  spaces ("D.I.E.T.", "d i e t"), multi-word keys ("R.T.E. Act"), a plural "S".
+- Letters next to an acronym block a match ("ptmabc", "dietary").
+- Digits next to it are kept as their own word: "ptm2024" → "Parent Teacher Meeting
+  2024", "123ptm" → "123 Parent Teacher Meeting".
+- An acronym is **not** written out when the query already spells its meaning out
+  (`_phrase_in_text`), so the meaning is not added twice. Every content word of the
+  meaning must be in the query, each matched to its own word, so a repeated word
+  must appear as often ("mbbs bachelor medicine surgery" does not spell out
+  "Bachelor of Medicine and Bachelor of Surgery"). Word forms match by prefix
+  ("institute" ~ "institutes"), limited by `ACRONYM_MIN_PREFIX_MATCH_LEN` and
+  `ACRONYM_PREFIX_SUFFIX_CAP` ("tests" ~ "test", but not "testimony").
+- An empty mapping is rejected (`ValueError`): its pattern would match bare digits.
 
-## Field boosts (acronym queries)
+The regex pieces are constants: `ACRONYM_MATCH_TEMPLATE`, `ACRONYM_LETTER_GAP_PATTERN`,
+`ACRONYM_WORD_GAP_PATTERN`.
 
-final = acronym_pre_boost_score x title multiplier x summary multiplier x text
-multiplier, capped at 1.0. The title/summary multipliers are the ordinary
-`EXACT_*`/`PARTIAL_*` boosts, matched on the query and the acronym (see Title
-and summary matching); the text multiplier is `EXACT_TEXT_BOOST` when the body
-uses the acronym (see Body check).
+## Boosts and add-back (acronym queries)
 
-This replaced the acronym bonus (final = relevance x (1 + bonus), with grades
-for the acronym or expansion in the title or summary). A comparison on 33
-acronym queries found no speed difference and similar relevance, and field
-boosts are simpler code. Known trade-off: stacked multipliers on a capped score
-put many good documents at exactly 1.0, so ties at the top are common; their
-order follows the score before the cap.
+final score = score before boosts × every multiplier that applies, capped at 1.0.
 
-## Relevance blend (`_blended_acronym_relevance`)
+| Multiplier | When |
+|---|---|
+| `EXACT_TITLE_BOOST` / `PARTIAL_TITLE_BOOST` (any query) | The title equals / contains the query as typed |
+| `ACRONYM_EXPANSION_EXACT_TITLE_BOOST` (1.7) / `..._PARTIAL_TITLE_BOOST` (1.3) | The title equals / contains a written-out query |
+| `EXACT_SUMMARY_BOOST` / `PARTIAL_SUMMARY_BOOST` (any query) | The same for the summary |
+| `ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST` (1.4) / `..._PARTIAL_SUMMARY_BOOST` (1.2) | The same for the summary |
 
-acronym_pre_boost_score = (1 - W) x score vs query + W x score vs expansion,
-W = `ACRONYM_EXPANSION_SCORE_WEIGHT` (0.5). Retrieval merges both texts with
-max(), which is right for finding documents but wrong for scoring them: a
-generic expansion scores any education document highly ("District Primary
-Education Programme" went from 0.28 against "DIET" to 0.89 with the expansion,
-above every real DIET document), while a bare "ptm" means almost nothing.
-Averaging needs both to agree.
+- For "PTM": "Parent Teacher Meeting" as a title gets 1.7, "Parent Teacher
+  Meeting Guidelines" 1.3, "PTM Guidelines" the normal 1.5. A title with both forms
+  gets both (1.5 × 1.3). Word order and plurals are not matched.
+- **One scroll per field, no extra Qdrant call.** The title (and summary) scroll
+  matches the query as typed OR any written-out query; each document is then
+  classified against both in Python.
+- **Add-back.** Title/summary matches that the threshold dropped are added with the
+  floor score `min(max(0.15 × boost, threshold), 1.0)`: title matches first, then
+  expansion-title, summary, expansion-summary; a document is added once.
+- **Semantic mode** (`search_mode="semantic"`, or `HYBRID_SEARCH_ENABLED=false`):
+  no boosts and no add-back, but the search still uses the acronym texts.
+- 1.0 turns a boost off; a value below 1.0 stops the service at startup.
 
-Only the top `ACRONYM_RESCORE_POOL_LIMIT` candidates are rescored; the rest keep
-their retrieval score (and show no `acronym_pre_boost_score`). The full pool's min/max
-(`normalization_reference`) is passed so the rescored subset stays on the same
-scale; otherwise ordering and `filter_score` break at the cutoff. RRF mode
-rescores the whole pool, because RRF scores are rank-based and cannot use that
-reference.
-
-## Settings (`app/config.py`)
-
-**`ACRONYM_EXPANSION_SCORE_WEIGHT` = 0.5.** Chosen on 2026-09-29 by comparing
-0.2, 0.35, 0.65, 0.8 and 0.7 on 19 acronyms of the local corpus
-(`scripts/simulate_soft_acronym_boost.py`; the acronym bonus still existed
-then). At 0.2 the acronym side dominated: a nutrition document titled "Healthy
-Diet Guide" outranked real DIET documents (MiniLM reads "diet" as food), and
-documents that only spell out the expansion ranked far below their content.
-Above 0.5 the expansion's generic words took over ("District ... Education"
-pulled "District Primary Education Programme" into DIET's top 5; "School ...
-Committee" pushed SMC modules out of SMC's top 10).
-
-**`EXACT_TEXT_BOOST` = 2.0.** The text multiplier for a body that uses the
-acronym. It only applies on acronym queries, after the title/summary
-multipliers.
-
-**`ACRONYM_BODY_CHECK_MAX_SOURCES` = 200.** Caps the documents whose body the
-text boost checks, so its cost does not grow with the candidate pool. Measured
-locally: rankings identical for 33 acronym queries at `filter_score` 0.35; at
-`filter_score` 0 with top_k 100, 5 queries changed from rank 39 down, between
-near-equal scores.
-
-**`ACRONYM_RESCORE_POOL_LIMIT` = 200.** The blend costs two more Qdrant round
-trips. Uncapped it raised latency by 115% at top_k=10 and 297% at top_k=1000
-(measured). Blending only reweights two signals the pool is already ranked by,
-so a document far down is not going to reach the top.
-
-**`ACRONYM_MAX_DENSE_VARIANTS` = 3.** AC-11: an ambiguous acronym (SSC = Staff
-Selection Commission or Sainik School Society) used to get a dense variant for
-its first expansion only. Now one variant per expansion, capped by this setting
-(including the original query). Only SSC, DM and MIP are ambiguous today.
-
-**`ACRONYM_MIN_PREFIX_MATCH_LEN` = 4.** Below four characters a "prefix" is an
-initial, not a stem: "s" would stand in for "school", so "S M C Handbook" read
-as School Management Committee. It is a stem length for expansion words, not a
-limit on acronym length (that is the column width, 32).
-
-**`ACRONYM_PREFIX_SUFFIX_CAP` = 3.** Real inflections add a few characters
-("test" ~ "tests"); unrelated words sharing a prefix add more ("testimony").
-Checked against the dictionary to keep plural/tense forms while blocking
-collisions on short expansion words ("post", "work", "home", "master").
-
-**`ACRONYM_SEARCH_ENABLED` defaults to true**, matching `.env.sample` and the
-release note. With it off, ranking is exactly the pre-feature behaviour
-(pinned by `TestFusionFormulaHasNoAcronymBranch`).
-
-**`REDIS_NEGATIVE_CACHE_TTL` (1 h)** caches "not an acronym" so ordinary query
-words do not hit Postgres on every request. Uploads refresh the cache for their
-acronyms, so this TTL only bounds staleness in rare races.
-
-**Postgres timeouts.** psycopg has no connect timeout by default: a blackholed
-host (packets dropped, not refused) hung a connect past 15 s in a live test,
-hence `POSTGRES_CONNECT_TIMEOUT`. An open connection to an unresponsive server
-(stuck lock, frozen backend) hung every query, found in a pause test, hence
-`POSTGRES_STATEMENT_TIMEOUT_MS` = 5 s. Every query here is a small indexed
-lookup, so 5 s never fires against a healthy database.
+**Response.** `acronym_info`: `enabled`, `detected`, `method`, `method_description`
+(`semantic`, `keyword`, `boosting`),
+and when found the `mapping` and the `ambiguous` acronyms (two or more meanings).
+Debug only: `title_expansion_multiplier`, `summary_expansion_multiplier`,
+`title_expansion_match`, `summary_expansion_match`, and in
+`scoring_context` the expansion boosts.
 
 ## Cache (`acronym_service`)
 
-`get_expansions_batch` is cache-aside: one Redis `MGET` for every candidate of a
-query, Postgres for the misses, then a write-back. Batching also turns N
-connection timeouts into one during a Redis outage.
-- **Bad cache values are misses.** An unparseable value once raised
-  `JSONDecodeError` out of `search()` as a 500. A cached bare string would make
-  `expansions[0]` its first *character* ("D"). Both are now treated as a miss,
-  and Postgres answers.
-- **Negative entries.** A cached `null` means "not an acronym" and is not sent
-  to Postgres, or every ordinary word would be queried on every request.
-- **Postgres outage** degrades to "not found" (search did not depend on Postgres
-  before this feature), cached for the short `REDIS_DB_ERROR_CACHE_TTL`.
-- **Write-back uses `SET NX`.** What a lookup writes is only as fresh as its
-  read, and an upload can commit in between. An unconditional write buried a
-  new acronym under `null`, or restored an old or deactivated expansion for
-  24 h. With `SET NX`, whatever the upload wrote wins. Keys holding a broken
-  value are overwritten instead, or NX would keep them forever.
-- **Deactivation writes a `null` marker, not a delete.** A deleted key is empty,
-  so a late lookup could write the old value back. The marker is written only
-  for acronyms Postgres still shows as inactive (a second upload may have
-  reactivated one), and lives only 30 s: long enough for in-flight lookups, short
-  enough that a lost race costs seconds. If the re-read fails, the keys are
-  deleted, which heals on the next lookup.
-- **`invalidate_cache` and `mark_deactivated_in_cache` swallow Redis errors**
-  (the upload has already committed; a 500 would be wrong) but return False, so
-  the upload reports `cache_refreshed=false` instead of silently leaving
-  deactivated acronyms live for 24 h.
-- **Warm-up** (`load_acronym_cache`) writes every active acronym in one
-  pipelined call at startup. It is all or nothing; a failure is logged and the
-  service boots with a cold cache, which costs latency, not correctness.
+`get_expansions_batch`: one Redis `MGET` for all candidates, then one Postgres
+query for the misses, then a write back.
 
-## Bulk upload (`bulk_upsert`, `POST /api/acronyms/bulk`)
+| Cached value | Meaning | TTL |
+|---|---|---|
+| A JSON list | The acronym's meanings | `REDIS_CACHE_TTL` (24 h) |
+| `null` | Not an acronym | `REDIS_NEGATIVE_CACHE_TTL` (1 h) |
+| `null` after a Postgres error | Treated as not found for now | `REDIS_DB_ERROR_CACHE_TTL` (30 s) |
 
-- The CSV is decoded as `utf-8-sig`: an Excel/Sheets BOM would otherwise join
-  the first header name and fail every row.
-- Keys must be letters in up to `ACRONYM_MAX_PHRASE_WORDS` words, the only shape
-  detection can find. A single-letter whole key ("A") is rejected; a
-  single-letter word inside a phrase ("RBI GRADE B") is fine.
-- Over-length values are rejected per row, because one reaching Postgres fails
-  the single multi-row INSERT for the whole batch.
-- `is_active` is optional (missing means active, for older CSVs); anything other
-  than true/false is a per-row error.
-- Create vs update comes from `RETURNING (xmax = 0)` in the same upsert (an
-  inserted row has xmax 0), not from timestamps: two uploads can share the same
-  `now`. A database error says the outcome is unconfirmed (a lost connection
-  during the commit can leave it saved) and that retrying the whole file is
-  safe, since it is an upsert.
-- After the commit, active rows are refreshed in the cache and deactivated rows
-  get the marker (see Cache). If the refresh fails, active keys are deleted and
-  deactivated keys still get the marker. The request succeeds either way (the
-  database change is done); `cache_refreshed` says whether the cache caught up.
-- `_split_expansions` is duplicated in migration `f13a664a31b6` on purpose:
-  migrations must stay frozen snapshots.
+- **Write back uses `SET NX`**, so a value an upload wrote after our read is kept.
+- **A broken value** (not JSON, or the wrong shape) is a miss: Postgres answers and
+  the key is deleted; the next lookup refills it.
+- **Full load** (`load_acronym_cache`, at startup and after each upload) writes every
+  active acronym and overwrites existing keys, so it also repairs keys changed outside
+  the upload API (a migration, a SQL fix). A failed load is logged; the service still
+  starts.
+- **Redis down**: lookups go to Postgres. **Postgres down**: acronyms are treated as
+  not found, and search keeps working.
 
-## Schema history (`acronym_mapping` key)
+## Bulk upload (`POST /api/acronyms/bulkUpload`)
 
-Revision `f13a664a31b6` was edited before the table reached production, so a
-database recorded at that revision can hold one of these shapes:
+Needs the `internal_access_token` header. Bad rows go to `errors`; the other rows
+are saved in one transaction.
 
-| Shape | Where it comes from |
-|---|---|
-| `id` primary key, identity GENERATED ALWAYS | `f13a664a31b6` as it is now (fresh databases) |
-| `id` primary key, identity GENERATED BY DEFAULT | `f13a664a31b6` on 2026-10-01, before the switch to ALWAYS |
-| UUID `code` primary key only | `f13a664a31b6` as it was from 2026-09-30 |
-| UUID `code` primary key plus a unique identity `id` | earlier versions of `f13a664a31b6` |
-| `id` bigserial primary key | the first version of `f13a664a31b6` |
+1. **File:** at most `ACRONYM_BULK_UPLOAD_MAX_SIZE_MB` (413 otherwise), UTF-8; an
+   Excel BOM is removed.
+2. **Header** (`validate_csv_header`): names are trimmed and lowercased. Duplicate or
+   unknown columns reject the file (400), so a typo such as `is_actve` cannot
+   silently save a row as active. `acronym` and `expansions` are required. A column
+   with no name (a trailing comma) also rejects the file.
+3. **Each row** (`validate_acronym_row`): as many fields as the header (an unquoted
+   comma would shift values); an acronym of letters only, 1 to
+   `ACRONYM_MAX_PHRASE_WORDS` words, at most 32 characters, one word of at least 2
+   letters; `is_active` empty, `true` or `false`; expansions required for active rows.
+4. **Batch rules** (`bulk_upsert`): a repeated acronym: the last row wins.
+   `is_active=false` only turns an existing acronym off and keeps its stored
+   expansions and description, so the row needs only the key (given expansions are
+   ignored). An unknown acronym is a row error; an acronym cannot be added as inactive.
+5. **Save:** in batches of `ACRONYM_BULK_UPLOAD_BATCH_SIZE` rows (200), in one
+   transaction; Postgres accepts at most 65,535 values per statement. Active rows are
+   upserted, and created vs updated comes from `RETURNING (xmax = 0)`. Inactive rows
+   are one `UPDATE ... SET is_active = false`; an acronym it does not find is a row error.
+6. **Cache:** the keys of all uploaded acronyms are deleted, then every active
+   acronym is loaded again. Deactivated keys stay deleted, so the next lookup reads
+   Postgres. If the delete or the load fails, `cache_refreshed` is `false`; the rows
+   are saved either way.
 
-Revision `5b7dea819fa4` converts all of them to the first: it drops `code` and
-adds `id` as the key, or promotes the existing `id` (dropping its own unique
-constraint), and then makes `id` GENERATED ALWAYS (a serial column gets an
-identity that continues after the highest id). GENERATED ALWAYS means nothing
-can insert its own `id`, so the identity can never collide with a hand-written
-value. Deployment runs `alembic upgrade head` (`deployment/ansible.yml`), so every
-environment ends up with the same table without manual SQL.
+A database error returns 503 or 500 and says the outcome is unconfirmed; retrying
+the same file is safe, because it is an upsert.
 
-Its downgrade restores a UUID `code` primary key (new UUIDs; the old values are
-gone) and keeps `id` as a unique column. That shape is read by every model
-version, so an app rolled back together with `alembic downgrade -1` keeps
-working. All five histories were tested with upgrade, downgrade and upgrade on a
-throwaway database: rows kept, new rows continue after the highest id, an
-explicit id is rejected, `uq_acronym` and the expansions check stay.
+## Settings
 
-## Search pipeline (`prioritized_search_service.search`)
+| Setting | Default | Meaning |
+|---|---|---|
+| `ACRONYM_SEARCH_ENABLED` | `true` | Master switch; off gives the normal search |
+| `ACRONYM_SEARCH_METHOD` | `inline` | `inline` or `dual_query`; empty means `inline` |
+| `ACRONYM_MAX_DENSE_VARIANTS` | `3` | `dual_query`: semantic texts per query, the query included |
+| `ACRONYM_MAX_PHRASE_WORDS` | `4` | Longest acronym in words (detection and upload) |
+| `ACRONYM_MAX_QUERY_WORDS` | `30` | Words of the query checked for acronyms |
+| `ACRONYM_MIN_PREFIX_MATCH_LEN` | `4` | Shortest word that may prefix-match a meaning word |
+| `ACRONYM_PREFIX_SUFFIX_CAP` | `3` | Most extra letters in a prefix match |
+| `ACRONYM_EXPANSION_EXACT_TITLE_BOOST` | `1.7` | Title equals a written-out query |
+| `ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST` | `1.3` | Title contains a written-out query |
+| `ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST` | `1.4` | Summary equals a written-out query |
+| `ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST` | `1.2` | Summary contains a written-out query |
+| `ACRONYM_BULK_UPLOAD_MAX_SIZE_MB` | `5` | Largest CSV accepted |
+| `ACRONYM_BULK_UPLOAD_BATCH_SIZE` | `200` | Rows saved per database statement (1 to 10000) |
+| `INTERNAL_API_TOKEN` | — (required) | Secret for the acronym endpoints |
+| `CACHE_ENABLED` | `true` | Use Redis for acronym lookups |
+| `REDIS_DB` | `2` | Redis database (commons uses 0) |
+| `REDIS_CACHE_TTL` | `86400` | Seconds a found acronym stays cached |
+| `REDIS_NEGATIVE_CACHE_TTL` | `3600` | Seconds a "not an acronym" stays cached |
+| `REDIS_DB_ERROR_CACHE_TTL` | `30` | Seconds a miss after a Postgres error stays cached |
+| `REDIS_SOCKET_CONNECT_TIMEOUT`, `REDIS_SOCKET_TIMEOUT` | `1` | Seconds before a Redis call gives up |
+| `POSTGRES_CONNECT_TIMEOUT` | `3` | Seconds to open a Postgres connection |
+| `POSTGRES_STATEMENT_TIMEOUT_MS` | `5000` | Longest query on Postgres |
 
-**Query variants.** Each expansion meaning gets its own dense query string,
-never concatenated with the original: embedding "PTM meeting" + "Parent Teacher
-Meeting" as one text averages two concepts into a point close to neither. All
-acronyms are substituted in one regex pass over the original text; sequential
-substitution could re-scan an expansion that contains another acronym (NFST ->
-"...for ST" when ST is also detected). The replacement is a callable, because a
-string replacement treats backslashes specially. The matched span is normalized
-per word exactly like detection (one tokenizer: `_normalize_token`), and both the
-spaced and glued key are tried, so "d i e t" maps back to DIET. A variant is
-skipped when the query already spells the expansion out (a doubled phrase embeds
-to a distorted point), and when it differs only in case (embeddings ignore case).
-One variant per expansion index (AC-11), capped by `ACRONYM_MAX_DENSE_VARIANTS`;
-only the first substituted variant feeds the relevance blend, the others widen
-retrieval. The sparse query appends every expansion's words: BM25 is a bag of
-words, so extra words cannot dilute it, and its tokenizer has no OR or phrases.
-All dense texts are embedded in one `encode()` call and validated before Qdrant.
-Retrieval merges same-field hits across embeddings with `max()`.
+**At startup the service stops** if `INTERNAL_API_TOKEN` is not set (the list is
+`REQUIRED_ENV_VARIABLES` in `app/constants/constants.py`), `ACRONYM_SEARCH_METHOD` is
+unknown, an expansion boost is below 1.0, a cache TTL is 0 or less,
+`ACRONYM_BULK_UPLOAD_BATCH_SIZE` is outside 1 to 10000, or the `translations` table
+cannot be created.
 
-**Semantic mode.** Acronym ranking (the blend and the field boosts) is
-lexical, so it follows the same switch as the title/summary boost: off in
-`search_mode="semantic"` and when `HYBRID_SEARCH_ENABLED` is false. Retrieval is
-not gated: the expanded queries still run, so an acronym still widens *which*
-documents are found.
+## Database
 
-**Boost placement.** `filter_score` judges the pre-boost score. On acronym
-queries, the title, summary and text boosts are applied to every unique
-candidate before the `top_k` cut, so a boost can lift a document onto the page.
-This replaced hard tiering, which sorted by (tier, score) and let any
-acronym-titled document outrank any untitled one however much weaker:
-measured, 16-43 cases per top 20 of a document ranked above one more than 20%
-more relevant.
+- `acronym_mapping`: `id` (identity, primary key), `acronym` (unique, uppercase, up
+  to 32 characters), `expansions` (JSON list), `description`, `is_active`,
+  `created_by` / `updated_by` (`SYSTEM` for now), `created_at`, `updated_at`.
+- Migrations: `fcd65d39a795` is the starting point; `f13a664a31b6` creates
+  `acronym_mapping` and loads `data/acronyms.csv`; `5b7dea819fa4` converts tables made
+  by earlier versions of `f13a664a31b6` to the shape above. The deploy runs
+  `alembic upgrade head` before restarting the service.
+- The `translations` table predates Alembic and is created by `init_db()` at startup.
 
-**Injected documents** (title/summary matches the threshold dropped). If the
-pipeline scored the document before the threshold, its real field scores are
-reused and its real relevance is shown as `pre_floor_score`; the score itself
-still uses the floor formula, so it is never mistaken for a semantic hit, and it
-shows no `acronym_pre_boost_score`. A document never retrieved gets the floor score.
+## Known limits
 
-**Debug fields.** `acronym_pre_boost_score` (the blend, before the boosts) is set only on
-rescored rows; `acronym_in_body_match`/`acronym_in_body_multiplier` only where the text boost ran;
-`pre_floor_score` only for reused injected documents. All are debug-only.
-
-**Title match scroll.** The literal query and every acronym are checked in
-one scroll with an OR filter, not one scroll per text, classified as if each
-had its own scroll ("exact" is never downgraded). `must_not` filters carry
-into the scroll, or it would re-admit excluded documents.
+- **Common words that are also acronyms.** "me", "be" and "so" are matched in any
+  case, so "show me library books" is searched as ME (Master of Engineering) too.
+- **Acronyms after word 30** are not detected; the words are still searched.
+- **Two uploads of the same acronym at the same moment**, or an upload while a pod
+  loads the cache, can leave the older value in the cache until a re-upload or restart.
+- **A search running during an upload** can read the old meaning just before the
+  commit and write it back just after the cache delete. A deactivated acronym can
+  then stay on until its cache entry expires (`REDIS_CACHE_TTL`, 24 h) or the next
+  upload. Uploads are rare, so this is accepted.
+- **A frozen Postgres server** (connection open, no answer) can make a search wait:
+  `statement_timeout` is enforced by the server, so it cannot help there.
+- **Meanings with a repeated word** (MBBS: "Bachelor of ... Bachelor of ..."): a query
+  that types the word once is not seen as spelling the meaning out, so the meaning
+  is added, and can appear twice in the search text.

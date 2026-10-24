@@ -5,6 +5,7 @@ from app.services.document_operations.upload_service import UploadService
 from app.services.document_operations.update_service import UpdateService
 from app.services.document_operations.delete_service import DeleteService
 from app.services.document_operations.metadata_service import MetadataService
+from app.services.document_operations.theme_service import ThemeService
 from app.models.api_models import DeleteRequest
 
 logger = logging.getLogger(__name__)
@@ -18,6 +19,7 @@ class DocumentProcessor:
         self.update_service = UpdateService()
         self.delete_service = DeleteService()
         self.metadata_service = MetadataService()
+        self.theme_service = ThemeService()
 
     def get_supported_file_types(self):
         """Get list of all supported file types"""
@@ -25,21 +27,32 @@ class DocumentProcessor:
 
     async def process_upload(self, file: UploadFile, priority: str, metadata: Dict[str, Any] = None,
                              source_id: str = None, company_id: str = None, 
-                             title: str = None, summary: str = None, tags: List[str] = None):
+                             title: str = None, summary: str = None, tags: List[str] = None,
+                             theme: str = None):
         """Process file upload"""
         return await self.upload_service.process(
-            file, priority, metadata, source_id, company_id, title, summary, tags
+            file, priority, metadata, source_id, company_id, title, summary, tags, theme=theme
         )
 
     async def update_documents(self, file: UploadFile, priority: str, metadata: str = None,
-                               source_id: str = None, company_id: str = None):
+                               source_id: str = None, company_id: str = None,
+                               title: str = None, summary: str = None, tags: List[str] = None,
+                               theme: str = None):
         """Update existing documents"""
-        return await self.update_service.update(file, priority, metadata, source_id, company_id)
+        return await self.update_service.update(
+            file, priority, metadata, source_id, company_id,
+            title=title, summary=summary, tags=tags, theme=theme
+        )
 
     async def upsert_documents(self, file: UploadFile, priority: str, metadata: str = None,
-                               source_id: str = None, company_id: str = None):
+                               source_id: str = None, company_id: str = None,
+                               title: str = None, summary: str = None, tags: List[str] = None,
+                               theme: str = None):
         """Upsert documents - update if exists, create if not"""
-        return await self.update_service.upsert(file, priority, metadata, source_id, company_id)
+        return await self.update_service.upsert(
+            file, priority, metadata, source_id, company_id,
+            title=title, summary=summary, tags=tags, theme=theme
+        )
 
     async def delete_documents(self, request: DeleteRequest):
         """Delete documents by source_id and optional company_id"""
@@ -49,3 +62,8 @@ class DocumentProcessor:
                               company_id: Optional[str] = None):
         """Update only metadata without reprocessing documents"""
         return await self.metadata_service.update_metadata(source_id, metadata_updates, company_id)
+
+    async def update_theme(self, source_id: str, theme: Optional[str],
+                           company_id: Optional[str] = None):
+        """Update only the theme without reprocessing documents"""
+        return await self.theme_service.update_theme(source_id, theme, company_id)

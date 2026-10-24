@@ -8,7 +8,7 @@ This module provides query preprocessing functionality to improve search quality
 - Normalizing whitespace
 """
 import logging
-from typing import Optional
+from typing import Optional, Set
 import spacy
 from spacy.language import Language
 
@@ -50,7 +50,7 @@ def _load_spacy_model() -> Language:
         raise RuntimeError(f"Failed to load spaCy model: {str(e)}") from e
 
 
-def preprocess_query(query: str) -> str:
+def preprocess_query(query: str, keep_words: Optional[Set[str]] = None) -> str:
     # Handle empty or whitespace-only queries
     if not query or not query.strip():
         logger.debug("Empty query provided, returning empty string")
@@ -87,6 +87,11 @@ def preprocess_query(query: str) -> str:
         # Filter tokens (no lemmatization)
         processed_tokens = []
         for token in doc:
+            # Acronym: keep detected acronyms that are also stopwords or pronouns (BE, ME, SO).
+            if keep_words and token.text.upper() in keep_words:
+                processed_tokens.append(token.text.lower())
+                continue
+
             # Skip pronouns (I, my, you, etc.)
             if token.pos_ == "PRON":
                 logger.debug(f"Removing pronoun: '{token.text}'")

@@ -41,15 +41,10 @@ def set_many(items: Dict[str, Tuple[str, int]]) -> None:
 
 
 def set_many_if_absent(items: Dict[str, Tuple[str, int]]) -> None:
-    """Like set_many, but each key is written ONLY if it does not already
-    exist (Redis SET ... NX). Existing keys are left untouched.
+    """Like set_many, but writes a key only if it does not exist yet (Redis SET NX).
 
-    This is the safe way to write a value you computed from possibly-stale
-    information: the "does it exist" check and the write happen together
-    inside Redis, so a value someone else wrote between your read and your
-    write survives instead of being overwritten. Used for negative
-    ("not an acronym") entries, where a blind overwrite could bury a real
-    acronym an upload had just cached and hide it for the whole negative TTL.
+    Use it for a value read earlier that may be out of date: a value someone else
+    wrote in the meantime is kept, not overwritten.
     """
     if not items:
         return

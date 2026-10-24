@@ -73,8 +73,10 @@ class FilterBlock(BaseModel):
     organizations: Optional[List[str]] = Field(default=None, description="Company names (searches 'metadata.company')")
     resource_type: Optional[List[str]] = Field(default=None, description="Key entities (searches 'metadata.DOCUMENT_TYPE')")
     file_type: Optional[List[str]] = Field(default=None, description="Document types (searches 'metadata.type')")
+    themes: Optional[List[str]] = Field(default=None, description="Document themes (searches top-level 'theme')")
     exclude_organizations: Optional[List[str]] = Field(default=None, description="Company names to exclude (must_not)")
     exclude_file_type: Optional[List[str]] = Field(default=None, description="Document types to exclude (must_not)")
+    exclude_themes: Optional[List[str]] = Field(default=None, description="Document themes to exclude (must_not)")
 
     @model_validator(mode="after")
     def _reject_empty_block(self):
@@ -84,7 +86,8 @@ class FilterBlock(BaseModel):
             value and any(str(item).strip() for item in value)
             for value in (
                 self.categories, self.organizations, self.resource_type,
-                self.file_type, self.exclude_organizations, self.exclude_file_type,
+                self.file_type, self.themes, self.exclude_organizations,
+                self.exclude_file_type, self.exclude_themes,
             )
         )
         if not has_value:
@@ -125,6 +128,11 @@ class PrioritizedSearchRequest(BaseModel):
         default=None,
         description="Optional list of document types to filter (searches in 'metadata.type' field, OR condition)"
     )
+    themes: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of document themes to filter (searches the top-level 'theme' field, "
+                    "OR condition, case-sensitive). Documents without a theme are dropped."
+    )
     exclude_organizations: Optional[List[str]] = Field(
         default=None,
         description="Optional list of company names to exclude (must_not on 'metadata.company'). "
@@ -135,6 +143,11 @@ class PrioritizedSearchRequest(BaseModel):
         description="Optional list of document types to exclude (must_not on 'metadata.type'). "
                     "A document matching any listed value is dropped."
     )
+    exclude_themes: Optional[List[str]] = Field(
+        default=None,
+        description="Optional list of document themes to exclude (must_not on the top-level 'theme'). "
+                    "A document matching any listed value is dropped; documents without a theme are kept."
+    )
     any_of: Optional[List[FilterBlock]] = Field(
         default=None,
         description="Optional list of alternatives, at least one of which must match "
@@ -144,7 +157,7 @@ class PrioritizedSearchRequest(BaseModel):
                     "Use it only for an OR that joins two different fields, e.g. "
                     "'PDFs from shikshalokam, or DOCX from csf'. An OR between values "
                     "of one field is just a longer list on that field, and an exclusion "
-                    "is exclude_organizations/exclude_file_type — neither needs any_of."
+                    "is exclude_organizations/exclude_file_type/exclude_themes — neither needs any_of."
     )
     search_mode: Literal["hybrid", "semantic"] = Field(
         default="hybrid",
@@ -183,6 +196,11 @@ class SearchResultItem(BaseModel):
     title: Optional[str] = None
     summary: Optional[str] = None
     tags: Optional[List[str]] = None
+    theme: Optional[str] = Field(
+        default=None,
+        description="Document theme (top-level payload key, KEYWORD-indexed, never embedded). "
+                    "None when the document has no theme."
+    )
     metadata: Dict[str, Any]
     source_id: str
     score: float
@@ -259,33 +277,25 @@ class SearchResultItem(BaseModel):
                     "Applied after title_multiplier, each capped at 1.0. "
                     "Debug-only (include_scoring_debug=true)."
     )
-    pre_floor_score: Optional[float] = Field(
+    title_expansion_multiplier: Optional[float] = Field(
         default=None,
-        description="Keyword-injected rows only (debug, see match_source): the relevance "
-                    "the search measured before the threshold dropped this document and "
-                    "it was re-added as a title/summary match. Its score is the floor, "
-                    "not this value. None when debug is off, for documents that were "
-                    "never scored, and for normal results."
+        description=(
+            "Additional boost applied when an acronym query matches its expanded form in the title. "
+            "Uses ACRONYM_EXPANSION_EXACT_TITLE_BOOST or ACRONYM_EXPANSION_PARTIAL_TITLE_BOOST, "
+            "depending on the match type. Applied on top of title_multiplier: when both match, the "
+            "score is multiplied by both (capped at 1.0). A value of 1.0 means no additional boost. "
+            "Only available when include_scoring_debug=true."
+        ),
     )
-    acronym_pre_boost_score: Optional[float] = Field(
+    summary_expansion_multiplier: Optional[float] = Field(
         default=None,
-        description="Acronym queries only (debug): the score before the title, summary and "
-                    "text boosts, a blend of the query and expansion scores (see "
-                    "search_config.scoring_context.acronym_ranking). score = acronym_pre_boost_score "
-                    "x title, summary and text multipliers, capped at 1.0. None when no blend "
-                    "ran (the query already spells out the expansion, or the rescore failed; "
-                    "see scoring_context.acronym_ranking.rescore), for keyword-injected rows, "
-                    "for rows outside the rescored pool, and for ordinary queries."
-    )
-    acronym_in_body_match: Optional[str] = Field(
-        default=None,
-        description="Acronym queries only (debug): 'exact' when the body uses the acronym "
-                    "as written (capitals), else None."
-    )
-    acronym_in_body_multiplier: Optional[float] = Field(
-        default=None,
-        description="Acronym queries only (debug): text boost applied (EXACT_TEXT_BOOST, "
-                    "1.0 when the body does not use the acronym), else None."
+        description=(
+            "Additional boost applied when an acronym query matches its expanded form in the summary. "
+            "Uses ACRONYM_EXPANSION_EXACT_SUMMARY_BOOST or ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST, "
+            "depending on the match type. Applied on top of summary_multiplier: when both match, the "
+            "score is multiplied by both (capped at 1.0). A value of 1.0 means no additional boost. "
+            "Only available when include_scoring_debug=true."
+        ),
     )
     title_match: Optional[str] = Field(
         default=None,
@@ -294,6 +304,25 @@ class SearchResultItem(BaseModel):
     summary_match: Optional[str] = Field(
         default=None,
         description="Summary match type: 'exact', 'partial', or None if no summary match"
+    )
+    title_expansion_match: Optional[str] = Field(
+        default=None,
+        description=(
+            "Indicates how the title matched the expanded form of an acronym in the query "
+            "(e.g., 'PTM document' matching 'Parent Teacher Meeting document'). "
+            "Possible values: 'exact', 'partial', or None if no match. "
+            "Complements title_match, which represents the match against the original query. "
+            "Only available when include_scoring_debug=true."
+        ),
+    )
+    summary_expansion_match: Optional[str] = Field(
+        default=None,
+        description=(
+            "Indicates how the summary matched the expanded form of an acronym in the query. "
+            "Possible values: 'exact', 'partial', or None if no match. "
+            "Complements summary_match, which represents the match against the original query. "
+            "Only available when include_scoring_debug=true."
+        ),
     )
 
 class PrioritizedSearchResponse(BaseModel):
@@ -307,10 +336,13 @@ class PrioritizedSearchResponse(BaseModel):
     )
     acronym_info: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Acronym detection for this query: enabled (ACRONYM_SEARCH_ENABLED), "
-                    "detected (an acronym was found), and when detected the mapping "
-                    "{acronym: expansions} plus ambiguous (acronyms with several meanings). "
-                    "None only when the request had no query text."
+        description=(
+            "Provides acronym detection details for the query, including whether detection is enabled "
+            "and whether an acronym was found. When enabled, includes the detection method "
+            "('inline' or 'dual_query') and its description. When an acronym is detected, includes the "
+            "acronym-to-expansions mapping and any ambiguous acronyms with multiple meanings. "
+            "None only when the request contains no query text."
+        ),
     )
 
 class TextSearchRequest(BaseModel):
@@ -348,14 +380,10 @@ class AcronymBulkUploadResponse(BaseModel):
     received: int
     created: int
     updated: int
-    # Rows in this batch whose is_active was set to false. A SUBSET of
-    # created + updated, not a separate category — without it a batch that
-    # disables 30 acronyms is indistinguishable from one that edits them.
+    # Rows set to is_active=false; also counted in created or updated.
     deactivated: int
-    # False means the rows committed but the cache could not be updated, so
-    # stale expansions may still be served until their TTL expires (up to
-    # REDIS_CACHE_TTL for a deactivated acronym). The upload itself succeeded;
-    # the fix is to clear the cache, not to re-upload.
+    # False: the rows are saved, but the cache could not be updated, so old values
+    # may be served until REDIS_CACHE_TTL ends. Clear the cache; do not re-upload.
     cache_refreshed: bool = True
     errors: List[AcronymUploadError]
     # Which acronyms each count refers to, in CSV order.
@@ -368,6 +396,8 @@ class AcronymItem(BaseModel):
     expansions: List[str]
     description: Optional[str] = None
     is_active: bool
+    created_by: str
+    updated_by: str
     created_at: datetime
     updated_at: datetime
 

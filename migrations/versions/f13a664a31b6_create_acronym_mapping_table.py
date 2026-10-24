@@ -4,13 +4,9 @@ Revision ID: f13a664a31b6
 Revises: fcd65d39a795
 Create Date: 2026-08-11 16:21:22.416872
 
-This revision was edited before the table reached production: it now creates an
-identity `id` primary key (GENERATED ALWAYS), while databases that ran an earlier
-version of it hold a UUID `code` primary key (with or without a separate unique
-`id`), a BY DEFAULT identity, or a serial `id`. The next revision, 5b7dea819fa4,
-converts every one of those shapes to the current one, so `alembic upgrade head`
-gives the same table everywhere. See release-doc/acronym-design-notes.md, Schema
-history.
+Edited before production; it now creates an identity `id` primary key. Tables made
+by its earlier versions are converted by 5b7dea819fa4, so `alembic upgrade head`
+gives the same table everywhere. See design notes, Database.
 """
 import csv
 import logging
@@ -63,12 +59,7 @@ def _load_seed_rows() -> list:
                 f"{sorted(REQUIRED_CSV_COLUMNS)}, found {reader.fieldnames}"
             )
         now = datetime.now(timezone.utc)
-        # Everything goes into ONE multi-row INSERT ... ON CONFLICT, so a single
-        # bad row aborts the whole migration: a repeated acronym ("command
-        # cannot affect row a second time") or one over the column length. An
-        # empty expansions list would insert as [] and never be usable. Such
-        # rows are skipped with a warning instead; a repeated acronym keeps its
-        # last occurrence, the same rule the bulk upload uses.
+        # One bad row would fail the single INSERT: skip empty or too-long rows; the last repeat wins.
         by_acronym = {}
         for line_no, row in enumerate(reader, start=2):
             acronym = (row.get('acronym') or '').strip().upper()
