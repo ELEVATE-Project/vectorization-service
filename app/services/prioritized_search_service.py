@@ -832,7 +832,7 @@ class PrioritizedSearchService:
                 logger.info(f"[ACRONYM] dense search with {len(dense_vectors)} query vectors")
             # Project payload to retrieve only small metadata keys needed for filters and boosts.
             # Excludes the heavy 'text' payload field during candidate scoring.
-            metadata_payload_fields = ["source_id", "title", "summary", "tags", "theme", "metadata"]
+            metadata_payload_fields = ["source_id", "title", "summary"]
 
             # 1. Build Query Requests for Dense Fields
             for field in search_fields:
@@ -1619,7 +1619,7 @@ class PrioritizedSearchService:
                     collection_name=self.collection_name,
                     scroll_filter=combined_filter,
                     limit=1000,
-                    with_payload=True,
+                    with_payload=["source_id", field],
                     with_vectors=False,
                 )
                 if offset is not None:
