@@ -57,21 +57,11 @@ def _repeats_a_must(exclusion: models.FieldCondition, must_conditions: List[Any]
 
 class PrioritizedSearchService:
     """
-    Service for prioritized multi-field vector search with intelligent filtering.
-    
-    Features:
-    - Multi-field vector search across title, tags, summary, metadata, and content
-    - Configurable field weights and priority ordering
-    - Advanced filtering with AND/OR logic combinations
-    - Automatic deduplication by source_id
-    - Score-based ranking with multi-field bonuses
-    
-    Search Priority (configurable in settings):
-    1. Title - Highest priority
-    2. Tags - High priority  
-    3. Summary - Medium-high priority
-    4. Metadata - Medium priority
-    5. Text - Base priority
+    Multi-field search over the title, text, tags, summary and metadata vectors, fused
+    with BM25 when SPARSE_SEARCH_ENABLED is true. Applies filters, title/summary keyword
+    boosts and acronym expansion, and returns the best chunk per source_id.
+
+    Field weights and order come from SEARCH_PRIORITY_WEIGHTS and SEARCH_PRIORITY_ORDER (config.py).
     """
     
     def __init__(self):
@@ -84,14 +74,17 @@ class PrioritizedSearchService:
         self.min_score_threshold = settings.MIN_WEIGHTED_SCORE_THRESHOLD
 
     def _candidate_limit(self, top_k: int) -> int:
-        """Per-field candidate pool size for multi-field search.
+        """How many candidates each field search asks Qdrant for.
 
-        Each of the dense named-vector searches and the sparse BM25 search retrieves
-        this many candidates; the union is fused/ranked. The CAP bounds HNSW ``ef``
-        (the dominant query cost) so a large top_k can't trigger a 10k-deep traversal
-        per field; the FANOUT gives small-top_k callers a re-ranking margin. The union
-        across fields still fills top_k after source-level dedup. Env-tunable via
-        SEARCH_CANDIDATE_FANOUT / SEARCH_CANDIDATE_MAX. For top_k=1000 → 2000 (was 10000).
+        Every dense field search and the BM25 search fetch this many points. The lists
+        are then merged, ranked and reduced to one chunk per document, so we need more
+        points than top_k.
+
+        - SEARCH_CANDIDATE_FANOUT: gives a small top_k enough extra points to re-rank.
+        - SEARCH_CANDIDATE_MAX: caps the size, because deep HNSW search is the main
+          query cost and a large top_k would otherwise make every field search slow.
+
+        Example: top_k=1000 fetches 2000 points per field with the default settings.
         """
         return min(max(top_k, 1) * settings.SEARCH_CANDIDATE_FANOUT, settings.SEARCH_CANDIDATE_MAX)
 
@@ -287,16 +280,12 @@ class PrioritizedSearchService:
             # Use request.top_k directly without any limit
             top_k = request.top_k
 
-            # Determine filtering strategy
-            # Simple logic: If detail_filter_score is provided, use it. Otherwise use filter_score.
-            use_detail_filter = False
-            detail_filter_score = None
+            # If detail_filter_score is provided, use it. Otherwise use filter_score.
+            detail_filter_score = request.detail_filter_score
+            use_detail_filter = detail_filter_score is not None
             filter_score = self.min_filter_score
-            
-            # Condition 1: detail_filter_score is provided (NOT null)
-            if request.detail_filter_score is not None:
-                use_detail_filter = True
-                detail_filter_score = request.detail_filter_score
+
+            if use_detail_filter:
                 logger.info("Filter mode: DETAIL_FILTER_SCORE (field-level thresholds with OR logic)")
                 logger.info(f"Detail thresholds: title={detail_filter_score.title}, "
                            f"text={detail_filter_score.text}, tags={detail_filter_score.tags}, "
@@ -535,8 +524,10 @@ class PrioritizedSearchService:
                         return filter_score
                     return getattr(detail_filter_score, field_name, 0.0) or 0.0
 
-                present_ids = {r["payload"].get("source_id") for r in top_results}
-                missing_title = [sid for sid in title_matches if sid not in present_ids]
+                present_source_ids = {result["payload"].get("source_id") for result in top_results}
+                missing_title = [
+                    source_id for source_id in title_matches if source_id not in present_source_ids
+                ]
                 if missing_title:
                     injected = self._fetch_field_match_docs(
                         missing_title, title_matches, "title", *title_boosts,
@@ -552,13 +543,16 @@ class PrioritizedSearchService:
                             mult_key="title_expansion_multiplier",
                         )
                     top_results = top_results + injected
-                    present_ids.update(missing_title)
-                    injected_source_ids.update(d["payload"].get("source_id") for d in injected)
+                    present_source_ids.update(missing_title)
+                    injected_source_ids.update(doc["payload"].get("source_id") for doc in injected)
                     logger.info(f"Injected {len(injected)} title-match docs missing from semantic results")
 
                 if apply_expansion_boosts:
                     # Acronym: add documents whose title matches only the written-out query.
-                    missing_expansion = [sid for sid in expansion_title_matches if sid not in present_ids]
+                    missing_expansion = [
+                        source_id for source_id in expansion_title_matches
+                        if source_id not in present_source_ids
+                    ]
                     if missing_expansion:
                         injected = self._fetch_field_match_docs(
                             missing_expansion, expansion_title_matches, "title", *expansion_title_boosts,
@@ -568,15 +562,15 @@ class PrioritizedSearchService:
                             mult_key="title_expansion_multiplier",
                         )
                         top_results = top_results + injected
-                        present_ids.update(missing_expansion)
-                        injected_source_ids.update(d["payload"].get("source_id") for d in injected)
+                        present_source_ids.update(missing_expansion)
+                        injected_source_ids.update(doc["payload"].get("source_id") for doc in injected)
                         logger.info(f"[ACRONYM] added {len(injected)} expansion-title docs missing from semantic results")
 
                 missing_summary = [
-                    sid for sid in summary_matches
-                    if sid not in present_ids and sid not in title_matches
+                    source_id for source_id in summary_matches
+                    if source_id not in present_source_ids and source_id not in title_matches
                     # Acronym: not when an expansion title match already covers it.
-                    and sid not in expansion_title_matches
+                    and source_id not in expansion_title_matches
                 ]
                 if missing_summary:
                     injected = self._fetch_field_match_docs(
@@ -592,17 +586,17 @@ class PrioritizedSearchService:
                             mult_key="summary_expansion_multiplier",
                         )
                     top_results = top_results + injected
-                    present_ids.update(missing_summary)
-                    injected_source_ids.update(d["payload"].get("source_id") for d in injected)
+                    present_source_ids.update(missing_summary)
+                    injected_source_ids.update(doc["payload"].get("source_id") for doc in injected)
                     logger.info(f"Injected {len(injected)} summary-match docs missing from semantic results")
 
                 if apply_expansion_boosts:
                     # Acronym: add documents whose summary matches only the written-out query,
                     # unless a title match already brought them in.
                     missing_expansion_summary = [
-                        sid for sid in expansion_summary_matches
-                        if sid not in present_ids and sid not in title_matches
-                        and sid not in expansion_title_matches
+                        source_id for source_id in expansion_summary_matches
+                        if source_id not in present_source_ids and source_id not in title_matches
+                        and source_id not in expansion_title_matches
                     ]
                     if missing_expansion_summary:
                         injected = self._fetch_field_match_docs(
@@ -614,7 +608,7 @@ class PrioritizedSearchService:
                             mult_key="summary_expansion_multiplier",
                         )
                         top_results = top_results + injected
-                        injected_source_ids.update(d["payload"].get("source_id") for d in injected)
+                        injected_source_ids.update(doc["payload"].get("source_id") for doc in injected)
                         logger.info(f"[ACRONYM] added {len(injected)} expansion-summary docs missing from semantic results")
 
                 # The boosts live in weighted_score itself, so a caller that re-sorts by
@@ -627,20 +621,20 @@ class PrioritizedSearchService:
             # Late Payload Retrieval: Fetch full payloads (including 'text')
             # for ONLY the final top_k results when hybrid/sparse search is active.
             if settings.SPARSE_SEARCH_ENABLED and top_results:
-                points_to_fetch = [r["id"] for r in top_results]
+                top_point_ids = [result["id"] for result in top_results]
                 try:
                     t2 = time.time()
                     full_points = qdrant_client.retrieve(
                         collection_name=self.collection_name,
-                        ids=points_to_fetch,
+                        ids=top_point_ids,
                         with_payload=True,
                         with_vectors=False
                     )
                     t3 = time.time()
-                    logger.info(f"TIMING: late retrieve of {len(points_to_fetch)} docs took {t3-t2:.2f}s")
-                    payload_map = {p.id: p.payload for p in full_points}
-                    for r in top_results:
-                        r["payload"] = payload_map.get(r["id"], r["payload"])
+                    logger.info(f"TIMING: late retrieve of {len(top_point_ids)} docs took {t3-t2:.2f}s")
+                    payload_by_point_id = {point.id: point.payload for point in full_points}
+                    for result in top_results:
+                        result["payload"] = payload_by_point_id.get(result["id"], result["payload"])
                     logger.info(f"Successfully retrieved full payloads for final top {len(top_results)} results")
                 except Exception as exc:
                     logger.error(f"Failed late payload retrieval: {exc}")
@@ -689,7 +683,7 @@ class PrioritizedSearchService:
 
             # total_results = all unique matched sources (semantic pool ∪ injected boost docs),
             # so the count never reports fewer than the results actually returned.
-            matched_source_ids = {r["payload"].get("source_id") for r in unique_source_results}
+            matched_source_ids = {result["payload"].get("source_id") for result in unique_source_results}
             matched_source_ids |= injected_source_ids
             total_results = len(matched_source_ids)
 
@@ -736,7 +730,7 @@ class PrioritizedSearchService:
             Tuple of (all_results dict, field_scores dict)
         """
         search_requests = []
-        valid_fields = []
+        request_fields = []
 
         # Defense-in-depth: validate each dense vector immediately before it is sent to
         # Qdrant. Each embedding is already a validated list from embed_query, but this
@@ -761,9 +755,9 @@ class PrioritizedSearchService:
                         filter=filter_conditions
                     )
                 )
-                valid_fields.append(field)
+                request_fields.append(field)
 
-        logger.info(f"Executing batch search across {len(valid_fields)} field/query-variant combinations")
+        logger.info(f"Executing batch search across {len(request_fields)} field/query-variant combinations")
         batch_results = qdrant_client.query_batch_points(
             collection_name=self.collection_name,
             requests=search_requests
@@ -772,19 +766,19 @@ class PrioritizedSearchService:
         all_results = {}
         field_scores = {}
 
-        for field, query_response in zip(valid_fields, batch_results):
-            results = query_response.points
-            logger.info(f"Field '{field}' returned {len(results)} results")
+        for field, query_response in zip(request_fields, batch_results):
+            points = query_response.points
+            logger.info(f"Field '{field}' returned {len(points)} results")
 
-            for result in results:
-                point_id = result.id
+            for point in points:
+                point_id = point.id
                 if point_id not in all_results:
-                    all_results[point_id] = result
+                    all_results[point_id] = point
                     field_scores[point_id] = {}
 
                 # Acronym: max(), not overwrite: with several query vectors, keep each field's best score.
-                existing = field_scores[point_id].get(field, float("-inf"))
-                field_scores[point_id][field] = max(existing, result.score)
+                previous_score = field_scores[point_id].get(field, float("-inf"))
+                field_scores[point_id][field] = max(previous_score, point.score)
 
         logger.info(f"Batch search completed: {len(all_results)} unique documents found")
         return all_results, field_scores
@@ -822,7 +816,7 @@ class PrioritizedSearchService:
             from app.core.clients.sparse_encoder import generate_sparse_vector
 
             search_requests = []
-            valid_fields = []
+            request_fields = []
 
             # Defense-in-depth: validate each dense vector before it reaches Qdrant
             # (prevents the "expected dim: 384, got 0" batch 400).
@@ -848,7 +842,7 @@ class PrioritizedSearchService:
                                 filter=filter_conditions
                             )
                         )
-                        valid_fields.append(field)
+                        request_fields.append(field)
 
             # 2. Build Query Request for BM25 Sparse Field
             # Replace underscores with spaces so BM25 tokenises compound
@@ -878,7 +872,7 @@ class PrioritizedSearchService:
                         filter=filter_conditions
                     )
                 )
-                valid_fields.append(settings.SPARSE_VECTOR_NAME)
+                request_fields.append(settings.SPARSE_VECTOR_NAME)
             if not sparse_queries:
                 # A query that tokenises to nothing (e.g. only stopwords or punctuation) has no
                 # lexical signal at all, so there is no sparse modality to fuse.
@@ -886,10 +880,9 @@ class PrioritizedSearchService:
                     f"BM25 query '{bm25_query_text}' produced no tokens; sparse branch not issued"
                 )
 
-            logger.info(f"Executing client-side hybrid batch search across {len(valid_fields)} fields: {valid_fields}")
+            logger.info(f"Executing client-side hybrid batch search across {len(request_fields)} fields: {request_fields}")
 
             # 3. Execute all queries in a single network batch call
-            import time
             t0 = time.time()
             batch_results = qdrant_client.query_batch_points(
                 collection_name=self.collection_name,
@@ -909,37 +902,17 @@ class PrioritizedSearchService:
             all_results: Dict[str, Any] = {}
             field_scores: Dict[str, Dict[str, float]] = {}
 
-            for field, query_response in zip(valid_fields, batch_results):
+            for field, query_response in zip(request_fields, batch_results):
                 for point in query_response.points:
-                    pid = point.id
-                    all_results[pid] = point
-                    if pid not in field_scores:
-                        field_scores[pid] = {}
+                    point_id = point.id
+                    all_results[point_id] = point
+                    if point_id not in field_scores:
+                        field_scores[point_id] = {}
                     # Acronym: max(), not overwrite: with several query texts a chunk can be
                     # scored twice for one field; keep the higher score.
                     score = getattr(point, "score", 0.0)
-                    existing = field_scores[pid].get(field, float("-inf"))
-                    field_scores[pid][field] = max(existing, score)
-
-            # 5. Remap raw Qdrant vector-field names to the semantic field names that
-            #    _apply_detail_filter checks against ("title", "text", "tags",
-            #    "summary", "metadata"). The keys of self.default_weights are the
-            #    authoritative semantic names; the corresponding Qdrant vector name is
-            #    VECTOR_FIELD_PREFIX + semantic_name. This collection configures its
-            #    named vectors with no prefix (see app/core/clients/qdrant.py), so the
-            #    mapping is an identity today — but doing it explicitly keeps the
-            #    field_scores contract correct if a prefix is ever introduced.
-            #    The "bm25" (SPARSE_VECTOR_NAME) key is preserved untouched — it carries
-            #    the raw BM25 score consumed by _rank_results' dense+sparse fusion and
-            #    signals hybrid mode.
-            prefix = getattr(settings, "VECTOR_FIELD_PREFIX", "") or ""
-            qdrant_to_semantic = {
-                f"{prefix}{semantic}": semantic for semantic in self.default_weights
-            }
-            for scores in field_scores.values():
-                for qdrant_name, semantic_name in qdrant_to_semantic.items():
-                    if qdrant_name in scores and semantic_name not in scores:
-                        scores[semantic_name] = scores[qdrant_name]
+                    previous_score = field_scores[point_id].get(field, float("-inf"))
+                    field_scores[point_id][field] = max(previous_score, score)
 
             sparse_hit_count = sum(
                 1 for scores in field_scores.values() if settings.SPARSE_VECTOR_NAME in scores
@@ -1255,7 +1228,9 @@ class PrioritizedSearchService:
         # spans both. Zero hits
         # are handled by weight redistribution in the `weighted` branch instead.
         # sparse_has_hits is a floor, not a replacement: hits imply hybrid without the flag.
-        sparse_has_hits = any(sparse_name in fs for fs in field_scores.values())
+        sparse_has_hits = any(
+            sparse_name in point_field_scores for point_field_scores in field_scores.values()
+        )
         is_hybrid = sparse_issued or sparse_has_hits
 
         # Fusion method (env-selectable): "weighted" min-max score fusion, or "rrf"
@@ -1275,15 +1250,15 @@ class PrioritizedSearchService:
         sparse_rank: Dict[Any, int] = {}
         if is_hybrid:
             raw_dense: Dict[Any, float] = {}
-            for point_id, fs in field_scores.items():
-                dense = 0.0
+            for point_id, point_field_scores in field_scores.items():
+                dense_score = 0.0
                 for field in search_fields:
                     if field in weights:
-                        score = fs.get(field)
+                        score = point_field_scores.get(field)
                         if score is not None:
-                            dense += score * weights[field]
-                raw_dense[point_id] = dense
-                raw_sparse[point_id] = fs.get(sparse_name) or 0.0
+                            dense_score += score * weights[field]
+                raw_dense[point_id] = dense_score
+                raw_sparse[point_id] = point_field_scores.get(sparse_name) or 0.0
 
             if fusion_method == "rrf":
                 # Reciprocal Rank Fusion over two lists: the combined dense list
@@ -1291,10 +1266,10 @@ class PrioritizedSearchService:
                 # list. This keeps the dense weighting intact (constraint) while
                 # fusing by rank position rather than raw score.
                 rrf_k = settings.RRF_K
-                dense_hits = {pid: s for pid, s in raw_dense.items() if s > 0.0}
+                dense_hits = {point_id: score for point_id, score in raw_dense.items() if score > 0.0}
                 dense_rank = self._rank_positions(dense_hits)
                 # Only docs with an actual sparse hit get a sparse rank.
-                sparse_hits = {pid: s for pid, s in raw_sparse.items() if s > 0.0}
+                sparse_hits = {point_id: score for point_id, score in raw_sparse.items() if score > 0.0}
                 sparse_rank = self._rank_positions(sparse_hits)
                 for point_id in raw_dense:
                     fused = 0.0
@@ -1312,22 +1287,22 @@ class PrioritizedSearchService:
                 norm_dense = self._min_max_normalize(raw_dense)
                 norm_sparse = self._min_max_normalize(raw_sparse)
                 if sparse_has_hits:
-                    dense_w = settings.HYBRID_DENSE_WEIGHT
-                    sparse_w = settings.HYBRID_SPARSE_WEIGHT
+                    dense_weight = settings.HYBRID_DENSE_WEIGHT
+                    sparse_weight = settings.HYBRID_SPARSE_WEIGHT
                 else:
                     # Sparse ran but matched nothing, so norm_sparse is all 0. Keeping the
                     # configured split would shrink every score by the sparse share for a
                     # silent modality, pushing good results under filter_score; dense takes
                     # the full weight instead.
-                    dense_w, sparse_w = 1.0, 0.0
+                    dense_weight, sparse_weight = 1.0, 0.0
                     logger.info(
                         "No sparse hits in candidate pool; dense weight raised to 1.0 "
                         "to keep the fused score on the [0, 1] scale"
                     )
                 for point_id in raw_dense:
                     hybrid_scores[point_id] = (
-                        dense_w * norm_dense.get(point_id, 0.0)
-                        + sparse_w * norm_sparse.get(point_id, 0.0)
+                        dense_weight * norm_dense.get(point_id, 0.0)
+                        + sparse_weight * norm_sparse.get(point_id, 0.0)
                     )
 
             # Expose the per-query normalization reference (min/max of each modality
@@ -1347,8 +1322,8 @@ class PrioritizedSearchService:
                 # the sparse branch matched nothing (see redistribution above). Reporting
                 # settings here instead would make the debug numbers irreproducible.
                 if fusion_method != "rrf":
-                    scoring_context_out["dense_weight"] = dense_w
-                    scoring_context_out["sparse_weight"] = sparse_w
+                    scoring_context_out["dense_weight"] = dense_weight
+                    scoring_context_out["sparse_weight"] = sparse_weight
 
         # candidate_pool_size is meaningful in both modes.
         if scoring_context_out is not None:
@@ -1362,7 +1337,7 @@ class PrioritizedSearchService:
         ranked = []
 
         for point_id, result in all_results.items():
-            field_score_dict = field_scores.get(point_id, {})
+            point_field_scores = field_scores.get(point_id, {})
 
             if is_hybrid:
                 # Calibrated 0-1 fused score per the selected fusion method.
@@ -1373,8 +1348,8 @@ class PrioritizedSearchService:
                 # Dense multi-field path: weighted sum of per-field similarity scores.
                 weighted_score = 0.0
                 for field in search_fields:
-                    if field in field_score_dict and field in weights:
-                        field_score = field_score_dict[field]
+                    if field in point_field_scores and field in weights:
+                        field_score = point_field_scores[field]
                         weight = weights[field]
                         weighted_score += field_score * weight
                 # In dense-only mode the pre-boost weighted score IS raw_dense.
@@ -1382,13 +1357,13 @@ class PrioritizedSearchService:
 
             # Do NOT cap at 1.0 here — the title/summary boost (applied later) needs
             # the uncapped score to differentiate matches, and enforces its own cap.
-            num_fields_matched = len([k for k in field_score_dict.keys() if k != sparse_name])
+            num_fields_matched = len([k for k in point_field_scores.keys() if k != sparse_name])
 
             entry = {
                 'id': result.id,
                 'payload': result.payload,
                 'weighted_score': weighted_score,
-                'field_scores': field_score_dict,
+                'field_scores': point_field_scores,
                 'num_fields_matched': num_fields_matched,
                 # raw_dense (pre-fusion, pre-boost weighted cosine sum) is meaningful in
                 # both modes; surfaced only when include_scoring_debug (see _build_result_items).
@@ -1443,13 +1418,13 @@ class PrioritizedSearchService:
         logger.info(f"Detail filter thresholds: {thresholds}")
         
         for result in ranked_results:
-            field_score_dict = result.get('field_scores', {})
+            point_field_scores = result.get('field_scores', {})
             passed = False
             passing_fields = []
 
             # Check if ANY field meets its threshold (OR logic)
             for field, threshold in thresholds.items():
-                field_score = field_score_dict.get(field, 0.0) or 0.0
+                field_score = point_field_scores.get(field, 0.0) or 0.0
                 if field_score >= threshold:
                     passed = True
                     passing_fields.append(f"{field}={field_score:.3f}")
@@ -1473,7 +1448,7 @@ class PrioritizedSearchService:
         Returns:
             Deduplicated results with best match per source_id
         """
-        seen_sources = {}
+        seen_sources = set()
         unique_results = []
         
         for result in ranked_results:
@@ -1483,7 +1458,7 @@ class PrioritizedSearchService:
                 continue
             
             if source_id not in seen_sources:
-                seen_sources[source_id] = True
+                seen_sources.add(source_id)
                 unique_results.append(result)
         
         logger.info(f"Filtered {len(ranked_results)} results to {len(unique_results)} unique sources")
@@ -1492,27 +1467,10 @@ class PrioritizedSearchService:
     def _scroll_and_collect_unique_sources(self, filter_conditions) -> dict:
         """Scroll through documents and collect unique sources"""
         unique_sources = {}
-        scroll_result = qdrant_client.scroll(
-            collection_name=self.collection_name,
-            scroll_filter=filter_conditions,
-            limit=10000,
-            with_payload=True,
-            with_vectors=False
-        )
-        
-        points, next_page_offset = scroll_result
-        
-        for point in points:
-            source_id = point.payload.get('source_id')
-            if source_id and source_id not in unique_sources:
-                unique_sources[source_id] = {
-                    'id': point.id,
-                    'payload': point.payload,
-                    'source_id': source_id
-                }
-        
-        while next_page_offset:
-            scroll_result = qdrant_client.scroll(
+        next_page_offset = None
+
+        while True:
+            points, next_page_offset = qdrant_client.scroll(
                 collection_name=self.collection_name,
                 scroll_filter=filter_conditions,
                 limit=10000,
@@ -1520,8 +1478,7 @@ class PrioritizedSearchService:
                 with_payload=True,
                 with_vectors=False
             )
-            points, next_page_offset = scroll_result
-            
+
             for point in points:
                 source_id = point.payload.get('source_id')
                 if source_id and source_id not in unique_sources:
@@ -1530,7 +1487,10 @@ class PrioritizedSearchService:
                         'payload': point.payload,
                         'source_id': source_id
                     }
-        
+
+            if not next_page_offset:
+                break
+
         return unique_sources
 
     def _build_source_result_items(self, top_results) -> List[SearchResultItem]:
@@ -1590,7 +1550,9 @@ class PrioritizedSearchService:
 
         # Acronym: the written-out queries are OR'ed into the same filter, so the
         # expansion boosts need no extra call.
-        expansion_texts = [e.strip().lower() for e in (expansions or []) if e.strip()]
+        expansion_texts = [
+            expansion.strip().lower() for expansion in (expansions or []) if expansion.strip()
+        ]
         if expansion_texts:
             logger.info(f"[ACRONYM] {field} scroll also matches written-out queries: {expansion_texts}")
         text_conditions = [
@@ -1613,7 +1575,7 @@ class PrioritizedSearchService:
             offset = None
             # Every chunk of a document carries the same title/summary, so each
             # source is classified once (typed query and expansions together).
-            seen: set = set()
+            seen_source_ids: set = set()
             while True:
                 scroll_kwargs: Dict[str, Any] = dict(
                     collection_name=self.collection_name,
@@ -1629,22 +1591,24 @@ class PrioritizedSearchService:
 
                 for point in points:
                     source_id = point.payload.get("source_id")
-                    if not source_id or source_id in seen:
+                    if not source_id or source_id in seen_source_ids:
                         continue
-                    seen.add(source_id)
-                    value = (point.payload.get(field) or "").lower()
+                    seen_source_ids.add(source_id)
+                    field_text = (point.payload.get(field) or "").lower()
 
-                    match_type = self._classify_text_match(query_lower, value)
+                    match_type = self._classify_text_match(query_lower, field_text)
 
                     if match_type:
                         matches[source_id] = match_type
 
                     # Acronym: the same rule against each written-out query; the best match wins.
                     if expansion_matches_out is not None and expansion_texts:
-                        found = {self._classify_text_match(text, value) for text in expansion_texts}
-                        if "exact" in found:
+                        expansion_match_types = {
+                            self._classify_text_match(text, field_text) for text in expansion_texts
+                        }
+                        if "exact" in expansion_match_types:
                             expansion_matches_out[source_id] = "exact"
-                        elif "partial" in found:
+                        elif "partial" in expansion_match_types:
                             expansion_matches_out[source_id] = "partial"
 
                 if not next_offset:
@@ -1656,8 +1620,8 @@ class PrioritizedSearchService:
 
         logger.info(
             f"{field} match sources found: {len(matches)} "
-            f"(exact={sum(1 for v in matches.values() if v == 'exact')}, "
-            f"partial={sum(1 for v in matches.values() if v == 'partial')})"
+            f"(exact={sum(1 for match_type in matches.values() if match_type == 'exact')}, "
+            f"partial={sum(1 for match_type in matches.values() if match_type == 'partial')})"
         )
         return matches
 
@@ -1682,8 +1646,8 @@ class PrioritizedSearchService:
             source_id = result["payload"].get("source_id")
             if not source_id or source_id in matches:
                 continue
-            raw_value = (result["payload"].get(field) or "").lower()
-            match_type = self._classify_text_match(query_lower, raw_value)
+            field_text = (result["payload"].get(field) or "").lower()
+            match_type = self._classify_text_match(query_lower, field_text)
             if match_type:
                 matches[source_id] = match_type
 
@@ -1734,15 +1698,15 @@ class PrioritizedSearchService:
                 continue
 
             multiplier = exact_boost if match_type == "exact" else partial_boost
-            original = result["weighted_score"]
-            boosted = min(original * multiplier, 1.0)
-            result["weighted_score"] = boosted
+            original_score = result["weighted_score"]
+            boosted_score = min(original_score * multiplier, 1.0)
+            result["weighted_score"] = boosted_score
             result["field_scores"][match_key] = match_type
             result[mult_key] = multiplier
 
             logger.debug(
                 f"{field} boost applied to {source_id}: "
-                f"{match_type} match, {original:.4f} → {boosted:.4f}"
+                f"{match_type} match, {original_score:.4f} → {boosted_score:.4f}"
             )
 
         ranked_results.sort(key=lambda x: x["weighted_score"], reverse=True)
@@ -1798,11 +1762,11 @@ class PrioritizedSearchService:
 
         # Step 2: Documents we already scored earlier, before the threshold removed them.
         # Their real scores are still in memory, so reuse them instead of asking Qdrant.
-        remaining: List[str] = []
+        unscored_source_ids: List[str] = []
         for source_id in source_ids:
-            ranked = prethreshold_by_source.get(source_id)
-            if ranked is None:
-                remaining.append(source_id)
+            prethreshold_entry = prethreshold_by_source.get(source_id)
+            if prethreshold_entry is None:
+                unscored_source_ids.append(source_id)
                 continue
 
             match_type = matches.get(source_id, "partial")
@@ -1810,8 +1774,8 @@ class PrioritizedSearchService:
             score, boost = _score_for(match_type)
 
             # Copy both dicts — the original is shared and must not be changed.
-            entry = dict(ranked)
-            entry["field_scores"] = dict(ranked.get("field_scores") or {})
+            entry = dict(prethreshold_entry)
+            entry["field_scores"] = dict(prethreshold_entry.get("field_scores") or {})
             entry["field_scores"][match_key] = match_type
             entry["weighted_score"] = score
             entry[mult_key] = boost
@@ -1824,14 +1788,15 @@ class PrioritizedSearchService:
                 f"({match_type}), score {score:.4f}"
             )
 
-        if not remaining:
+        if not unscored_source_ids:
             logger.info(
                 f"Resolved all {len(source_ids)} missing '{field}' documents from the "
                 f"pre-threshold pool — no Qdrant request needed."
             )
             return injected
 
-        source_ids = remaining
+        # From here on, source_ids holds only the documents Qdrant must fetch.
+        source_ids = unscored_source_ids
         num_requests_before = len(source_ids)
 
         # Step 3: The rest were never scored, so fetch their vectors and score them here.
@@ -1853,7 +1818,7 @@ class PrioritizedSearchService:
 
         try:
             start_time = time.perf_counter()
-            # Step 2: Paginate scroll with MatchAny until every requested source_id has
+            # Step 4: Paginate scroll with MatchAny until every requested source_id has
             # at least one point or Qdrant returns no further results.  A single page
             # of len(source_ids)*10 points (capped at 1000) is almost always enough;
             # the loop only continues when sources with unusually many chunks exhaust
@@ -1866,7 +1831,7 @@ class PrioritizedSearchService:
             num_pages = 0
 
             while True:
-                batch, offset = qdrant_client.scroll(
+                page_points, offset = qdrant_client.scroll(
                     collection_name=self.collection_name,
                     scroll_filter=models.Filter(
                         must=[
@@ -1882,11 +1847,11 @@ class PrioritizedSearchService:
                     with_vectors=with_vectors,
                 )
                 num_pages += 1
-                all_points.extend(batch)
-                for pt in batch:
-                    sid = pt.payload.get("source_id")
-                    if sid:
-                        covered_sources.add(sid)
+                all_points.extend(page_points)
+                for point in page_points:
+                    source_id = point.payload.get("source_id")
+                    if source_id:
+                        covered_sources.add(source_id)
                 if offset is None or source_ids_set <= covered_sources:
                     break
 
@@ -1900,7 +1865,7 @@ class PrioritizedSearchService:
             logger.warning(f"Could not bulk fetch {field}-match docs: {exc}")
             return []
 
-        # Step 3: Deduplicate matching points in-memory.
+        # Step 5: Deduplicate matching points in-memory.
         # Since we only want one representative chunk per unique source_id, we process them
         # sequentially and keep the first one we see.
         seen_sources: Set[str] = set()
@@ -1912,7 +1877,7 @@ class PrioritizedSearchService:
                 continue
             seen_sources.add(source_id)
 
-            # Step 4: Compute the boosted score, floored at the caller's threshold.
+            # Step 6: Compute the boosted score, floored at the caller's threshold.
             # (Only never-scored documents reach here.)
             match_type = matches.get(source_id, "partial")
             score, boost = _score_for(match_type)
@@ -1920,22 +1885,24 @@ class PrioritizedSearchService:
             # Score each field against the query. A field is None when the document has
             # no vector for it (empty fields are not stored) or scoring was skipped.
             # None means "not scored" — never write 0.0 here, that means "scored zero".
-            vector_map = (getattr(point, "vector", None) or {}) if score_vectors else {}
+            vectors_by_field = (getattr(point, "vector", None) or {}) if score_vectors else {}
             field_scores: Dict[str, Any] = {
-                f: (self._cosine_similarity(query_embedding, vector_map.get(f))
-                    if score_vectors else None)
-                for f in self.priority_order
+                field_name: (self._cosine_similarity(query_embedding, vectors_by_field.get(field_name))
+                             if score_vectors else None)
+                for field_name in self.priority_order
             }
             field_scores[match_key] = match_type
 
             # Combine the field scores using the same weights as a normal search, so this
             # number can be compared against one. None when no field could be scored.
-            scored = [
-                (f, s) for f, s in field_scores.items()
-                if f in self.default_weights and isinstance(s, (int, float))
+            scored_fields = [
+                (field_name, field_score) for field_name, field_score in field_scores.items()
+                if field_name in self.default_weights and isinstance(field_score, (int, float))
             ]
             raw_dense = (
-                sum(s * self.default_weights[f] for f, s in scored) if scored else None
+                sum(field_score * self.default_weights[field_name]
+                    for field_name, field_score in scored_fields)
+                if scored_fields else None
             )
 
             injected.append({
@@ -1951,43 +1918,15 @@ class PrioritizedSearchService:
             })
             logger.debug(f"Injected {field}-match doc {source_id} ({match_type}) with floor score {score:.4f}")
 
-        missing_after = len(source_ids) - len(seen_sources)
+        not_found_count = len(source_ids) - len(seen_sources)
         logger.info(
             f"Finished resolving missing documents for field '{field}'. "
             f"Requests before: {num_requests_before}, Requests after: 1. "
             f"Successfully resolved: {len(seen_sources)}/{len(source_ids)}. "
-            f"Missing/Not Found IDs: {missing_after}."
+            f"Missing/Not Found IDs: {not_found_count}."
         )
 
         return injected
-
-    # ── Backward-compatible title wrappers (kept for existing callers/tests) ──────
-    def _get_title_match_sources(
-        self,
-        query: str,
-        filter_conditions: Optional[models.Filter],
-    ) -> Dict[str, str]:
-        return self._get_field_match_sources(query, filter_conditions, "title")
-
-    def _apply_title_boost(
-        self,
-        ranked_results: List[Dict[str, Any]],
-        title_matches: Dict[str, str],
-    ) -> List[Dict[str, Any]]:
-        return self._apply_field_boost(
-            ranked_results, title_matches, "title",
-            settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-        )
-
-    def _fetch_title_match_docs(
-        self,
-        source_ids: List[str],
-        title_matches: Dict[str, str],
-    ) -> List[Dict[str, Any]]:
-        return self._fetch_field_match_docs(
-            source_ids, title_matches, "title",
-            settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
-        )
 
     def _get_unique_source_documents(self, request: PrioritizedSearchRequest) -> PrioritizedSearchResponse:
         """
