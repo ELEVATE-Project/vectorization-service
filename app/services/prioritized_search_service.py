@@ -914,6 +914,26 @@ class PrioritizedSearchService:
                     previous_score = field_scores[point_id].get(field, float("-inf"))
                     field_scores[point_id][field] = max(previous_score, score)
 
+            # 5. Remap raw Qdrant vector-field names to the semantic field names that
+            #    _apply_detail_filter checks against ("title", "text", "tags",
+            #    "summary", "metadata"). The keys of self.default_weights are the
+            #    authoritative semantic names; the corresponding Qdrant vector name is
+            #    VECTOR_FIELD_PREFIX + semantic_name. This collection configures its
+            #    named vectors with no prefix (see app/core/clients/qdrant.py), so the
+            #    mapping is an identity today — but doing it explicitly keeps the
+            #    field_scores contract correct if a prefix is ever introduced.
+            #    The "bm25" (SPARSE_VECTOR_NAME) key is preserved untouched — it carries
+            #    the raw BM25 score consumed by _rank_results' dense+sparse fusion and
+            #    signals hybrid mode.
+            prefix = getattr(settings, "VECTOR_FIELD_PREFIX", "") or ""
+            qdrant_to_semantic = {
+                f"{prefix}{semantic}": semantic for semantic in self.default_weights
+            }
+            for scores in field_scores.values():
+                for qdrant_name, semantic_name in qdrant_to_semantic.items():
+                    if qdrant_name in scores and semantic_name not in scores:
+                        scores[semantic_name] = scores[qdrant_name]
+
             sparse_hit_count = sum(
                 1 for scores in field_scores.values() if settings.SPARSE_VECTOR_NAME in scores
             )
@@ -1467,10 +1487,27 @@ class PrioritizedSearchService:
     def _scroll_and_collect_unique_sources(self, filter_conditions) -> dict:
         """Scroll through documents and collect unique sources"""
         unique_sources = {}
-        next_page_offset = None
-
-        while True:
-            points, next_page_offset = qdrant_client.scroll(
+        scroll_result = qdrant_client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=filter_conditions,
+            limit=10000,
+            with_payload=True,
+            with_vectors=False
+        )
+        
+        points, next_page_offset = scroll_result
+        
+        for point in points:
+            source_id = point.payload.get('source_id')
+            if source_id and source_id not in unique_sources:
+                unique_sources[source_id] = {
+                    'id': point.id,
+                    'payload': point.payload,
+                    'source_id': source_id
+                }
+        
+        while next_page_offset:
+            scroll_result = qdrant_client.scroll(
                 collection_name=self.collection_name,
                 scroll_filter=filter_conditions,
                 limit=10000,
@@ -1478,7 +1515,8 @@ class PrioritizedSearchService:
                 with_payload=True,
                 with_vectors=False
             )
-
+            points, next_page_offset = scroll_result
+            
             for point in points:
                 source_id = point.payload.get('source_id')
                 if source_id and source_id not in unique_sources:
@@ -1487,10 +1525,7 @@ class PrioritizedSearchService:
                         'payload': point.payload,
                         'source_id': source_id
                     }
-
-            if not next_page_offset:
-                break
-
+        
         return unique_sources
 
     def _build_source_result_items(self, top_results) -> List[SearchResultItem]:
@@ -1927,6 +1962,34 @@ class PrioritizedSearchService:
         )
 
         return injected
+
+    # ── Backward-compatible title wrappers (kept for existing callers/tests) ──────
+    def _get_title_match_sources(
+        self,
+        query: str,
+        filter_conditions: Optional[models.Filter],
+    ) -> Dict[str, str]:
+        return self._get_field_match_sources(query, filter_conditions, "title")
+
+    def _apply_title_boost(
+        self,
+        ranked_results: List[Dict[str, Any]],
+        title_matches: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        return self._apply_field_boost(
+            ranked_results, title_matches, "title",
+            settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
+        )
+
+    def _fetch_title_match_docs(
+        self,
+        source_ids: List[str],
+        title_matches: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        return self._fetch_field_match_docs(
+            source_ids, title_matches, "title",
+            settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
+        )
 
     def _get_unique_source_documents(self, request: PrioritizedSearchRequest) -> PrioritizedSearchResponse:
         """
