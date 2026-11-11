@@ -1225,38 +1225,39 @@ class PrioritizedSearchService:
         filter_score, instead of the raw RRF fused value, which sits far below any
         cosine-scale threshold.
 
-        Two easy mistakes:
-          - Hybrid mode follows ``sparse_issued`` (query sent), NOT whether it matched;
-            a zero-hit sparse branch stays here with its weight shifted onto dense.
-          - "rrf" fuses TWO lists — the combined dense list and the sparse list — so a
-            doc gets at most two rank terms, not one per dense field.
+        Note: hybrid mode is detected by the presence of a raw sparse (BM25) score in
+        field_scores (the sparse field key), not a separate all-field RRF value. The
+        "rrf" fusion method below computes its own RRF over exactly TWO lists — the
+        single combined dense list (the 5 dense fields collapsed into one weighted
+        cosine sum, raw_dense) and the sparse list (raw_sparse) — i.e. up to two rank
+        terms per doc, NOT one RRF term per dense field. _apply_detail_filter is pure
+        per-field OR logic and does not consume any fusion score.
 
         Args:
             all_results: Dictionary of search results by point ID
             field_scores: Scores for each field per point
             weights: Weight configuration for each field
             search_fields: List of fields searched
-            scoring_context_out: Optional mutable dict, filled with the per-query scoring
-                context for search_config.scoring_context. Keys:
-                  candidate_pool_size, sparse_issued, sparse_has_hits — every path; the
-                      flags describe retrieval, not fusion.
-                  dense_min/max, sparse_min/max — hybrid only.
-                  dense_weight, sparse_weight — weighted-fusion branch only, with the
-                      weights actually applied (1.0/0.0 if sparse matched nothing).
-                      Absent elsewhere; never back-fill from settings.
+            scoring_context_out: Optional mutable dict. When provided, it is populated
+                with the per-query normalization context (candidate_pool_size and, in
+                hybrid mode, dense_min/max + sparse_min/max) so the caller can surface it
+                under search_config.scoring_context without recomputing raw_dense/raw_sparse
+                or keeping per-request state on the (shared) service instance. Left empty
+                on the dense-only path except for candidate_pool_size.
 
         Returns:
             List of ranked results sorted by weighted score (descending)
         """
         sparse_name = settings.SPARSE_VECTOR_NAME
-        # Keys off whether the BM25 branch was ISSUED, not whether it matched: a zero-hit
-        # sparse branch would otherwise flip scoring from the normalized [0, 1] fusion to
-        # the raw cosine sum, which occupies a much lower range — no single filter_score
-        # spans both. Zero hits
-        # are handled by weight redistribution in the `weighted` branch instead.
-        # sparse_has_hits is a floor, not a replacement: hits imply hybrid without the flag.
-        sparse_has_hits = any(sparse_name in fs for fs in field_scores.values())
-        is_hybrid = sparse_issued or sparse_has_hits
+        # Hybrid mode is signalled by the presence of a raw sparse (BM25) score under
+        # the sparse field key — _hybrid_batch_search injects it only when the BM25
+        # query actually participated and returned hits. This is the same key the rrf/
+        # weighted fusion below reads as raw_sparse, so detection and fusion stay tied
+        # to one signal. Detecting it this way (rather than via a global flag or a
+        # separate all-field RRF marker) keeps the dense-only fallback and the
+        # empty-sparse edge case on the plain weighted-sum path, avoiding score
+        # deflation. In hybrid mode we fuse normalized dense + sparse scores.
+        is_hybrid = any(sparse_name in fs for fs in field_scores.values())
 
         # Fusion method (env-selectable): "weighted" min-max score fusion, or "rrf"
         # rank fusion of the combined dense list vs the sparse list. The dense
@@ -1311,19 +1312,8 @@ class PrioritizedSearchService:
                 # Weighted min-max score fusion (default).
                 norm_dense = self._min_max_normalize(raw_dense)
                 norm_sparse = self._min_max_normalize(raw_sparse)
-                if sparse_has_hits:
-                    dense_w = settings.HYBRID_DENSE_WEIGHT
-                    sparse_w = settings.HYBRID_SPARSE_WEIGHT
-                else:
-                    # Sparse ran but matched nothing, so norm_sparse is all 0. Keeping the
-                    # configured split would shrink every score by the sparse share for a
-                    # silent modality, pushing good results under filter_score; dense takes
-                    # the full weight instead.
-                    dense_w, sparse_w = 1.0, 0.0
-                    logger.info(
-                        "No sparse hits in candidate pool; dense weight raised to 1.0 "
-                        "to keep the fused score on the [0, 1] scale"
-                    )
+                dense_w = settings.HYBRID_DENSE_WEIGHT
+                sparse_w = settings.HYBRID_SPARSE_WEIGHT
                 for point_id in raw_dense:
                     hybrid_scores[point_id] = (
                         dense_w * norm_dense.get(point_id, 0.0)
@@ -1353,11 +1343,6 @@ class PrioritizedSearchService:
         # candidate_pool_size is meaningful in both modes.
         if scoring_context_out is not None:
             scoring_context_out["candidate_pool_size"] = len(all_results)
-            # Retrieval facts, every path — unlike dense_weight/sparse_weight above, which
-            # report fusion. Outside `if is_hybrid` so a client can tell "never issued"
-            # from "ran but contributed nothing".
-            scoring_context_out["sparse_issued"] = sparse_issued
-            scoring_context_out["sparse_has_hits"] = sparse_has_hits
 
         ranked = []
 
