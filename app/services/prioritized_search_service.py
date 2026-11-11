@@ -1333,6 +1333,12 @@ class PrioritizedSearchService:
                 if sparse_vals:
                     scoring_context_out["sparse_min"] = min(sparse_vals)
                     scoring_context_out["sparse_max"] = max(sparse_vals)
+                # The weights actually applied, which differ from the configured ones when
+                # the sparse branch matched nothing (see redistribution above). Reporting
+                # settings here instead would make the debug numbers irreproducible.
+                if fusion_method != "rrf":
+                    scoring_context_out["dense_weight"] = dense_w
+                    scoring_context_out["sparse_weight"] = sparse_w
 
         # candidate_pool_size is meaningful in both modes.
         if scoring_context_out is not None:
