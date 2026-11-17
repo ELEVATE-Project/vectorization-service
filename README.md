@@ -36,7 +36,9 @@ has every endpoint, with one request per success and validation case and a saved
 
 1. In Postman, choose **Import** and select the file.
 2. Set the collection variables: `baseUrl` (`http://localhost:8000` locally, `https://<host>/vector` elsewhere),
-   `sourceId`, `companyId` and `theme`.
+   `internalAccessToken` (the `INTERNAL_API_TOKEN` value), `sourceId`, `companyId` and `theme`.
+   The collection sends `internalAccessToken` as the `internal_access_token` header on every request except
+   Health check; it is needed when `INTERNAL_TOKEN_ENFORCED=true`.
 3. For upload, update and upsert requests, choose a file in the `file` field. Each request's description says
    which kind of file to use.
 
