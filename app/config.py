@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     REDIS_CACHE_ENABLED: bool = False
 
     # Secret for the internal_access_token header: always on the acronym endpoints,
-    # and on every /api route when INTERNAL_TOKEN_ENFORCED is true; no default.
+    # and on selected routes when INTERNAL_TOKEN_ENFORCED is true; no default.
     INTERNAL_API_TOKEN: str = os.getenv("INTERNAL_API_TOKEN", "")
 
     INTERNAL_TOKEN_ENFORCED: bool = os.getenv("INTERNAL_TOKEN_ENFORCED", "false").lower() == "true"

@@ -1,8 +1,8 @@
-# Release 2.3.0 — API Access Token for All Routes
+# Release 2.3.0 — API Access Token for Selected Routes
 
 ## Table of Contents
 
-- [Release 2.3.0 — API Access Token for All Routes](#release-230--api-access-token-for-all-routes)
+- [Release 2.3.0 — API Access Token for Selected Routes](#release-230--api-access-token-for-selected-routes)
   - [Table of Contents](#table-of-contents)
   - [What's New](#whats-new)
   - [New Configuration](#new-configuration)
@@ -16,7 +16,12 @@
 
 **API access**
 
-- **Token check for every `/api` route.** With `INTERNAL_TOKEN_ENFORCED=true`, every route under `/api` except `/api/health` needs the `internal_access_token` header (same value as `INTERNAL_API_TOKEN`). A missing or wrong token gets `401`. The check is set once on the parent `/api` router (`app/api/v1/api.py`), so new routes get it too.
+- **Token check for write routes.** With `INTERNAL_TOKEN_ENFORCED=true`, these routes need the `internal_access_token` header (same value as `INTERNAL_API_TOKEN`); a missing or wrong token gets `401`:
+  - `POST /api/documents` (upload), `PUT /api/documents/{source_id}` (replace), `PUT /api/documents/{source_id}/upsert`
+  - `PATCH /api/documents/{source_id}/metadata`, `PATCH /api/documents/{source_id}/theme`
+  - `DELETE /api/documents/{source_id}`, `DELETE /api/cache/redis`
+- **Open routes.** Search and read routes stay open: `/api/documents/search`, `/api/documents/text-search`, `/api/documents/check-similarity`, `/api/documents/verify-sources`, `/api/query/` and `/api/health`.
+- The check is set on each write route (`dependencies=[Depends(verify_internal_token_if_enforced)]`), the same way as the acronym endpoints; a new write route must add it too.
 - **Off by default.** With `INTERNAL_TOKEN_ENFORCED=false` (the default), routes behave as in 2.2.0, so current callers keep working until they send the header. The acronym endpoints need the token in both cases, as in 2.2.0.
 
 ---
@@ -25,7 +30,7 @@
 
 | Variable | Default | Description |
 |---|---|---|
-| `INTERNAL_TOKEN_ENFORCED` | `false` | `true`: every `/api` route except `/api/health` needs the `internal_access_token` header. Keep `false` until every caller (commons-backend) sends the header. |
+| `INTERNAL_TOKEN_ENFORCED` | `false` | `true`: the document write routes and cache clear need the `internal_access_token` header; search routes stay open. Keep `false` until every caller sends the header on write calls. |
 
 `INTERNAL_API_TOKEN` (from 2.2.0) is the token value for this check. It is still required: the service does not start without it.
 
@@ -45,7 +50,7 @@ No new dependencies.
    ```
    Restart the service. Behaviour is the same as 2.2.0.
 
-2. Change every caller to send the header on each call to the vector service:
+2. Change every caller to send the header on each write call (upload, update, upsert, metadata, theme, delete, cache clear):
    ```
    internal_access_token: <INTERNAL_API_TOKEN>
    ```
@@ -55,21 +60,20 @@ No new dependencies.
    INTERNAL_TOKEN_ENFORCED=true
    ```
 
-4. **Smoke test:**
+4. **Smoke test** (the delete uses an id that does not exist, so no data changes):
    ```bash
-   # No token -> expect 401
+   # Write route, no token -> expect 401
+   curl -s -o /dev/null -w "%{http_code}\n" -X DELETE "http://<HOST>:<PORT>/api/documents/smoke-test-no-such-id"
+
+   # Write route, with token -> expect 404 (passes the token check; the id does not exist)
+   curl -s -o /dev/null -w "%{http_code}\n" -X DELETE "http://<HOST>:<PORT>/api/documents/smoke-test-no-such-id" \
+     -H "internal_access_token: <INTERNAL_API_TOKEN>"
+
+   # Search, no token -> expect 200
    curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://<HOST>:<PORT>/api/documents/search" \
      -H 'Content-Type: application/json' -d '{"query":"test","top_k":1}'
-
-   # With token -> expect 200
-   curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://<HOST>:<PORT>/api/documents/search" \
-     -H 'Content-Type: application/json' -H "internal_access_token: <INTERNAL_API_TOKEN>" \
-     -d '{"query":"test","top_k":1}'
-
-   # Health needs no token -> expect 200
-   curl -s -o /dev/null -w "%{http_code}\n" "http://<HOST>:<PORT>/api/health"
    ```
-   Also run one search from commons-backend and confirm it returns results (not `401`).
+   Also run one upload from each caller and confirm it is indexed (not `401`).
 
 ---
 

@@ -23,7 +23,7 @@ def verify_internal_token_if_enforced(
 ) -> None:
     """Run verify_internal_token only when INTERNAL_TOKEN_ENFORCED is true.
 
-    The flag lets callers such as commons start sending the header before the check is turned on.
+    The flag lets callers start sending the header before the check is turned on.
     """
     if not settings.INTERNAL_TOKEN_ENFORCED:
         return
