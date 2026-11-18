@@ -2,12 +2,14 @@ import json
 import logging
 import re
 from typing import Any, List, Dict, Optional
+from urllib.parse import urlparse
 from fastapi import HTTPException
 from qdrant_client import models
 from app.core.clients.qdrant import qdrant_client, ensure_collections_exist
 from app.config import settings
 from app.constants import messages as msg
 from app.utils.generic import normalize_theme
+from app.validations.generic import is_url_host_allowed
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +236,14 @@ class BaseDocumentOperation:
                 raise HTTPException(
                     status_code=400,
                     detail=msg.MARKDOWN_URL_NOT_HTTP
+                )
+            # The service fetches this URL, so only listed hosts may be used; this keeps it
+            # from reading internal addresses such as localhost or the cloud metadata IP.
+            url_host = urlparse(markdown_url.strip()).hostname or ""
+            if not is_url_host_allowed(url_host):
+                raise HTTPException(
+                    status_code=400,
+                    detail=msg.MARKDOWN_URL_HOST_NOT_ALLOWED.format(host=url_host)
                 )
             metadata["markdown_url"] = markdown_url.strip()
 

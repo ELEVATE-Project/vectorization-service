@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     URL_EXTRACTION_CHUNK_SIZE: int = 1500
     URL_EXTRACTION_CHUNK_OVERLAP: int = 300  # 20% overlap
     URL_REQUEST_TIMEOUT: int = 30  # seconds
+    # Hosts metadata.markdown_url may point to, comma-separated; "*" allows any host.
+    ALLOWED_URL_HOSTS: str = os.getenv("ALLOWED_URL_HOSTS", "*")
 
     # File upload settings
     MAX_FILE_SIZE_MB: int = int(os.getenv("MAX_FILE_SIZE_MB", 1024))  # 1GB default (in MB)
