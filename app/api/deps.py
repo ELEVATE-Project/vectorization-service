@@ -16,3 +16,15 @@ def verify_internal_token(
     """
     if not secret_matches(internal_access_token, settings.INTERNAL_API_TOKEN):
         raise HTTPException(status_code=401, detail=msg.INTERNAL_TOKEN_INVALID)
+
+
+def verify_internal_token_if_enforced(
+    internal_access_token: Optional[str] = Header(None, convert_underscores=False),
+) -> None:
+    """Run verify_internal_token only when INTERNAL_TOKEN_ENFORCED is true.
+
+    The flag lets callers start sending the header before the check is turned on.
+    """
+    if not settings.INTERNAL_TOKEN_ENFORCED:
+        return
+    verify_internal_token(internal_access_token)

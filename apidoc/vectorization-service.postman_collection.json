@@ -6728,6 +6728,9 @@
 						}
 					],
 					"request": {
+						"auth": {
+							"type": "noauth"
+						},
 						"method": "GET",
 						"header": [
 							{
@@ -7077,10 +7080,35 @@
 			]
 		}
 	],
+	"auth": {
+		"type": "apikey",
+		"apikey": [
+			{
+				"key": "key",
+				"value": "internal_access_token",
+				"type": "string"
+			},
+			{
+				"key": "value",
+				"value": "{{internalAccessToken}}",
+				"type": "string"
+			},
+			{
+				"key": "in",
+				"value": "header",
+				"type": "string"
+			}
+		]
+	},
 	"variable": [
 		{
 			"key": "baseUrl",
 			"value": "http://localhost:8000",
+			"type": "string"
+		},
+		{
+			"key": "internalAccessToken",
+			"value": "",
 			"type": "string"
 		},
 		{
