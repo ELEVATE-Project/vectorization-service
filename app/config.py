@@ -64,8 +64,8 @@ class Settings(BaseSettings):
     POSTGRES_STATEMENT_TIMEOUT_MS: int = int(os.getenv("POSTGRES_STATEMENT_TIMEOUT_MS", 5000))
     REDIS_CACHE_ENABLED: bool = False
 
-    # Secret for the internal_access_token header: always on the acronym endpoints,
-    # and on selected routes when INTERNAL_TOKEN_ENFORCED is true; no default.
+    # Secret for the internal_access_token header, checked on selected routes
+    # when INTERNAL_TOKEN_ENFORCED is true; no default.
     INTERNAL_API_TOKEN: str = os.getenv("INTERNAL_API_TOKEN", "")
 
     INTERNAL_TOKEN_ENFORCED: bool = os.getenv("INTERNAL_TOKEN_ENFORCED", "false").lower() == "true"

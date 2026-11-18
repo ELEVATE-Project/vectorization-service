@@ -16,13 +16,15 @@
 
 **API access**
 
-- **Token check for write routes.** With `INTERNAL_TOKEN_ENFORCED=true`, these routes need the `internal_access_token` header (same value as `INTERNAL_API_TOKEN`); a missing or wrong token gets `401`:
+- **Token check for selected routes.** With `INTERNAL_TOKEN_ENFORCED=true`, these routes need the `internal_access_token` header (same value as `INTERNAL_API_TOKEN`); a missing or wrong token gets `401`:
   - `POST /api/documents` (upload), `PUT /api/documents/{source_id}` (replace), `PUT /api/documents/{source_id}/upsert`
   - `PATCH /api/documents/{source_id}/metadata`, `PATCH /api/documents/{source_id}/theme`
   - `DELETE /api/documents/{source_id}`, `DELETE /api/cache/redis`
+  - `GET /api/acronyms`, `POST /api/acronyms/bulkUpload`
 - **Open routes.** Search and read routes stay open: `/api/documents/search`, `/api/documents/text-search`, `/api/documents/check-similarity`, `/api/documents/verify-sources`, `/api/query/` and `/api/health`.
-- The check is set on each write route (`dependencies=[Depends(verify_internal_token_if_enforced)]`), the same way as the acronym endpoints; a new write route must add it too.
-- **Off by default.** With `INTERNAL_TOKEN_ENFORCED=false` (the default), routes behave as in 2.2.0, so current callers keep working until they send the header. The acronym endpoints need the token in both cases, as in 2.2.0.
+- The check is set on each protected route (`dependencies=[Depends(verify_internal_token_if_enforced)]`); a new route that needs protection must add it too.
+- **Off by default.** With `INTERNAL_TOKEN_ENFORCED=false` (the default), every route is open, so current callers keep working until they send the header.
+- **Change from 2.2.0:** the acronym endpoints always needed the token in 2.2.0. They now need it only when `INTERNAL_TOKEN_ENFORCED=true`, so with the default they are open, including `POST /api/acronyms/bulkUpload`.
 
 ---
 
@@ -30,7 +32,7 @@
 
 | Variable | Default | Description |
 |---|---|---|
-| `INTERNAL_TOKEN_ENFORCED` | `false` | `true`: the document write routes and cache clear need the `internal_access_token` header; search routes stay open. Keep `false` until every caller sends the header on write calls. |
+| `INTERNAL_TOKEN_ENFORCED` | `false` | `true`: the document write routes, cache clear and the acronym endpoints need the `internal_access_token` header; search routes stay open. Keep `false` until every caller sends the header on write calls. |
 
 `INTERNAL_API_TOKEN` (from 2.2.0) is the token value for this check. It is still required: the service does not start without it.
 
