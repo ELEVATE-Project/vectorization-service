@@ -49,27 +49,36 @@ class URLTextExtractor:
             logger.info(f"Fetching content from URL: {url}")
             
             # Fetch content from URL using async HTTP client
-            import httpx
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                response = await client.get(url, headers=self.headers)
-            
-            # Check if request was successful
-            response.raise_for_status()
-            
+            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
+                async with client.stream("GET", url, headers=self.headers) as response:
+                    # A redirect could send the service to a host outside ALLOWED_URL_HOSTS.
+                    if response.is_redirect:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=msg.URL_REDIRECT_NOT_ALLOWED.format(
+                                url=url, location=response.headers.get("Location", "")
+                            )
+                        )
+
+                    # Check if request was successful
+                    response.raise_for_status()
+
+                    page_text = await self._validate_size_and_read_text(response, url)
+
             # Get content type
             content_type = response.headers.get('Content-Type', '').lower()
-            
+
             logger.info(f"Content-Type: {content_type}")
-            
+
             # Extract text based on content type
             if 'text/html' in content_type:
-                text = self._extract_from_html(response.text, url)
+                text = self._extract_from_html(page_text, url)
             elif 'text/plain' in content_type or 'text/markdown' in content_type:
-                text = response.text
+                text = page_text
             else:
                 # Try to extract as HTML anyway
                 logger.warning(f"Unknown content type: {content_type}, attempting HTML extraction")
-                text = self._extract_from_html(response.text, url)
+                text = self._extract_from_html(page_text, url)
             
             if not text or not text.strip():
                 raise HTTPException(
@@ -107,6 +116,23 @@ class URLTextExtractor:
                 detail=msg.URL_EXTRACTION_FAILED.format(error=e)
             )
     
+    async def _validate_size_and_read_text(self, response: httpx.Response, url: str) -> str:
+        """Read the page body in parts and return it as text.
+
+        Stops with 413 once the body passes MAX_FILE_SIZE_MB (the file upload limit),
+        so a very large page cannot fill the service's memory.
+        """
+        max_size_bytes = settings.MAX_FILE_SIZE_MB * 1024 * 1024
+        body = bytearray()
+        async for body_part in response.aiter_bytes():
+            body.extend(body_part)
+            if len(body) > max_size_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=msg.URL_CONTENT_TOO_LARGE.format(url=url, max_size_mb=settings.MAX_FILE_SIZE_MB)
+                )
+        return bytes(body).decode(response.encoding or "utf-8", errors="replace")
+
     def _extract_from_html(self, html_content: str, url: str) -> str:
         """
         Extract main text content from HTML.

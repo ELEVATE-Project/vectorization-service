@@ -26,3 +26,18 @@ def check_required_env_variables() -> None:
     ]
     if missing:
         raise RuntimeError(msg.ENV_VARIABLES_MISSING.format(missing="; ".join(missing)))
+
+
+def is_url_host_allowed(host: str) -> bool:
+    """True when ALLOWED_URL_HOSTS is "*" or lists this host (exact match, any case).
+
+    An empty ALLOWED_URL_HOSTS allows no host, so URL uploads are refused.
+    """
+    allowed_hosts = []
+    for allowed_host in settings.ALLOWED_URL_HOSTS.split(","):
+        if allowed_host.strip():
+            allowed_hosts.append(allowed_host.strip().lower())
+
+    if "*" in allowed_hosts:
+        return True
+    return host.lower() in allowed_hosts
