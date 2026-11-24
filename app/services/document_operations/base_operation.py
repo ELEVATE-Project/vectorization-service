@@ -239,7 +239,13 @@ class BaseDocumentOperation:
                 )
             # The service fetches this URL, so only listed hosts may be used; this keeps it
             # from reading internal addresses such as localhost or the cloud metadata IP.
-            url_host = urlparse(markdown_url.strip()).hostname or ""
+            # urlparse raises ValueError on a broken URL such as an unclosed IPv6 "[".
+            try:
+                url_host = urlparse(markdown_url.strip()).hostname
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=msg.MARKDOWN_URL_NOT_HTTP) from exc
+            if not url_host:
+                raise HTTPException(status_code=400, detail=msg.MARKDOWN_URL_NOT_HTTP)
             if not is_url_host_allowed(url_host):
                 raise HTTPException(
                     status_code=400,
