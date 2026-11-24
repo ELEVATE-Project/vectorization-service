@@ -161,8 +161,8 @@ query for the misses, then a write back.
 
 ## Bulk upload (`POST /api/acronyms/bulkUpload`)
 
-Needs the `internal_access_token` header. Bad rows go to `errors`; the other rows
-are saved in one transaction.
+Needs the `internal_access_token` header when `INTERNAL_TOKEN_ENFORCED=true`. Bad rows
+go to `errors`; the other rows are saved in one transaction.
 
 1. **File:** at most `ACRONYM_BULK_UPLOAD_MAX_SIZE_MB` (413 otherwise), UTF-8; an
    Excel BOM is removed.
@@ -207,7 +207,7 @@ the same file is safe, because it is an upsert.
 | `ACRONYM_EXPANSION_PARTIAL_SUMMARY_BOOST` | `1.2` | Summary contains a written-out query |
 | `ACRONYM_BULK_UPLOAD_MAX_SIZE_MB` | `5` | Largest CSV accepted |
 | `ACRONYM_BULK_UPLOAD_BATCH_SIZE` | `200` | Rows saved per database statement (1 to 10000) |
-| `INTERNAL_API_TOKEN` | — (required) | Secret for the acronym endpoints |
+| `INTERNAL_API_TOKEN` | — (required) | Secret for the acronym endpoints, checked when `INTERNAL_TOKEN_ENFORCED=true` |
 | `CACHE_ENABLED` | `true` | Use Redis for acronym lookups |
 | `REDIS_DB` | `2` | Redis database (commons uses 0) |
 | `REDIS_CACHE_TTL` | `86400` | Seconds a found acronym stays cached |

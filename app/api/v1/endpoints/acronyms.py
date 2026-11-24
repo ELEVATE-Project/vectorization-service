@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import verify_internal_token
+from app.api.deps import verify_internal_token_if_enforced
 from app.config import settings
 from app.constants import messages as msg
 from app.models.api_models import AcronymBulkUploadResponse, AcronymItem, AcronymListResponse
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 @router.get(
     "",
     response_model=AcronymListResponse,
-    dependencies=[Depends(verify_internal_token)],
+    dependencies=[Depends(verify_internal_token_if_enforced)],
 )
 async def get_acronyms(
     prefix: Optional[str] = Query(None, description="Case-insensitive match against the start of the acronym key"),
@@ -36,7 +36,7 @@ async def get_acronyms(
 ):
     """List the acronym dictionary, active and inactive rows by default.
 
-    Needs internal_access_token only; reading is lower risk than writing.
+    Needs internal_access_token when INTERNAL_TOKEN_ENFORCED is true.
     """
     rows, total = await run_in_threadpool(
         list_acronyms, prefix=prefix, is_active=is_active, limit=limit, offset=offset
@@ -64,12 +64,13 @@ async def get_acronyms(
 @router.post(
     "/bulkUpload",
     response_model=AcronymBulkUploadResponse,
-    dependencies=[Depends(verify_internal_token)],
+    dependencies=[Depends(verify_internal_token_if_enforced)],
 )
 async def bulk_upload_acronyms(file: UploadFile = File(...)):
     """Upsert acronyms from a CSV: acronym, expansions (pipe-separated), description, is_active.
 
-    Needs internal_access_token. Bad rows are reported in `errors`; the rest commit.
+    Needs internal_access_token when INTERNAL_TOKEN_ENFORCED is true. Bad rows are reported
+    in `errors`; the rest commit.
     """
     max_size_mb = settings.ACRONYM_BULK_UPLOAD_MAX_SIZE_MB
     max_bytes = max_size_mb * 1024 * 1024

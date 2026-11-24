@@ -2,6 +2,7 @@ from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Depends
 from typing import Optional, Dict, Any, List
 import json
 import logging
+from app.api.deps import verify_internal_token_if_enforced
 from app.constants import messages as msg
 from app.services.document_processor import DocumentProcessor
 from app.services.similarity_service import SimilarityService
@@ -68,7 +69,7 @@ def parse_tags_form(tags: Optional[str] = Form(default=None)) -> Optional[List[s
 
 # Upload a file (or metadata.markdown_url) and ingest it: extract text, chunk, embed
 # every chunk across the 5 dense fields (+ BM25 when enabled), and store the points in Qdrant.
-@router.post("/documents", status_code=201)
+@router.post("/documents", status_code=201, dependencies=[Depends(verify_internal_token_if_enforced)])
 async def create_documents(
         file: UploadFile = File(...),
         priority: str = Form(default="P1"),
@@ -109,7 +110,7 @@ async def create_documents(
 
 # Replace an existing document: ingest the uploaded file as a fresh set of chunks, then
 # delete the old chunks by id; a failed upload leaves the old version untouched.
-@router.put("/documents/{source_id}")
+@router.put("/documents/{source_id}", dependencies=[Depends(verify_internal_token_if_enforced)])
 async def update_documents(
         source_id: str,
         file: UploadFile = File(...),
@@ -133,7 +134,7 @@ async def update_documents(
 
 # Create-or-replace: if chunks already exist for this source_id they are replaced,
 # otherwise the uploaded file is ingested as a new document.
-@router.put("/documents/{source_id}/upsert")
+@router.put("/documents/{source_id}/upsert", dependencies=[Depends(verify_internal_token_if_enforced)])
 async def upsert_documents(
         source_id: str,
         file: UploadFile = File(...),
@@ -157,7 +158,7 @@ async def upsert_documents(
 
 # Patch the metadata payload on every chunk of a source_id via set_payload.
 # Text and vectors are not regenerated, so the "metadata" embedding is left as-is.
-@router.patch("/documents/{source_id}/metadata")
+@router.patch("/documents/{source_id}/metadata", dependencies=[Depends(verify_internal_token_if_enforced)])
 async def update_document_metadata(
         source_id: str,
         metadata_updates: str = Form(...),
@@ -174,7 +175,7 @@ async def update_document_metadata(
 
 # Set the top-level theme on every chunk of a source_id via set_payload. No file is
 # read and nothing is embedded; only theme and metadata.updated_at change.
-@router.patch("/documents/{source_id}/theme")
+@router.patch("/documents/{source_id}/theme", dependencies=[Depends(verify_internal_token_if_enforced)])
 async def update_document_theme(
         source_id: str,
         theme: Optional[str] = Form(default=None),
@@ -190,7 +191,7 @@ async def update_document_theme(
 
 # Delete every chunk stored under this source_id (optionally scoped to company_id),
 # scrolling and removing the matching points from Qdrant in batches.
-@router.delete("/documents/{source_id}")
+@router.delete("/documents/{source_id}", dependencies=[Depends(verify_internal_token_if_enforced)])
 async def delete_documents(
         source_id: str,
         company_id: Optional[str] = Form(default=None)
